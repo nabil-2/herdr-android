@@ -1,0 +1,10 @@
+Herdr Pocket
+Copyright 2026 Nabil Salama
+
+This is an independent Android companion for Herdr. It is not an official Herdr
+application. Herdr is developed by its upstream contributors and runs separately
+on the host. This application talks to Herdr's public API and terminal-session CLI.
+
+Terminal rendering uses ConnectBot Terminal (org.connectbot:termlib), licensed
+under Apache License 2.0, and its embedded libvterm, licensed under MIT.
+See THIRD_PARTY_NOTICES.md and the bundled dependency licenses.
