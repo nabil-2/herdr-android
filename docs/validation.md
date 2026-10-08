@@ -20,10 +20,13 @@ Validated on 2026-10-09 against the installed, unmodified **Herdr 0.9.3**. Live 
 | Android device suite with live fixture | 15 passed | Native JNI/libvterm, explicit terminal controls, Keystore persistence, pairing UI review/cancellation/denial, host-generated QR decoding, real pairing and command delivery |
 | Frozen Linux package smoke | Passed | Self-contained authenticated HTTP server, phone pairing, one-use rejection, snapshot access, device revocation, packaged QR CLI helpers, private credential files, bundled licenses |
 | Installer extraction | Passed | Embedded binary checksum and execution of the extracted packaged CLI |
+| Linux installer and systemd service | Passed | Installed binary/link, real enabled and active user service, stock Herdr health/snapshots, packaged terminal WebSocket, device revocation closing the stream with 1008 |
 
 The 186 automated tests above passed. Optional live cases are skipped in ordinary runs without their fixture arguments. The packaged smoke is an additional end-to-end check against an isolated mock Unix daemon and does not require installed Herdr or Tailscale.
 
 The real Android pairing test reviews and confirms a one-use invitation, stores its device credential through Keystore, opens a live Herdr pane, and sends `printf 'PHONE_QR_PAIRING_E2E_OK\n'`. A separate read-only observer confirmed that marker in the isolated pane's output. Another device test decodes a Segno-generated host PNG using the same ZXing decoder as the CameraX scanner. The legacy manual-profile connection also passed. Tests remove their own saved profiles afterward.
+
+The self-extracting installer was also run against that isolated Herdr session with a real systemd user service manager. Its installed executable served authenticated requests and native Herdr ANSI frames after the installer exited. The test revoked a paired device and verified HTTP rejection and active-stream closure. Only Tailscale and lingering CLI commands were simulated; no real tailnet settings were changed. Cleanup disabled and removed only the temporary companion unit and its files.
 
 [Pairing review](screenshots/pairing.png) · [Workspace dashboard](screenshots/dashboard.png) · [Native terminal](screenshots/terminal.png)
 
