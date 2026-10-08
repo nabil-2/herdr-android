@@ -26,12 +26,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m pip install -r bridge/requirements.lock -r bridge/requirements-build.lock
-      - run: python -m pip install --no-deps -e ./bridge
-      - run: python scripts/build_host.py
+      # setup-python's macOS 3.11 cache stops at the last installer release.
+      # Use the same current, portable runtime on every packaging target.
+      - run: python -m pip install uv==0.12.24
+      - name: Install the packaged Python runtime
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/herdr-pocket-python
+        run: |
+          uv python install 3.11.17
+          uv venv --python 3.11.17 bridge/.venv
+          uv pip install --python bridge/.venv/bin/python -r bridge/requirements.lock -r bridge/requirements-build.lock
+          uv pip install --python bridge/.venv/bin/python --no-deps -e ./bridge
+      - run: bridge/.venv/bin/python scripts/build_host.py
       - name: Exercise the packaged runtime and pairing
         shell: bash
-        run: python scripts/smoke_host_package.py artifacts/host/herdr-pocket-${{ matrix.artifact }}
+        run: bridge/.venv/bin/python scripts/smoke_host_package.py artifacts/host/herdr-pocket-${{ matrix.artifact }}
       - uses: actions/upload-artifact@v4
         with:
           name: herdr-pocket-host-${{ matrix.artifact }}
