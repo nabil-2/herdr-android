@@ -50,7 +50,7 @@ bridge/.venv/bin/python scripts/smoke_host_package.py artifacts/host/herdr-pocke
 
 For all device tests, follow the [isolated fixture instructions](../bridge/README.md#live-android-device-fixture), omitting the `class` filter. Build first, then start the fixture immediately before testing because its invitation expires after five minutes. Stop the fixture and remove its `adb reverse` mapping afterward.
 
-GitHub Actions checks Android JVM/lint/APK and the offline bridge suite. The separate host packaging workflow builds and exercises self-contained companions on Linux x86_64, macOS Apple Silicon, and macOS Intel. [Android/bridge checks](https://github.com/nabil-2/herdr-android/actions/runs/37857944286) and [all three host package checks](https://github.com/nabil-2/herdr-android/actions/runs/37857944438) passed. The delivered Linux package was built with a portable Python 3.11.17 distribution and passed the real installer/service check on glibc 2.34; the Mac packages were downloaded from the successful CI run.
+GitHub Actions checks Android JVM/lint/APK and the offline bridge suite. The separate host packaging workflow builds and exercises self-contained companions on Linux x86_64, macOS Apple Silicon, and macOS Intel. [Android/bridge checks](https://github.com/nabil-2/herdr-android/actions/runs/37857944286) and [all three host package checks](https://github.com/nabil-2/herdr-android/actions/runs/37858901369) passed. The delivered Linux package was built with a portable Python 3.11.17 distribution and passed the real installer/service check on glibc 2.34; the Mac packages were downloaded from the successful CI run.
 
 ## Scope of validation
 
