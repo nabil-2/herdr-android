@@ -7,7 +7,7 @@ Validated on 2026-10-09 against the installed, unmodified **Herdr 0.9.3**. Live 
 - Native Android: Kotlin 2.4.20, Jetpack Compose, ConnectBot Terminal 0.3.11/libvterm, CameraX 1.6.2, ZXing Core 3.5.4.
 - Build: JDK 17, Gradle 9.6.0, Android Gradle Plugin 9.4.0, Android SDK 37.0; minimum API 26, target API 37.
 - Device: Pixel 7 emulator, Android 16/API 36, x86_64, hardware virtualization.
-- Host: Linux x86_64, glibc 2.34, Python 3.11.7; packaged runtime built with PyInstaller 6.22.3. Normal packaged installation requires no separate Python runtime.
+- Host: Linux x86_64, glibc 2.34, Python 3.11.17; packaged runtime built with PyInstaller 6.22.3. Normal packaged installation requires no separate Python runtime.
 
 ## Results
 
@@ -50,7 +50,7 @@ bridge/.venv/bin/python scripts/smoke_host_package.py artifacts/host/herdr-pocke
 
 For all device tests, follow the [isolated fixture instructions](../bridge/README.md#live-android-device-fixture), omitting the `class` filter. Build first, then start the fixture immediately before testing because its invitation expires after five minutes. Stop the fixture and remove its `adb reverse` mapping afterward.
 
-GitHub Actions checks Android JVM/lint/APK and the offline bridge suite. The separate host packaging workflow builds and exercises self-contained companions on Linux x86_64, macOS Apple Silicon, and macOS Intel.
+GitHub Actions checks Android JVM/lint/APK and the offline bridge suite. The separate host packaging workflow builds and exercises self-contained companions on Linux x86_64, macOS Apple Silicon, and macOS Intel. [Android/bridge checks](https://github.com/nabil-2/herdr-android/actions/runs/37857944286) and [all three host package checks](https://github.com/nabil-2/herdr-android/actions/runs/37857944438) passed. The delivered Linux package was built with a portable Python 3.11.17 distribution and passed the real installer/service check on glibc 2.34; the Mac packages were downloaded from the successful CI run.
 
 ## Scope of validation
 
