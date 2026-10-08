@@ -15,11 +15,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .herdr import BridgeError, HerdrClient, stop_observer, validate_pane_id, validate_terminal_frame
+from .pairing import PairingError, PairingStore, valid_name
 
 MAX_BODY_BYTES = 64 * 1024
 
 
-def authorized(header: str | None, token: str) -> bool:
+def authorized(header: str | None, token: str, pairing_store: PairingStore | None = None) -> bool:
     if header is None:
         return False
     scheme, separator, supplied = header.partition(" ")
@@ -27,15 +28,18 @@ def authorized(header: str | None, token: str) -> bool:
         return False
     # Byte comparison accepts only ASCII credentials, without timing-dependent equality.
     try:
-        return hmac.compare_digest(supplied.encode("ascii"), token.encode("ascii"))
+        if hmac.compare_digest(supplied.encode("ascii"), token.encode("ascii")):
+            return True
     except UnicodeError:
         return False
+    return pairing_store is not None and pairing_store.authorized(supplied)
 
 
 class AuthAndBodyLimit:
-    def __init__(self, app, token: str):
+    def __init__(self, app, token: str, pairing_store: PairingStore | None = None):
         self.app = app
         self.token = token
+        self.pairing_store = pairing_store
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or not (scope["path"] == "/v1" or scope["path"].startswith("/v1/")):
@@ -43,7 +47,10 @@ class AuthAndBodyLimit:
             return
         headers = dict(scope["headers"])
         header = headers.get(b"authorization", b"").decode("latin1")
-        if not authorized(header, self.token):
+        # Only the exact exchange endpoint accepts a code instead of a bearer.
+        # It still passes through the identical bounded-body reader below.
+        pairing_request = scope["path"] == "/v1/pair" and scope["method"] == "POST"
+        if not pairing_request and not await asyncio.to_thread(authorized, header, self.token, self.pairing_store):
             await JSONResponse({"detail": "Invalid or missing bearer token"}, 401, headers={"WWW-Authenticate": "Bearer"})(scope, receive, send)
             return
         body = bytearray()
@@ -120,11 +127,26 @@ class WorkspaceRequest(BaseModel):
         return value
 
 
-def create_app(client: HerdrClient, token: str) -> FastAPI:
+class PairRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    # Incorrect code values receive the same 401 as used/expired codes. JSON
+    # shape/type errors and excessive field lengths are invalid requests (422).
+    code: str = Field(max_length=128)
+    deviceName: str = Field(min_length=1, max_length=100)
+
+    @field_validator("deviceName")
+    @classmethod
+    def readable_name(cls, value: str) -> str:
+        if not valid_name(value):
+            raise ValueError("Device name must be nonblank and contain no controls")
+        return value
+
+
+def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | None = None) -> FastAPI:
     if not 32 <= len(token) <= 4096 or not token.isascii() or any(c.isspace() for c in token):
         raise ValueError("Use a generated bearer token of at least 32 ASCII characters")
     app = FastAPI(title="Herdr Android Bridge", docs_url=None, redoc_url=None, openapi_url=None)
-    app.add_middleware(AuthAndBodyLimit, token=token)
+    app.add_middleware(AuthAndBodyLimit, token=token, pairing_store=pairing_store)
 
     @app.exception_handler(BridgeError)
     async def bridge_error(_request, exc: BridgeError):
@@ -133,12 +155,21 @@ def create_app(client: HerdrClient, token: str) -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def invalid_request(_request, _exc):
         # Pydantic's default includes submitted text; keep error responses free of it.
-        return JSONResponse({"detail": "Invalid request: check text, key names, directory and size limits"}, 422)
+        return JSONResponse({"detail": "Invalid request: check text, key names, directory, device name and size limits"}, 422)
+
+    @app.post("/v1/pair")
+    async def pair(request: PairRequest):
+        if pairing_store is None:
+            raise PairingError(503, "Pairing is not configured on this bridge; enable pairing on the host")
+        await asyncio.to_thread(pairing_store.check_challenge, request.code)
+        # A stopped or incompatible Herdr must not consume the one-time code.
+        await client.snapshot()
+        return await asyncio.to_thread(pairing_store.exchange, request.code, request.deviceName)
 
     @app.get("/v1/health")
     async def health():
         snapshot = await client.snapshot()
-        return {"service": "herdr-android-bridge", "protocol": 1, "herdrVersion": snapshot["herdrVersion"]}
+        return {"service": "herdr-android-bridge", "protocol": 1, "herdrVersion": snapshot["herdrVersion"], "pairing": pairing_store is not None}
 
     @app.get("/v1/snapshot")
     async def snapshot():
@@ -161,7 +192,8 @@ def create_app(client: HerdrClient, token: str) -> FastAPI:
             else:
                 await websocket.close(code=1008, reason=detail[:100])
 
-        if not authorized(websocket.headers.get("authorization"), token):
+        auth_header = websocket.headers.get("authorization")
+        if not await asyncio.to_thread(authorized, auth_header, token, pairing_store):
             await deny(401, "Invalid or missing bearer token")
             return
         try:
@@ -206,8 +238,21 @@ def create_app(client: HerdrClient, token: str) -> FastAPI:
                 while await process.stderr.read(4096):
                     pass
 
-            tasks = [asyncio.create_task(forward()), asyncio.create_task(watch_disconnect()), asyncio.create_task(drain_stderr())]
-            done, _pending = await asyncio.wait(tasks[:2], return_when=asyncio.FIRST_COMPLETED)
+            tasks = [asyncio.create_task(forward()), asyncio.create_task(watch_disconnect())]
+            watched = list(tasks)
+            if pairing_store is not None and not authorized(auth_header, token):
+                async def watch_device_access():
+                    while True:
+                        await asyncio.sleep(1)
+                        if not await asyncio.to_thread(authorized, auth_header, token, pairing_store):
+                            await websocket.close(code=1008, reason="Device access was revoked; pair again on the host")
+                            return
+
+                access_task = asyncio.create_task(watch_device_access())
+                tasks.append(access_task)
+                watched.append(access_task)
+            tasks.append(asyncio.create_task(drain_stderr()))
+            done, _pending = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
         except (BridgeError, ValueError) as exc:

@@ -75,4 +75,6 @@ data class HerdrUiState(
     val sending: Boolean = false,
     val creatingWorkspace: Boolean = false,
     val inputRevision: Long = 0,
+    val pairing: Boolean = false,
+    val pairingSuccessRevision: Long = 0,
 )

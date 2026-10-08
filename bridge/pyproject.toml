@@ -4,16 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "herdr-android-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Authenticated local companion for the native Herdr Android client"
 requires-python = ">=3.11"
-dependencies = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.32,<1", "pydantic>=2.9,<3", "anyio>=4,<5"]
+dependencies = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.32,<1", "pydantic>=2.9,<3", "anyio>=4,<5", "segno>=1.6,<2"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "httpx>=0.27,<1"]
 
 [project.scripts]
 herdr-android-bridge = "herdr_bridge.__main__:main"
+herdr-pocket = "herdr_bridge.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["herdr_bridge*"]

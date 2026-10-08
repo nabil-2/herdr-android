@@ -26,7 +26,7 @@ def observer(tmp_path, monkeypatch):
     script.write_text("""#!/usr/bin/env python3
 import json, os, pathlib, signal, sys, time
 pathlib.Path(os.environ['TEST_PID']).write_text(str(os.getpid()))
-pathlib.Path(os.environ['TEST_ARGS']).write_text(json.dumps({'args': sys.argv[1:], 'socket': os.environ['HERDR_SOCKET_PATH']}))
+pathlib.Path(os.environ['TEST_ARGS']).write_text(json.dumps({'args': sys.argv[1:], 'socket': os.environ['HERDR_SOCKET_PATH'], 'libraryPath': os.environ.get('LD_LIBRARY_PATH')}))
 if os.environ.get('TEST_IGNORE_TERM'):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 # A large diagnostic pipe must be drained while the stdout stream stays live.
@@ -49,7 +49,20 @@ else:
             return normalize_snapshot(SNAPSHOT)
 
     backend = Client(tmp_path / "chosen-session.sock", str(script))
-    return create_app(backend, TOKEN), pid_path, args_path
+    app = create_app(backend, TOKEN)
+    app.state.test_backend = backend
+    return app, pid_path, args_path
+
+
+@pytest.fixture
+def paired_observer(observer, tmp_path):
+    from herdr_bridge.pairing import PairingStore
+    old_app, pid_path, args_path = observer
+    store = PairingStore(tmp_path / "devices.json")
+    pending = store.begin_pairing("Test host")
+    device = store.exchange(pending["code"], "Test phone")
+    app = create_app(old_app.state.test_backend, TOKEN, store)
+    return app, pid_path, args_path, store, device
 
 
 def assert_reaped(pid_path: Path):
@@ -141,3 +154,57 @@ def test_malformed_cli_frame_closes_stream_and_reaps(observer, monkeypatch):
 def test_invalid_terminal_envelopes_rejected(frame):
     with pytest.raises(BridgeError, match="invalid terminal frame"):
         validate_terminal_frame(json.dumps(frame).encode())
+
+
+def test_paired_device_can_observe_and_owner_token_remains_valid(paired_observer):
+    app, pid_path, _, store, device = paired_observer
+    device_headers = {"Authorization": f"Bearer {device['token']}"}
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/terminals/w1:p1/stream", headers=device_headers) as websocket:
+            assert websocket.receive_json() == FRAME
+        # A revoked device never prevents the independent legacy owner from access.
+        assert store.revoke(device["deviceId"])
+        store.path.write_bytes(b"unavailable device registry")
+        with client.websocket_connect("/v1/terminals/w1:p1/stream", headers=AUTH) as websocket:
+            assert websocket.receive_json() == FRAME
+    assert_reaped(pid_path)
+
+
+def test_revoked_device_is_rejected_before_websocket_observer_spawn(paired_observer):
+    app, pid_path, _, store, device = paired_observer
+    assert store.revoke(device["deviceId"])
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDenialResponse) as exc:
+            with client.websocket_connect("/v1/terminals/w1:p1/stream", headers={"Authorization": f"Bearer {device['token']}"}):
+                pytest.fail("Revoked device must not connect")
+        assert exc.value.status_code == 401
+    assert not pid_path.exists()
+
+
+def test_revocation_closes_active_device_observer_and_reaps_process(paired_observer):
+    app, pid_path, _, store, device = paired_observer
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/terminals/w1:p1/stream", headers={"Authorization": f"Bearer {device['token']}"}) as websocket:
+            assert websocket.receive_json() == FRAME
+            from herdr_bridge.pairing import PairingStore
+            assert PairingStore(store.path).revoke(device["deviceId"])
+            with pytest.raises(WebSocketDisconnect) as exc:
+                websocket.receive_text()
+            assert exc.value.code == 1008
+    assert_reaped(pid_path)
+
+
+def test_frozen_terminal_observer_uses_system_libraries_and_exact_socket(observer, monkeypatch):
+    from herdr_bridge import runtime
+    app, pid_path, args_path = observer
+    monkeypatch.setattr(runtime.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(runtime.sys, "platform", "linux")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/fake-pyinstaller-bundle")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/observer-original-system-libs")
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/terminals/w1:p1/stream", headers=AUTH) as websocket:
+            assert websocket.receive_json() == FRAME
+    child = json.loads(args_path.read_text())
+    assert child["libraryPath"] == "/observer-original-system-libs"
+    assert child["socket"].endswith("chosen-session.sock")
+    assert_reaped(pid_path)

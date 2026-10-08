@@ -47,4 +47,21 @@ class ConnectionPermissionGateTest {
         assertEquals(listOf(target), actions)
         assertEquals(0, requests)
     }
+
+    @Test
+    fun qrSecretsStayOutOfSavedStateAndDiagnosticStrings() {
+        val secretPayload = "sensitive one-use pairing invitation"
+        val actions = mutableListOf<PendingNetworkAction>()
+        val gate = ConnectionPermissionGate({ false }, {}, { actions += it }, {})
+        gate.run(PendingNetworkAction(NetworkActionKind.PAIR, secretPayload))
+        assertNull(gate.restorableAction())
+        assertTrue(!gate.pending.toString().contains(secretPayload))
+        val recreated = ConnectionPermissionGate({ true }, {}, { actions += it }, {})
+        recreated.pending = gate.restorableAction()
+        recreated.onResult(true)
+        assertTrue(actions.isEmpty())
+        gate.onResult(true)
+        assertEquals(1, actions.size)
+        assertEquals(secretPayload, actions.single().id)
+    }
 }

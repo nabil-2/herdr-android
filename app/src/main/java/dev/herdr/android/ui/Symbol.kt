@@ -14,7 +14,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 
-internal enum class Symbol { BACK, PLUS, REFRESH, SERVER, NEXT, CLOSE, TERMINAL, SEND, DELETE }
+internal enum class Symbol { BACK, PLUS, REFRESH, SERVER, NEXT, CLOSE, TERMINAL, SEND, DELETE, QR }
 
 /** Small local vector set; no image assets or icon-font dependency. */
 @Composable
@@ -25,6 +25,14 @@ internal fun SymbolIcon(symbol: Symbol, description: String? = null, modifier: M
         fun line(x1: Float, y1: Float, x2: Float, y2: Float) =
             drawLine(color, Offset(x1 * unit, y1 * unit), Offset(x2 * unit, y2 * unit), 1.8f * unit)
         when (symbol) {
+            Symbol.QR -> {
+                for ((x, y) in listOf(3f to 3f, 14f to 3f, 3f to 14f)) {
+                    drawRoundRect(color, Offset(x * unit, y * unit), Size(7f * unit, 7f * unit), CornerRadius(unit), style = Stroke(1.8f * unit))
+                    drawRect(color, Offset((x + 2.5f) * unit, (y + 2.5f) * unit), Size(2f * unit, 2f * unit))
+                }
+                line(14f, 15f, 20f, 15f); line(15f, 15f, 15f, 20f)
+                drawRect(color, Offset(18f * unit, 18f * unit), Size(3f * unit, 3f * unit))
+            }
             Symbol.BACK -> { line(19f, 12f, 5f, 12f); line(5f, 12f, 11f, 6f); line(5f, 12f, 11f, 18f) }
             Symbol.PLUS -> { line(5f, 12f, 19f, 12f); line(12f, 5f, 12f, 19f) }
             Symbol.CLOSE -> { line(6f, 6f, 18f, 18f); line(18f, 6f, 6f, 18f) }

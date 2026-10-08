@@ -12,6 +12,8 @@ import re
 import stat
 import uuid
 
+from .runtime import external_environment
+
 
 PANE_ID = re.compile(r"w[1-9][0-9]*:p[1-9][0-9]*\Z")
 MAX_FRAME_BYTES = 2 * 1024 * 1024
@@ -104,7 +106,7 @@ class HerdrClient:
         snapshot = await self.snapshot()
         if not any(pane["id"] == pane_id for pane in snapshot["panes"]):
             raise BridgeError(409, "Pane is no longer available; refresh the workspace")
-        env = dict(os.environ)
+        env = external_environment()
         env["HERDR_SOCKET_PATH"] = str(self.socket_path)
         env.pop("HERDR_SOCKET", None)
         try:

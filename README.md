@@ -1,59 +1,75 @@
 # Herdr Pocket
 
-A native Android companion for the Herdr agents and terminals already running on your computer or server. Connect the host and phone to Tailscale, then open your work from your phone.
+A native Android companion for the Herdr agents and terminals already running on your computer or server. Connect your host and phone through Tailscale, run the host installer, then scan its pairing code.
 
-The app is written in Kotlin and Jetpack Compose. Terminal rendering uses ConnectBot's native libvterm-backed terminal component. There is no WebView, browser wrapper, or Herdr fork. A small authenticated Python bridge runs next to the existing Herdr daemon.
+The app uses Kotlin, Jetpack Compose, and ConnectBot's native libvterm terminal component. A small authenticated companion runs beside your existing Herdr daemon. Herdr does not need to be forked or changed.
 
 ## What works
 
-- Save multiple server profiles and switch between them. Access tokens are encrypted using Android Keystore, excluded from backups, and sent only in Authorization headers.
-- Browse workspaces, tabs, agent states, and shell panes. Status refreshes while the app is in the foreground.
+- Scan or paste a pairing invitation, review the host, and explicitly confirm pairing. Each phone receives its own revocable credential, encrypted locally with Android Keystore and excluded from backups.
+- Save multiple server profiles and switch between them.
+- Browse workspaces, tabs, agent states, and shell panes, with agents needing input grouped together. Status refreshes while the app is in the foreground.
 - Watch live ANSI terminal output, including colors, cursor movement, and agent terminal interfaces.
 - Send literal text with optional Enter, or use the Enter, Escape, Tab, arrow and Ctrl+C controls. Typing a draft does not send it. Failed sends retain the draft and are never replayed automatically.
 - Create a workspace on the host, then launch an agent from its shell.
 - Reconnect terminal observation after a temporary connection loss without taking the desktop's terminal controller or resizing its panes.
 
-Requires Android 8.0+ (API 26). The companion service requires Python 3.11+, Linux or macOS, and Herdr 0.9.3. Connect it to a running Herdr session as the same Unix user that owns the session.
+Requires Android 8.0+ (API 26), a running Herdr session on Linux or macOS, and Tailscale installed and signed into the same tailnet on both devices. The host companion runs as the Unix user who owns the Herdr session. The current integration targets Herdr 0.9.3.
 
 <p>
+  <img src="docs/screenshots/pairing.png" width="240" alt="Herdr Pocket host review before confirming QR pairing">
   <img src="docs/screenshots/dashboard.png" width="240" alt="Herdr Pocket workspace dashboard from the live device test">
   <img src="docs/screenshots/terminal.png" width="240" alt="Native Herdr terminal displaying a command executed from the Android app">
 </p>
 
-## Install the Android app
+## Install and pair
 
-Download the APK from this repository's [preview releases](https://github.com/nabil-2/herdr-android/releases). The initial preview is a debug-signed APK intended for sideloading; it is not an app-store release. Android may ask you to allow installation from the browser or file manager you use.
+**1. Install the phone app.** Download the APK from the [releases page](https://github.com/nabil-2/herdr-android/releases) and open it on your phone. This preview is a debug-signed APK for sideloading; Android may ask you to allow installation from your browser or file manager. Keep Tailscale connected on the phone. The app uses that existing network connection and does not manage Tailscale or request its credentials.
 
-Install Tailscale on your phone and sign into the same tailnet as your host. The app uses that existing network connection and does not manage Tailscale or request your Tailscale credentials.
+**2. Run the host installer.** From the same release, download the asset matching your host:
 
-On Android 17 and later, allow the **Local network** permission when connecting. If you deny it, enable it in Android's app settings before reconnecting.
+| Host | Installer |
+| --- | --- |
+| Linux, Intel/AMD 64-bit | `herdr-pocket-setup-linux-x86_64.sh` |
+| macOS, Apple Silicon | `herdr-pocket-setup-macos-arm64.sh` |
+| macOS, Intel | `herdr-pocket-setup-macos-x86_64.sh` |
 
-## Start the host companion
-
-Clone this repository on the machine where Herdr is running. From its root:
-
-```sh
-python3 -m venv bridge/.venv
-bridge/.venv/bin/python -m pip install -r bridge/requirements.lock
-bridge/.venv/bin/python -m pip install --no-deps -e ./bridge
-bridge/.venv/bin/herdr-android-bridge init-token
-bridge/.venv/bin/herdr-android-bridge serve
-```
-
-Copy the token printed by `init-token` into the Android app's server profile. It is stored in `~/.config/herdr-android/token` with owner-only permissions. Keep the bridge terminal running; closing the companion stops phone access but does not stop Herdr's agents. See [bridge setup](bridge/README.md) for named sessions and explicit socket paths.
-
-In a second host terminal, expose the loopback service privately through Tailscale:
+For example, open a host terminal in the download directory and run:
 
 ```sh
-tailscale serve --bg http://127.0.0.1:8765
-tailscale serve status
+bash herdr-pocket-setup-linux-x86_64.sh
 ```
 
-Use the HTTPS address printed by Tailscale, such as `https://my-host.my-tailnet.ts.net`. [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve) may prompt you to enable HTTPS for your tailnet. Tailnet access rules must allow your phone to reach this host. Serve keeps this endpoint inside your tailnet.
+Use the matching filename on macOS. Run it as your normal user, without `sudo`. The installer includes its runtime, so Python and Git are not required. Herdr and Tailscale must already be installed and running. If you have several Herdr sessions, setup asks you to choose one.
 
-Open **Herdr Pocket → Add server** and enter a display name, that HTTPS URL, and the bridge token. Tap **Save & connect**, then choose a workspace, tab and pane. Sending a prompt to an agent uses the same running terminal you see on your desktop. The companion token grants control of the selected Herdr session.
+Setup installs a background companion for that session, keeps its HTTP listener on loopback, and configures private [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve) HTTPS on an unused port starting at 8443. It preserves existing Serve endpoints. Tailscale may print a one-time HTTPS approval URL; follow that prompt. Your tailnet's access rules must allow the phone to reach the selected host and port.
 
-For direct private-network development, the app also accepts HTTP on numeric Tailscale addresses (`100.64.0.0/10` or `fd7a:115c:a1e0::/48`) and loopback. To use a direct Tailscale IP, bind the bridge to that specific IP using `--host`, then enter `http://100.x.y.z:8765`. HTTPS with Serve is the default setup. Arbitrary HTTP hosts, credentials inside URLs, redirects, and untrusted TLS certificates are rejected.
+Linux setup requires a working systemd user service manager. It attempts to enable user lingering so the companion can start at boot and stay running after logout; if your system denies that, an administrator must enable lingering for unattended access. macOS setup installs a LaunchAgent that starts at login and runs while that user is logged in. Herdr must remain running independently.
+
+**3. Pair the phone.** Setup displays a QR code. In Herdr Pocket, tap **Scan pairing code**, allow camera access, review the host name and HTTPS address, then tap **Pair & connect**. The scanner decodes locally and does not save or upload camera images. On Android 17 and later, allow **Local network** access when connecting. If denied, enable it in Android's app settings before reconnecting.
+
+If scanning is inconvenient, run the following on the host and paste the complete JSON into **Paste pairing code** in the app:
+
+```sh
+~/.local/bin/herdr-pocket pair --plain
+```
+
+Each code expires after five minutes and pairs one phone. It is exchanged for a separate device credential; you never need to copy the host's permanent owner token. If a code expires or has already been used, generate a new one. After connecting, choose a workspace, tab, and pane to control the same running terminal you use on your desktop.
+
+## Manage phone access
+
+Generate another QR code, check the companion, list paired devices, or revoke one device using its ID from the list:
+
+```sh
+~/.local/bin/herdr-pocket pair
+~/.local/bin/herdr-pocket status
+~/.local/bin/herdr-pocket devices
+~/.local/bin/herdr-pocket revoke-device DEVICE_ID
+```
+
+For another running Herdr session, run `~/.local/bin/herdr-pocket setup --session NAME`. Each session has its own companion, address, and device registry. Add `--session NAME` to `pair`, `status`, `devices`, and `revoke-device` when selecting among configured sessions. Revocation rejects subsequent requests and closes an active phone terminal stream.
+
+Existing manual profiles remain supported through **Advanced: manual server setup**, or **Add server** beside existing profiles. See [host companion setup](bridge/README.md) for source installation, explicit sockets, and manual network configuration.
 
 ## Develop and test
 
@@ -76,21 +92,20 @@ With an emulator or test phone attached:
 ./gradlew :app:connectedDebugAndroidTest
 ```
 
-Bridge checks:
+For host checks, install the [source environment](bridge/README.md#install-from-source), then run:
 
 ```sh
-bridge/.venv/bin/python -m pip install -e './bridge[test]'
 bridge/.venv/bin/python -m pytest bridge/tests -q
 HERDR_INTEGRATION=1 bridge/.venv/bin/python -m pytest bridge/tests/test_live_herdr.py -q
 ```
 
-The live integration test creates and cleans up an isolated named Herdr session. It does not send commands to an existing user pane. The [live Android fixture](bridge/README.md#live-android-device-fixture) also tests the native app against a real bridge and Herdr shell. GitHub Actions builds the APK and runs Android JVM/lint and bridge checks on pushes.
+The live integration test creates and cleans up an isolated named Herdr session. It does not send commands to an existing user pane. The [Android device fixture](bridge/README.md#live-android-device-fixture) exercises the app against a real companion and Herdr shell, including host-generated QR decoding and pairing. GitHub Actions builds the APK, runs JVM/lint and host checks, and packages the supported host installers.
 
-See [protocol](docs/protocol.md) for the app/service interface and [validation](docs/validation.md) for this preview's results.
+See [protocol](docs/protocol.md) for the app/service interface and [validation](docs/validation.md) for this preview's results. Physical camera scanning and macOS login-service behavior need testing on their respective hardware; emulator checks do not establish those results.
 
 ## Current limits
 
-The preview has foreground status and terminal observation; background push notifications are not implemented. The app sends input through the selected pane's terminal, rather than interpreting agent-specific approval menus. Remote terminal scrollback and direct SSH connections are not implemented. The host and Herdr daemon must remain online. Native Windows hosts are not supported by this first companion because Herdr's terminal observer requires Linux or macOS.
+Status and terminal observation run while the app is in the foreground; background push notifications are not implemented. Agent prompts and approval menus are controlled through the selected terminal. Remote terminal scrollback and direct SSH connections are not implemented. The host, Tailscale, and Herdr daemon must remain online. Native Windows hosts are not supported because Herdr's terminal observer requires Linux or macOS.
 
 ## License
 

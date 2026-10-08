@@ -37,7 +37,7 @@ class MainActivity : ComponentActivity() {
             execute = ::executeNetworkAction,
             onDenied = herdr::localNetworkPermissionDenied,
         )
-        val restoredKind = NetworkActionKind.entries.firstOrNull { it.name == savedInstanceState?.getString("pending_network_kind") }
+        val restoredKind = NetworkActionKind.entries.firstOrNull { it != NetworkActionKind.PAIR && it.name == savedInstanceState?.getString("pending_network_kind") }
         val restoredId = savedInstanceState?.getString("pending_network_id")
         if (restoredKind != null && restoredId != null) permissionGate.pending = PendingNetworkAction(restoredKind, restoredId)
         lifecycle.addObserver(LifecycleEventObserver { _, event ->
@@ -47,7 +47,7 @@ class MainActivity : ComponentActivity() {
                 else -> Unit
             }
         })
-        setContent { HerdrApp(herdr, ::connectWithNetworkPermission, ::retryTerminalWithNetworkPermission) }
+        setContent { HerdrApp(herdr, ::connectWithNetworkPermission, ::retryTerminalWithNetworkPermission, ::pairWithNetworkPermission) }
     }
 
     private fun hasLocalNetworkPermission(): Boolean = Build.VERSION.SDK_INT < 37 ||
@@ -61,16 +61,22 @@ class MainActivity : ComponentActivity() {
         permissionGate.run(PendingNetworkAction(NetworkActionKind.OBSERVE, paneId))
     }
 
+    private fun pairWithNetworkPermission(payload: String) {
+        permissionGate.run(PendingNetworkAction(NetworkActionKind.PAIR, payload))
+    }
+
     private fun executeNetworkAction(action: PendingNetworkAction) {
         when (action.kind) {
             NetworkActionKind.CONNECT -> if (herdr.state.value.profiles.any { it.id == action.id }) herdr.connect(action.id)
             NetworkActionKind.OBSERVE -> if (herdr.state.value.paneId == action.id) herdr.selectPane(action.id)
+            NetworkActionKind.PAIR -> herdr.pairServer(action.id)
         }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        outState.putString("pending_network_kind", permissionGate.pending?.kind?.name)
-        outState.putString("pending_network_id", permissionGate.pending?.id)
+        val restorable = permissionGate.restorableAction()
+        outState.putString("pending_network_kind", restorable?.kind?.name)
+        outState.putString("pending_network_id", restorable?.id)
         super.onSaveInstanceState(outState)
     }
 

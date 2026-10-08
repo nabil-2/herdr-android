@@ -1,6 +1,10 @@
 package dev.herdr.android.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -31,6 +35,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -39,14 +44,17 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -58,6 +66,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.core.content.ContextCompat
 import dev.herdr.android.data.ConnectionState
 import dev.herdr.android.data.HerdrUiState
 import dev.herdr.android.HerdrViewModel
@@ -65,23 +74,70 @@ import dev.herdr.android.data.Pane
 import dev.herdr.android.data.ServerProfile
 
 @Composable
-fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalRetry: (String) -> Unit) {
+fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalRetry: (String) -> Unit, onPair: (String) -> Unit) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     var showServers by rememberSaveable { mutableStateOf(false) }
     var showAddServer by rememberSaveable { mutableStateOf(false) }
     var editingProfileId by rememberSaveable { mutableStateOf<String?>(null) }
     val editingProfile = state.profiles.firstOrNull { it.id == editingProfileId }
     var showNewWorkspace by rememberSaveable { mutableStateOf(false) }
+    var showPairing by rememberSaveable { mutableStateOf(false) }
+    var pairingMode by rememberSaveable { mutableStateOf(PairingEntryMode.SCAN) }
+    var pairingStartRevision by rememberSaveable { mutableLongStateOf(0L) }
+    val context = LocalContext.current
+    var cameraGranted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
+    var cameraDenied by rememberSaveable { mutableStateOf(false) }
+    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        cameraGranted = granted
+        cameraDenied = !granted
+    }
+    val requestCamera: () -> Unit = {
+        cameraGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        cameraDenied = false
+        if (!cameraGranted) cameraPermission.launch(Manifest.permission.CAMERA)
+    }
+    val openScan: () -> Unit = {
+        viewModel.clearError()
+        pairingStartRevision = state.pairingSuccessRevision
+        pairingMode = PairingEntryMode.SCAN
+        showPairing = true
+        requestCamera()
+    }
+    val openPaste: () -> Unit = {
+        viewModel.clearError()
+        pairingStartRevision = state.pairingSuccessRevision
+        pairingMode = PairingEntryMode.PASTE
+        showPairing = true
+    }
+    LaunchedEffect(state.pairingSuccessRevision, showPairing) {
+        if (showPairing && state.pairingSuccessRevision > pairingStartRevision) {
+            showPairing = false
+            showServers = false
+        }
+    }
     val serversVisible = showServers || state.activeProfileId == null
-    BackHandler(enabled = showServers && state.activeProfileId != null) { showServers = false }
+    BackHandler(enabled = showServers && state.activeProfileId != null && !showPairing) { showServers = false }
 
     HerdrTheme {
         when {
+            showPairing -> PairingScreen(
+                initialMode = pairingMode,
+                cameraGranted = cameraGranted,
+                cameraDenied = cameraDenied,
+                pairing = state.pairing,
+                error = state.error,
+                onRequestCamera = requestCamera,
+                onPair = onPair,
+                onClearError = viewModel::clearError,
+                onClose = { viewModel.cancelPairing(); viewModel.clearError(); showPairing = false },
+            )
             serversVisible -> ServersScreen(
                 state = state,
                 canGoBack = state.activeProfileId != null,
                 onBack = { showServers = false },
                 onAdd = { viewModel.clearError(); editingProfileId = null; showAddServer = true },
+                onScan = openScan,
+                onPaste = openPaste,
                 onEdit = { viewModel.clearError(); editingProfileId = it.id; showAddServer = true },
                 onConnect = {
                     if (it != state.activeProfileId || state.connection != ConnectionState.CONNECTED) onConnect(it)
@@ -135,6 +191,8 @@ private fun ServersScreen(
     canGoBack: Boolean,
     onBack: () -> Unit,
     onAdd: () -> Unit,
+    onScan: () -> Unit,
+    onPaste: () -> Unit,
     onEdit: (ServerProfile) -> Unit,
     onConnect: (String) -> Unit,
     onDelete: (String) -> Unit,
@@ -149,13 +207,16 @@ private fun ServersScreen(
                 navigationIcon = {
                     if (canGoBack) IconButton(onClick = onBack) { SymbolIcon(Symbol.BACK, "Back to workspaces") }
                 },
-                actions = { IconButton(onClick = onAdd) { SymbolIcon(Symbol.PLUS, "Add server") } },
+                actions = {
+                    IconButton(onClick = onScan) { SymbolIcon(Symbol.QR, "Scan pairing code") }
+                    IconButton(onClick = onAdd) { SymbolIcon(Symbol.SERVER, "Add server") }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = CanvasColor),
             )
         },
         floatingActionButton = {
             if (state.profiles.isNotEmpty()) ExtendedFloatingActionButton(
-                onClick = onAdd, icon = { SymbolIcon(Symbol.PLUS) }, text = { Text("Add server") },
+                onClick = onScan, icon = { SymbolIcon(Symbol.QR) }, text = { Text("Pair server") },
             )
         },
     ) { padding ->
@@ -168,17 +229,20 @@ private fun ServersScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     BrandMark()
                     Text("Your agents. Anywhere.", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
-                    Text("Connect to the Herdr bridge on your computer. Join the same Tailscale network on your phone first.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Pair your computer with a scan. Join the same Tailscale network on your phone first.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (state.profiles.isNotEmpty()) TextButton(onClick = onPaste) { Text("Paste pairing code") }
                 }
             }
             if (state.error != null) item { ErrorNotice(state.error, onDismissError) }
             if (state.profiles.isEmpty()) item {
                 OutlinedCard(modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                        SymbolIcon(Symbol.SERVER)
-                        Text("Add your first server", style = MaterialTheme.typography.titleMedium)
-                        Text("Use the HTTPS address and access token from your bridge setup. Your token is stored encrypted on this device.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Button(onClick = onAdd, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Connect a server") }
+                        SymbolIcon(Symbol.QR)
+                        Text("Pair your computer", style = MaterialTheme.typography.titleMedium)
+                        Text("Open a pairing code from Herdr Pocket on your server. Scan it here, review the computer, and connect.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Button(onClick = onScan, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Scan pairing code") }
+                        OutlinedButton(onClick = onPaste, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Paste pairing code") }
+                        TextButton(onClick = onAdd, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Advanced: manual server setup") }
                     }
                 }
             }

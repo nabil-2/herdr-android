@@ -1,0 +1,38 @@
+name: Host packages
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            artifact: linux-x86_64
+          - runner: macos-14
+            artifact: macos-arm64
+          - runner: macos-15-intel
+            artifact: macos-x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r bridge/requirements.lock -r bridge/requirements-build.lock
+      - run: python -m pip install --no-deps -e ./bridge
+      - run: python scripts/build_host.py
+      - name: Exercise the packaged runtime and pairing
+        shell: bash
+        run: python scripts/smoke_host_package.py artifacts/host/herdr-pocket-${{ matrix.artifact }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: herdr-pocket-host-${{ matrix.artifact }}
+          path: artifacts/host/*

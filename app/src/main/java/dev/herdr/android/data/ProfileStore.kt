@@ -39,7 +39,7 @@ class ProfileStore(context: Context) {
     @Synchronized
     fun save(name: String, baseUrl: String, token: String, id: String? = null): ServerProfile {
         val cleanName = name.trim()
-        require(cleanName.isNotEmpty() && cleanName.length <= 100) { "Enter a server name (up to 100 characters)." }
+        require(cleanName.isNotEmpty() && cleanName.codePointCount(0, cleanName.length) <= 100) { "Enter a server name (up to 100 characters)." }
         val cleanUrl = ServerAddress.validate(baseUrl).toString()
         val cleanToken = ServerAddress.validateToken(token)
         val profileId = id ?: UUID.randomUUID().toString()

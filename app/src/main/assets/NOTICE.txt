@@ -7,4 +7,10 @@ on the host. This application talks to Herdr's public API and terminal-session C
 
 Terminal rendering uses ConnectBot Terminal (org.connectbot:termlib), licensed
 under Apache License 2.0, and its embedded libvterm, licensed under MIT.
+The native camera preview uses AndroidX CameraX, licensed under Apache License
+2.0. Offline pairing-code decoding uses ZXing Core (com.google.zxing:core),
+licensed under Apache License 2.0. Camera images are not uploaded or saved.
+AndroidX/Jetpack Compose, Kotlin, kotlinx.coroutines, kotlinx.serialization,
+OkHttp and Okio are also licensed under Apache License 2.0.
+The bundled Apache 2.0 and libvterm MIT texts are in assets/licenses.
 See THIRD_PARTY_NOTICES.md and the bundled dependency licenses.

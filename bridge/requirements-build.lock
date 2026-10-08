@@ -1,0 +1,5 @@
+# Packaging tools only. Install requirements.lock first.
+altgraph==0.17.5
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+macholib==1.16.4; sys_platform == 'darwin'

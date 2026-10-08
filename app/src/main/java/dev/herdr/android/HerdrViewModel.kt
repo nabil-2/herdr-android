@@ -10,6 +10,9 @@ import dev.herdr.android.data.ConnectionState
 import dev.herdr.android.data.HerdrClient
 import dev.herdr.android.data.HerdrUiState
 import dev.herdr.android.data.ProfileStore
+import dev.herdr.android.data.PairingClient
+import dev.herdr.android.data.PairingException
+import dev.herdr.android.data.PairingPayload
 import dev.herdr.android.data.Snapshot
 import dev.herdr.android.data.TerminalContent
 import dev.herdr.android.data.TerminalEndedException
@@ -18,6 +21,7 @@ import dev.herdr.android.data.TerminalMessage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -28,6 +32,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.UUID
 
 class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     private val profileStore = ProfileStore(application)
@@ -48,6 +53,8 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     private var terminalJob: Job? = null
     private var inputJob: Job? = null
     private var createJob: Job? = null
+    private var pairingJob: Job? = null
+    private var pairingClient: PairingClient? = null
 
     init {
         reloadProfiles()
@@ -78,6 +85,65 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         } catch (_: Exception) { showError("Could not remove this profile.") }
     }
 
+    fun pairServer(payload: String) {
+        if (state.value.pairing || !ensureNetworkPermission()) return
+        val invitation = try { PairingPayload.parse(payload) }
+        catch (error: PairingException) { showError(error.message ?: "Generate a new pairing code on your server."); return }
+        releaseConnection()
+        val currentGeneration = generation
+        val profileId = UUID.randomUUID().toString()
+        val newClient = PairingClient()
+        pairingClient = newClient
+        mutableState.update {
+            HerdrUiState(profiles = it.profiles, pairing = true, pairingSuccessRevision = it.pairingSuccessRevision)
+        }
+        pairingJob = viewModelScope.launch {
+            var stored = false
+            try {
+                val deviceName = listOf(Build.MANUFACTURER, Build.MODEL).joinToString(" ")
+                    .filter { it.code >= 32 && it.code != 127 }.take(100).ifBlank { "Android phone" }
+                val result = newClient.pair(invitation, deviceName)
+                if (generation != currentGeneration) return@launch
+                withContext(Dispatchers.IO) {
+                    profileStore.save(result.serverName, invitation.url, result.token, profileId)
+                    stored = true
+                }
+                if (generation != currentGeneration) return@launch
+                reloadProfiles()
+                // Keep the monotonic success signal when connect replaces UI state.
+                mutableState.update {
+                    it.copy(pairing = false, pairingSuccessRevision = it.pairingSuccessRevision + 1, error = null)
+                }
+                pairingJob = null
+                pairingClient = null
+                newClient.close()
+                connect(profileId)
+            } catch (cancelled: CancellationException) {
+                // Cancellation during a Keystore write must not leave a surprise profile.
+                if (stored) withContext(NonCancellable + Dispatchers.IO) {
+                    runCatching { profileStore.remove(profileId) }
+                }
+                throw cancelled
+            } catch (error: Exception) {
+                if (generation == currentGeneration) showError(
+                    if (error is PairingException) error.message ?: "Pairing failed. Generate a new code."
+                    else "Could not securely save this server. Generate a new pairing code before trying again.",
+                )
+            } finally {
+                newClient.close()
+                if (generation == currentGeneration) {
+                    pairingClient = null
+                    pairingJob = null
+                    mutableState.update { it.copy(pairing = false) }
+                }
+            }
+        }
+    }
+
+    fun cancelPairing() {
+        if (state.value.pairing) disconnect()
+    }
+
     fun connect(profileId: String) {
         if (!ensureNetworkPermission()) return
         releaseConnection()
@@ -87,6 +153,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
                 profiles = it.profiles,
                 activeProfileId = profileId,
                 connection = ConnectionState.CONNECTING,
+                pairingSuccessRevision = it.pairingSuccessRevision,
             )
         }
         connectJob = viewModelScope.launch {
@@ -117,7 +184,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
 
     fun disconnect() {
         releaseConnection()
-        mutableState.update { HerdrUiState(profiles = it.profiles) }
+        mutableState.update { HerdrUiState(profiles = it.profiles, pairingSuccessRevision = it.pairingSuccessRevision) }
     }
 
     fun localNetworkPermissionDenied() {
@@ -177,6 +244,10 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         if (id == null) {
             mutableState.update { it.copy(paneId = null) }
         } else {
+            if (state.value.pairing) {
+                cancelPairing()
+                showError("Pairing was canceled. Generate a new code before trying again.")
+            }
             val pane = state.value.snapshot?.panes?.firstOrNull { it.id == id } ?: return
             mutableState.update { it.copy(workspaceId = pane.workspaceId, tabId = pane.tabId, paneId = pane.id) }
         }
@@ -331,13 +402,16 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     private fun releaseConnection() {
         generation++
         terminalSession++
-        listOf(connectJob, refreshJob, autoRefreshJob, terminalJob, inputJob, createJob).forEach { it?.cancel() }
+        listOf(connectJob, refreshJob, autoRefreshJob, terminalJob, inputJob, createJob, pairingJob).forEach { it?.cancel() }
         connectJob = null
         refreshJob = null
         autoRefreshJob = null
         terminalJob = null
         inputJob = null
         createJob = null
+        pairingJob = null
+        pairingClient?.close()
+        pairingClient = null
         client?.close()
         client = null
     }

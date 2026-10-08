@@ -1,34 +1,36 @@
-# Preview validation
+# Preview 0.2.0 validation
 
-Validated on 2026-10-08 against the installed, unmodified **Herdr 0.9.3**. The phone client and companion live tests used a newly created UUID-named Herdr session and its own temporary shell directory. No commands were sent to existing user panes.
+Validated on 2026-10-09 against the installed, unmodified **Herdr 0.9.3**. Live tests created UUID-named Herdr sessions and temporary shell directories. No commands were sent to existing user panes.
 
 ## Environment
 
-- Android app: Kotlin 2.4.20, Jetpack Compose, ConnectBot Terminal 0.3.11 and native libvterm; no WebView.
+- Native Android: Kotlin 2.4.20, Jetpack Compose, ConnectBot Terminal 0.3.11/libvterm, CameraX 1.6.2, ZXing Core 3.5.4.
 - Build: JDK 17, Gradle 9.6.0, Android Gradle Plugin 9.4.0, Android SDK 37.0; minimum API 26, target API 37.
-- Device checks: Pixel 7 emulator, Android 16 / API 36, x86_64, hardware virtualization.
-- Bridge: Python 3.11 virtual environment installed from `bridge/requirements.lock`.
+- Device: Pixel 7 emulator, Android 16/API 36, x86_64, hardware virtualization.
+- Host: Linux x86_64, glibc 2.34, Python 3.11.7; packaged runtime built with PyInstaller 6.22.3. Normal packaged installation requires no separate Python runtime.
 
 ## Results
 
 | Check | Result | Coverage |
 | --- | --- | --- |
-| Android JVM suite | 23 passed | Bearer authentication, rejected credentials, redirects, frame parsing, input limits, explicit acknowledgements, uncertain writes, HTTP 503 follow-ups, and permission grant/denial |
-| Android lint | Passed; zero errors | API compatibility, manifest/resources, Kotlin and Compose checks; remaining dependency/style warnings and intentional private-network HTTP configuration |
-| Bridge offline suite | 49 passed | Simulated Unix daemon, atomic text/key submission, body limits, stale targets, token files, WebSocket authentication, validated ANSI frames, and observer process cleanup |
-| Live bridge integration | 1 passed | Real stock Herdr snapshot, workspace creation, atomic input, toolbar key aliases, unknown-key rejection, and read-only ANSI observation |
-| Android device suite with live fixture | 8 passed | Native JNI/libvterm, ANSI and fixed geometry; explicit send/Enter/key controls; draft retention; real Keystore round trip and profile binding; app connection and command delivery to real Herdr |
+| Android JVM suite | 37 passed | Strict QR parsing, redacted diagnostics, pairing authentication, no redirect/replay, cancellation, terminal frames, input limits, and permissions |
+| Android lint | Zero errors, 14 warnings | API compatibility, manifest/resources, Kotlin/Compose; dependency/style warnings and intentional private-network HTTP support |
+| Bridge offline suite | 133 passed | Pairing expiration, concurrent one-use exchanges, durable hashed credentials, revocation, body limits, socket routing, setup/service generation, Tailscale endpoint preservation, frozen external-command environments, terminal cleanup |
+| Live bridge integration | 1 passed | Stock Herdr snapshots, workspace creation, atomic input, logical keys, and read-only ANSI observation |
+| Android device suite with live fixture | 15 passed | Native JNI/libvterm, explicit terminal controls, Keystore persistence, pairing UI review/cancellation/denial, host-generated QR decoding, real pairing and command delivery |
+| Frozen Linux package smoke | Passed | Self-contained authenticated HTTP server, phone pairing, one-use rejection, snapshot access, device revocation, packaged QR CLI helpers, private credential files, bundled licenses |
+| Installer extraction | Passed | Embedded binary checksum and execution of the extracted packaged CLI |
 
-The ordinary bridge suite skips its optional live test. The ordinary device suite skips its optional live test unless fixture URL/token arguments are provided. The counts above include the separately enabled live runs.
+The 186 automated tests above passed. Optional live cases are skipped in ordinary runs without their fixture arguments. The packaged smoke is an additional end-to-end check against an isolated mock Unix daemon and does not require installed Herdr or Tailscale.
 
-The live app test creates a server profile, browses the workspace and pane, opens an authenticated terminal stream, and sends `printf 'PHONE_NATIVE_E2E_OK\n'` through the explicit Send control. The captured native terminal screen shows the resulting output. Fixture credentials are public temporary test values, and the test removes its own saved profile afterward.
+The real Android pairing test reviews and confirms a one-use invitation, stores its device credential through Keystore, opens a live Herdr pane, and sends `printf 'PHONE_QR_PAIRING_E2E_OK\n'`. A separate read-only observer confirmed that marker in the isolated pane's output. Another device test decodes a Segno-generated host PNG using the same ZXing decoder as the CameraX scanner. The legacy manual-profile connection also passed. Tests remove their own saved profiles afterward.
 
-[Workspace screenshot](screenshots/dashboard.png) · [Native terminal screenshot](screenshots/terminal.png)
+[Pairing review](screenshots/pairing.png) · [Workspace dashboard](screenshots/dashboard.png) · [Native terminal](screenshots/terminal.png)
 
-The delivered APK is 31,242,922 bytes. APK signature verification and 16 KiB ZIP alignment checks passed; the packaged 64-bit native libraries also have 16 KiB-aligned ELF load segments. Its SHA-256 is:
+The updated APK is **33,423,065 bytes**, uses the same signing certificate as preview 0.1.0, and can update that installation. APK signature verification and 16 KiB ZIP alignment checks passed; all eight packaged 64-bit native libraries have 16 KiB-aligned ELF load segments. APK SHA-256:
 
 ```text
-f629900f1196e4adb33e1f52d03a544d7dbe97f4d8cf87da432a6cd658c74ada
+495fdd294898254ef4ee425d5e5067093735ae1671ae4ba55987b4a0d33eb78e
 ```
 
 ## Repeat the checks
@@ -39,12 +41,16 @@ From the repository root, with the Android SDK configured:
 ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleDebugAndroidTest
 bridge/.venv/bin/python -m pytest bridge/tests -q
 HERDR_INTEGRATION=1 bridge/.venv/bin/python -m pytest bridge/tests/test_live_herdr.py -q
+bridge/.venv/bin/python scripts/build_host.py
+bridge/.venv/bin/python scripts/smoke_host_package.py artifacts/host/herdr-pocket-linux-x86_64
 ```
 
-For the complete device run, follow the [isolated fixture instructions](../bridge/README.md#live-android-device-fixture), omitting the `class` filter to run all device tests. Stop the fixture afterward and remove its `adb reverse` mapping. Ordinary connected device checks use `./gradlew :app:connectedDebugAndroidTest`.
+For all device tests, follow the [isolated fixture instructions](../bridge/README.md#live-android-device-fixture), omitting the `class` filter. Build first, then start the fixture immediately before testing because its invitation expires after five minutes. Stop the fixture and remove its `adb reverse` mapping afterward.
+
+GitHub Actions checks Android JVM/lint/APK and the offline bridge suite. The separate host packaging workflow builds and exercises self-contained companions on Linux x86_64, macOS Apple Silicon, and macOS Intel.
 
 ## Scope of validation
 
-The live Android connection used `adb reverse` to the real loopback bridge, rather than a physical phone connected through a tailnet. Tailscale Serve setup is documented, but a physical phone/tailnet test remains to be done by the user. The Android 17 local-network permission flow has JVM grant/denial tests; the device run used Android 16. Minimum Android 8 compatibility was checked by lint and compilation, not by an Android 8 device run.
+The live Android connection used `adb reverse` to a real loopback bridge. A physical phone over a real Tailscale network, physical camera scanning, and macOS LaunchAgent/login behavior remain untested. QR image decoding and permission/onboarding logic were tested separately. Tailscale configuration behavior is covered with simulated CLI responses; tests never modify the user's real Serve/Funnel endpoints. The Android 17 local-network permission flow has JVM grant/denial tests; device checks used Android 16. Android 8 compatibility was checked by lint and compilation.
 
-The preview APK is debug-signed for sideloading. It includes native libraries for arm64-v8a, armeabi-v7a, x86 and x86_64. The host companion and Herdr are not bundled into the APK. Background notifications, remote scrollback and direct SSH are outside this preview's implemented features.
+The preview APK is debug-signed for sideloading. It includes native libraries for arm64-v8a, armeabi-v7a, x86 and x86_64. Herdr itself is not bundled; it must remain running independently on the host. The host executable includes its Python runtime and license texts. Background notifications, remote scrollback, and direct SSH are outside the implemented preview.

@@ -23,10 +23,12 @@ import tempfile
 import uuid
 
 import httpx
+import segno
 import uvicorn
 
 from herdr_bridge.app import create_app
 from herdr_bridge.herdr import HerdrClient, stop_observer
+from herdr_bridge.pairing import PairingStore
 
 
 TEST_TOKEN = "android-emulator-isolated-test-token-20261008"
@@ -103,8 +105,14 @@ async def run(executable: str) -> None:
                 ["enter"],
             )
 
+            pairing = PairingStore(Path(directory) / "devices.json")
+            payload = json.dumps({"type": "herdr-pocket-pair", "version": 1,
+                "url": f"http://127.0.0.1:{PORT}/", "name": "Android live test",
+                **pairing.begin_pairing("Android live test")}, separators=(",", ":"))
+            qr_image = Path(directory) / "pairing.png"
+            segno.make(payload, error="M", micro=False).save(qr_image, scale=6, border=4)
             bridge = FixtureServer(uvicorn.Config(
-                create_app(client, TEST_TOKEN), host="127.0.0.1", port=PORT,
+                create_app(client, TEST_TOKEN, pairing), host="127.0.0.1", port=PORT,
                 log_level="error", access_log=False, timeout_graceful_shutdown=3,
             ))
             bridge_task = asyncio.create_task(bridge.serve(sockets=[listener]))
@@ -122,8 +130,9 @@ async def run(executable: str) -> None:
                         except httpx.HTTPError:
                             pass
                         await asyncio.sleep(0.1)
-            # Readiness contains only the public fixture URL and explicit target IDs.
-            print(json.dumps({"url": url, "workspaceId": workspace_id, "paneId": pane_id}), flush=True)
+            # Credentials belong only to this disposable fixture, never a user session.
+            print(json.dumps({"url": url, "workspaceId": workspace_id, "paneId": pane_id,
+                "pairingPayload": payload, "qrImage": str(qr_image)}), flush=True)
             await stopped.wait()
         finally:
             if bridge is not None:
