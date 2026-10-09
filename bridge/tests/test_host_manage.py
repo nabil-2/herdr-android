@@ -117,15 +117,12 @@ def test_unsafe_purge_is_rejected_before_any_service_or_route_mutation(installat
     assert path.exists() and unit.exists() and binary.read_bytes() == b"old archive"
 
 
-def test_legacy_owned_service_without_host_affinity_remains_upgradable(installation):
+def test_legacy_owned_service_without_host_affinity_remains_upgradable(installation, monkeypatch):
     binary, root, units, _ = installation
     _, path, _ = instance(binary, root, units, legacy=True)
-    original_run = manage.run
-    manage.run = lambda args, **kwargs: SimpleNamespace(stdout=json.dumps({"Self": {"DNSName": "test.example.ts.net."}}))
-    try:
-        assert [entry[1] for entry in manage.instances(root, binary=binary)] == [path]
-    finally:
-        manage.run = original_run
+    monkeypatch.setattr(manage.shutil, "which", lambda _: "/fake/tailscale")
+    monkeypatch.setattr(manage, "run", lambda args, **kwargs: SimpleNamespace(stdout=json.dumps({"Self": {"DNSName": "test.example.ts.net."}})))
+    assert [entry[1] for entry in manage.instances(root, binary=binary)] == [path]
 
 
 def test_management_commands_are_serialized(installation):
