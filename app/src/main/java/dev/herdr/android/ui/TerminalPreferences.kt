@@ -12,7 +12,7 @@ import kotlinx.serialization.json.Json
 internal data class TerminalAppearance(
     val fontSize: Float = 14f,
     val theme: TerminalPalette = TerminalPalette.MIDNIGHT,
-    val fitToWidth: Boolean = false,
+    val fitToWidth: Boolean = true,
 )
 
 internal enum class TerminalPalette(val label: String, val foreground: Color, val background: Color) {
@@ -27,11 +27,14 @@ internal class TerminalPreferenceStore(context: Context) {
     fun read(): TerminalAppearance = TerminalAppearance(
         fontSize = preferences.getFloat("font_size", 14f).takeIf { it.isFinite() }?.coerceIn(8f, 28f) ?: 14f,
         theme = TerminalPalette.entries.firstOrNull { it.name == preferences.getString("palette", null) } ?: TerminalPalette.MIDNIGHT,
-        fitToWidth = preferences.getBoolean("fit_width", false),
+        // The old default was saved whenever colors/font changed. Upgrade those
+        // old defaults once; future explicit zoom/fit choices remain respected.
+        fitToWidth = if (preferences.getBoolean("fit_width_default_v2", false)) preferences.getBoolean("fit_width", true) else true,
     )
     fun write(appearance: TerminalAppearance) {
         preferences.edit().putFloat("font_size", appearance.fontSize.coerceIn(8f, 28f))
-            .putString("palette", appearance.theme.name).putBoolean("fit_width", appearance.fitToWidth).apply()
+            .putString("palette", appearance.theme.name).putBoolean("fit_width", appearance.fitToWidth)
+            .putBoolean("fit_width_default_v2", true).apply()
     }
 }
 

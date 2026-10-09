@@ -64,6 +64,33 @@ class TerminalInputTest {
         assertTrue(modes.applicationCursor)
     }
 
+    @Test fun wheelEncodingRequiresBothTrackingAndSgrAndResetsWithTheObserver() {
+        val modes = TerminalInputModes()
+        modes.observe("\u001B[?1006h".toByteArray())
+        assertFalse(modes.supportsSgrWheel)
+        modes.observe("\u001B[?10".toByteArray())
+        modes.observe("00;1002h".toByteArray())
+        assertTrue(modes.supportsSgrWheel)
+        modes.observe("\u001B[?1000l".toByteArray())
+        assertTrue("Another enabled tracking mode remains active", modes.supportsSgrWheel)
+        modes.observe("\u001B[?1002l".toByteArray())
+        assertFalse(modes.supportsSgrWheel)
+        modes.observe("\u001B[?1003h".toByteArray())
+        assertTrue(modes.supportsSgrWheel)
+        assertArrayEquals("\u001B[<64;1;1M".toByteArray(), TerminalInputEncoder.mouseWheel(older = true))
+        assertArrayEquals("\u001B[<65;1;1M".toByteArray(), TerminalInputEncoder.mouseWheel(older = false))
+        modes.observe("\u001B[?1006l".toByteArray())
+        assertFalse(modes.supportsSgrWheel)
+        modes.observe("\u001B[?1006h".toByteArray())
+        modes.observe("\u001Bc".toByteArray())
+        assertFalse(modes.supportsSgrWheel)
+        modes.observe("\u001B[?1000;1006h".toByteArray())
+        modes.observe(byteArrayOf(), reset = true)
+        assertFalse(modes.supportsSgrWheel)
+        modes.observe("\u001B]title;\u001B[?1000;1006h\u0007".toByteArray())
+        assertFalse("Remote control-string contents are not input-mode advertisements", modes.supportsSgrWheel)
+    }
+
     @Test
     fun malformedUnicodeAndOversizedCompletionsAreRefused() {
         assertNull(TerminalInputEncoder.text("\uD800"))

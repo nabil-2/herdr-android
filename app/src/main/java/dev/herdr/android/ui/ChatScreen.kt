@@ -238,9 +238,14 @@ internal fun ConversationMessages(chat: ChatContent, onOlder: () -> Unit, modifi
             }
             itemsIndexed(messages, key = { _, message -> message.id }, contentType = { _, message -> message.role }) { index, message ->
                 Column(if (message.id == last?.id) Modifier.onSizeChanged { tailHeight = it.height } else Modifier) {
-                    val date = chatMessageDate(message.timestamp)
-                    if (date != null && date != chatMessageDate(messages.getOrNull(index - 1)?.timestamp)) {
+                    val date = chatMessageDate(message.messageTimestamp ?: message.timestamp)
+                    val previous = messages.getOrNull(index - 1)
+                    if (date != null && date != chatMessageDate(previous?.messageTimestamp ?: previous?.timestamp)) {
                         ChatDateDivider(date)
+                    }
+                    if (message.messageTimestamp == null && message.timestampSource != null &&
+                        (previous?.messageTimestamp != null || previous?.timestamp != message.timestamp || previous?.timestampSource != message.timestampSource)) {
+                        ChatTurnTimeCaption(message)
                     }
                     ChatMessageCard(message)
                 }
@@ -274,6 +279,24 @@ private suspend fun scrollToConversationEnd(list: LazyListState) {
 internal fun chatMessageDate(timestamp: Long?, zone: ZoneId = ZoneId.systemDefault()): LocalDate? =
     timestamp?.takeIf { it > 0 }?.let { runCatching { Instant.ofEpochSecond(it).atZone(zone).toLocalDate() }.getOrNull() }
 
+/** A turn boundary is shared by many messages and cannot be their individual clock. */
+internal fun chatMessageTimestamp(message: ChatMessage): Long? =
+    message.messageTimestamp ?: message.timestamp?.takeIf { message.timestampSource == null }
+
+@Composable
+private fun ChatTurnTimeCaption(message: ChatMessage) {
+    val context = LocalContext.current
+    val configuration = LocalConfiguration.current
+    val time = remember(message.timestamp, configuration) {
+        message.timestamp?.takeIf { chatMessageDate(it) != null && it <= Long.MAX_VALUE / 1000 }?.let {
+            android.text.format.DateFormat.getTimeFormat(context).format(Date(it * 1000))
+        }
+    } ?: return
+    Text(if (message.timestampSource == "turn_end") "Turn finished $time" else "Turn started $time",
+        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("chat-turn-time-${message.id}"),
+        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
 internal fun chatDateLabel(date: LocalDate, today: LocalDate = LocalDate.now(), locale: Locale = Locale.getDefault()): String = when (date) {
     today -> "Today"
     today.minusDays(1) -> "Yesterday"
@@ -298,16 +321,13 @@ internal fun ChatMessageCard(message: ChatMessage, modifier: Modifier = Modifier
     val user = message.role == "user"
     val context = LocalContext.current
     val configuration = LocalConfiguration.current
-    val time = remember(message.timestamp, configuration) {
-        message.timestamp?.takeIf { chatMessageDate(it) != null && it <= Long.MAX_VALUE / 1000 }?.let {
+    val timestamp = chatMessageTimestamp(message)
+    val time = remember(timestamp, configuration) {
+        timestamp?.takeIf { chatMessageDate(it) != null && it <= Long.MAX_VALUE / 1000 }?.let {
             android.text.format.DateFormat.getTimeFormat(context).format(Date(it * 1000))
         }
     }
-    val timeCaption = time?.let { when (message.timestampSource) {
-        "turn_start" -> "Turn started $it"
-        "turn_end" -> "Turn finished $it"
-        else -> it
-    } }
+    val timeCaption = time
     Column(modifier.fillMaxWidth().testTag("chat-message-${message.id}"), horizontalAlignment = if (user) Alignment.End else Alignment.Start) {
         if (user) {
             Surface(color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.75f), shape = RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp), modifier = Modifier.widthIn(max = 560.dp).fillMaxWidth(0.9f)) {

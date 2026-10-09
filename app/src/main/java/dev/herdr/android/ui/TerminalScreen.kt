@@ -102,6 +102,13 @@ internal fun TerminalScreen(state: HerdrUiState, viewModel: HerdrViewModel, onBa
     }
     var receivedFrame by remember(paneId) { mutableStateOf(false) }
     var sessionId by remember(paneId) { mutableLongStateOf(-1L) }
+    // Codex 0.162 handles unmodified PageUp/PageDown in its owned transcript.
+    // Ordinary shells keep finger gestures local until this is explicitly enabled.
+    var scrollProgram by remember(state.activeProfileId, paneId, sessionId) { mutableStateOf(pane?.agent == "codex") }
+    val frameRenderer = remember(emulator) {
+        TerminalFrameRenderer(emulator.dimensions.rows, emulator.dimensions.columns,
+            write = { emulator.writeInput(it) }, resize = { rows, cols -> emulator.resize(rows, cols) })
+    }
     var inputController by remember(state.activeProfileId, paneId, sessionId) { mutableStateOf<TerminalInputController?>(null) }
     LaunchedEffect(paneId, emulator) {
         // Collection owns an observer subscription. Cancelling it closes the stream.
@@ -109,14 +116,8 @@ internal fun TerminalScreen(state: HerdrUiState, viewModel: HerdrViewModel, onBa
             if (frame.paneId == paneId) {
                 val reset = frame.reset || frame.sessionId != sessionId
                 inputModes.observe(frame.ansi, reset = reset)
-                if (reset) {
-                    emulator.writeInput("\u001Bc".toByteArray(Charsets.US_ASCII))
-                    sessionId = frame.sessionId
-                }
-                if (emulator.dimensions.rows != frame.rows || emulator.dimensions.columns != frame.cols) {
-                    emulator.resize(frame.rows, frame.cols)
-                }
-                emulator.writeInput(frame.ansi)
+                frameRenderer.render(frame)
+                sessionId = frame.sessionId
                 receivedFrame = true
             }
         }
@@ -188,9 +189,17 @@ internal fun TerminalScreen(state: HerdrUiState, viewModel: HerdrViewModel, onBa
                     TextButton(onClick = { onRetry(paneId) }) { Text("Reconnect") }
                 }
                 if (focusMode) TextButton(onClick = { focusMode = false }, modifier = Modifier.testTag("terminal-leave-focus")) { Text("Exit focus") }
+                if ("terminal-history" in state.capabilities) TextButton(onClick = { openPanel(TerminalPanel.OUTPUT) }, modifier = Modifier.testTag("terminal-history")) { Text("History") }
+                if (directInput) TextButton(onClick = { scrollProgram = !scrollProgram; keyboardVisible = false; selectionController?.clearSelection() },
+                    enabled = canSend, modifier = Modifier.testTag("terminal-scroll-program").semantics {
+                        contentDescription = if (scrollProgram) "Stop program scroll" else "Scroll program"
+                    }) { Text(if (scrollProgram) "Read" else "Scroll") }
                 TextButton(onClick = { if (directInput) keyboardVisible = !keyboardVisible else openPanel(TerminalPanel.COMPOSE) }, enabled = canSend, modifier = Modifier.testTag("terminal-keyboard")) { Text(if (!directInput) "Compose" else if (keyboardVisible) "Hide keys" else "Keyboard") }
                 if (focusMode) TextButton(onClick = { openPanel(TerminalPanel.TOOLS) }) { Text("Tools") }
             }
+            if (scrollProgram) Text("Swipes send PgUp / PgDn to this program. Tap Read to stop.",
+                Modifier.padding(horizontal = 12.dp, vertical = 4.dp).testTag("terminal-scroll-program-hint"),
+                style = MaterialTheme.typography.bodySmall, color = Mint)
             if (!directInput && !focusMode) Text("Update the host companion for direct keyboard input. Compose and special keys are available.", Modifier.padding(horizontal = 12.dp, vertical = 6.dp), style = MaterialTheme.typography.bodySmall, color = Amber)
             if (state.terminal.inputUncertain) Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.errorContainer).padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("Input delivery is uncertain. Review the terminal before continuing.", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
@@ -226,6 +235,15 @@ internal fun TerminalScreen(state: HerdrUiState, viewModel: HerdrViewModel, onBa
                     fitToWidth = appearance.fitToWidth,
                     viewportResetKey = viewportResetKey,
                     onSelectionControllerAvailable = { selectionController = it },
+                    onHistoryRequested = if ("terminal-history" in state.capabilities) ({ openPanel(TerminalPanel.OUTPUT) }) else null,
+                    scrollProgram = scrollProgram,
+                    onProgramScroll = { older ->
+                        // Herdr0.9.3 rejects its advertised logical pageup alias.
+                        // The native raw-input queue preserves the standard key
+                        // sequence and the same pane/session delivery guards.
+                        viewModel.sendTerminalInput(renderedInputScope,
+                            TerminalInputEncoder.key(if (older) TerminalInputEncoder.Key.PAGE_UP else TerminalInputEncoder.Key.PAGE_DOWN))
+                    },
                     inputModes = inputModes,
                     modifier = Modifier.fillMaxSize().semantics { contentDescription = "Live terminal output for ${pane?.title ?: "selected pane"}" },
                 )
@@ -246,7 +264,8 @@ internal fun TerminalScreen(state: HerdrUiState, viewModel: HerdrViewModel, onBa
             onOutput = { panel = TerminalPanel.OUTPUT }, canReadOutput = "terminal-history" in state.capabilities,
         )
         TerminalPanel.OUTPUT -> key(state.activeProfileId, paneId, sessionId) {
-            TerminalOutputSheet(paneId, load = { viewModel.readTerminalHistory() }, onClose = { panel = null })
+            TerminalOutputSheet(paneId, load = { viewModel.readTerminalHistory() }, onClose = { panel = null },
+                fullScreenHint = pane?.agent == "codex", onOpenKeys = { panel = TerminalPanel.KEYS })
         }
         TerminalPanel.KEYS -> TerminalKeysSheet(canSend, { panel = null }, onKey)
         TerminalPanel.APPEARANCE -> TerminalAppearanceSheet(appearance, updateAppearance, { viewportResetKey++; updateAppearance(TerminalAppearance(theme = appearance.theme)) }, { panel = null })

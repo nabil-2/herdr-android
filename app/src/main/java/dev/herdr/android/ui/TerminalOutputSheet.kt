@@ -54,7 +54,13 @@ import kotlin.math.roundToInt
 /** Read-only, bounded history. Output and searches never enter saved app state or preferences. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun TerminalOutputSheet(paneId: String, load: suspend () -> TerminalHistory, onClose: () -> Unit) {
+internal fun TerminalOutputSheet(
+    paneId: String,
+    load: suspend () -> TerminalHistory,
+    onClose: () -> Unit,
+    fullScreenHint: Boolean = false,
+    onOpenKeys: (() -> Unit)? = null,
+) {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val currentLoad by rememberUpdatedState(load)
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
@@ -152,6 +158,13 @@ internal fun TerminalOutputSheet(paneId: String, load: suspend () -> TerminalHis
                 if (loading) CircularProgressIndicator(Modifier.padding(start = 8.dp).size(18.dp), strokeWidth = 2.dp)
             }
             Text(if (history?.truncated == true) "Recent output; older text omitted" else "A snapshot of recent output. Refresh to see new text.", Modifier.padding(horizontal = 20.dp, vertical = 4.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (fullScreenHint) {
+                Text("Full-screen apps may expose only their current screen. To scroll inside the app, use PgUp / PgDn in Keys.",
+                    Modifier.padding(horizontal = 20.dp, vertical = 4.dp).testTag("terminal-output-fullscreen-hint"),
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (onOpenKeys != null) TextButton(onClick = { close(); onOpenKeys() },
+                    modifier = Modifier.padding(horizontal = 12.dp).testTag("terminal-output-program-keys")) { Text("Open Keys") }
+            }
             OutlinedTextField(value = query, onValueChange = { query = it.take(128) }, label = { Text("Find in loaded output") }, singleLine = true, enabled = history != null && !loading, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).testTag("terminal-output-find"))
             if (query.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(if (matches.isEmpty()) "No matches" else "${activeMatch + 1} of ${matches.size}", Modifier.weight(1f).testTag("terminal-output-match-count"), style = MaterialTheme.typography.labelMedium)

@@ -21,10 +21,15 @@ internal object ConversationProtocol {
                 val value = objectValue[field] as? JsonPrimitive
                 require(value != null && !value.isString && value.booleanOrNull != null)
             }
+            objectValue["freshBootstrap"]?.let { value ->
+                require(value is JsonPrimitive && !value.isString && value.booleanOrNull != null)
+            }
             objectValue["messages"]?.jsonArray?.forEach { item ->
-                val timestamp = item.jsonObject["timestamp"]
-                if (timestamp != null && timestamp.toString() != "null") {
-                    require(timestamp is JsonPrimitive && !timestamp.isString && timestamp.longOrNull != null)
+                for (field in listOf("timestamp", "messageTimestamp")) {
+                    val timestamp = item.jsonObject[field]
+                    if (timestamp != null && timestamp.toString() != "null") {
+                        require(timestamp is JsonPrimitive && !timestamp.isString && timestamp.longOrNull != null)
+                    }
                 }
             }
             val page = json.decodeFromString<ConversationPage>(body)
@@ -35,7 +40,7 @@ internal object ConversationProtocol {
             require(page.messages.size <= 50 && page.messages.map { it.id }.distinct().size == page.messages.size)
             require(!page.unchanged || page.messages.isEmpty())
             require(page.status in statuses)
-            require(!page.canSend || page.status in setOf("idle", "done", "working"))
+            require(!page.canSend || page.status in setOf("idle", "done", "working") || (page.status == "unknown" && page.freshBootstrap))
             require(page.warning == null || page.warning.length <= 1000)
             require(page.canSendReason == null || page.canSendReason.length <= 1000)
             page.messages.forEach { message ->
@@ -44,6 +49,7 @@ internal object ConversationProtocol {
                 require(message.phase == null || message.phase in setOf("commentary", "final_answer"))
                 require(message.text.length <= 256 * 1024)
                 require(message.timestamp == null || message.timestamp in 0..253402300799L)
+                require(message.messageTimestamp == null || message.messageTimestamp in 0..253402300799L)
                 require(message.timestampSource == null || message.timestampSource in setOf("turn_start", "turn_end"))
                 require(message.timestampSource == null || message.timestamp != null)
             }
@@ -113,6 +119,7 @@ internal object ChatState {
             loading = false,
             refreshing = false,
             canSend = page.canSend,
+            freshBootstrap = page.freshBootstrap,
             canSendReason = page.canSendReason,
             status = page.status,
             warning = page.warning,

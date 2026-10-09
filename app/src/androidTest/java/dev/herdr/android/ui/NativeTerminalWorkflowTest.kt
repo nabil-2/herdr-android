@@ -17,6 +17,9 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipe
+import androidx.compose.ui.geometry.Offset
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -55,6 +58,7 @@ class NativeTerminalWorkflowTest {
             fixture.open()
             compose.onNodeWithText("Shell project").performClick()
             fixture.awaitTerminal("w1:p1")
+            fixture.saveScreenshot("terminal-0.6-fit.png")
             compose.onNodeWithTag("chat-screen").assertDoesNotExist()
             compose.onNodeWithTag("terminal-surface").assertIsDisplayed()
             compose.runOnIdle { assertTrue("Output queries must not become input", fixture.inputs.isEmpty()) }
@@ -113,6 +117,95 @@ class NativeTerminalWorkflowTest {
         }
     }
 
+    @Test
+    fun readingSwipeLoadsTheSelectedPanesHistoryThroughTheRealScreenWithoutSendingCommands() {
+        Fixture().use { fixture ->
+            fixture.open()
+            compose.onNodeWithText("Shell project").performClick()
+            fixture.awaitTerminal("w1:p1")
+            compose.onNodeWithTag("terminal-surface").performTouchInput {
+                swipe(center - Offset(0f, 130f), center + Offset(0f, 130f), 250)
+            }
+            compose.waitUntil(10_000) { fixture.historyReads.get() == 1 }
+            compose.waitUntil(10_000) { compose.onAllNodesWithTag("terminal-output-text").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("terminal-output-text").assertIsDisplayed()
+            fixture.saveScreenshot("terminal-0.6-history.png")
+            compose.onNodeWithTag("terminal-output-text").performTouchInput {
+                swipe(center + Offset(0f, 100f), center - Offset(0f, 100f), 250)
+            }
+            compose.runOnIdle {
+                assertTrue(fixture.inputs.isEmpty())
+                assertEquals(0, fixture.conversationReads.get())
+                assertEquals("w1:p1", fixture.vm.state.value.paneId)
+                assertEquals(80, fixture.vm.state.value.terminal.cols)
+                assertEquals(30, fixture.vm.state.value.terminal.rows)
+            }
+            compose.onNodeWithText("Done").performClick()
+            compose.onNodeWithTag("terminal-surface").assertIsDisplayed()
+            compose.runOnIdle { assertTrue(fixture.inputs.isEmpty()) }
+        }
+    }
+
+    @Test
+    fun explicitProgramScrollUsesTheScopedNativeInputQueueAndCanBeTurnedOff() {
+        Fixture().use { fixture ->
+            fixture.open()
+            compose.onNodeWithText("Shell project").performClick()
+            fixture.awaitTerminal("w1:p1")
+            compose.onNodeWithTag("terminal-scroll-program").performClick()
+            compose.onNodeWithTag("terminal-scroll-program-hint").assertIsDisplayed()
+            fixture.saveScreenshot("terminal-0.6-program-scroll.png")
+            compose.onNodeWithTag("terminal-surface").performTouchInput {
+                swipe(center - Offset(0f, 180f), center + Offset(0f, 180f), 500)
+            }
+            compose.waitUntil(10_000) { fixture.inputs.isNotEmpty() && !fixture.vm.state.value.sending }
+            compose.runOnIdle {
+                assertTrue(fixture.inputs.size in 1..3)
+                fixture.inputs.forEach { input ->
+                    assertEquals("/v1/panes/w1:p1/terminal-input", input.path)
+                    assertEquals("\u001B[5~", input.text)
+                    assertEquals(emptyList<String>(), input.keys)
+                }
+                assertEquals(0, fixture.historyReads.get())
+            }
+            compose.onNodeWithTag("terminal-scroll-program").performClick()
+            compose.onNodeWithTag("terminal-scroll-program-hint").assertDoesNotExist()
+            val writes = fixture.inputs.size
+            compose.onNodeWithTag("terminal-surface").performTouchInput {
+                swipe(center - Offset(0f, 130f), center + Offset(0f, 130f), 250)
+            }
+            compose.waitUntil(10_000) { fixture.historyReads.get() == 1 }
+            compose.runOnIdle { assertEquals(writes, fixture.inputs.size) }
+        }
+    }
+
+    @Test
+    fun confirmedCodexTerminalDefaultsToProgramScrollAndShellsStayLocal() {
+        Fixture().use { fixture ->
+            fixture.open()
+            compose.onNodeWithContentDescription("Find a session").performClick()
+            compose.onNodeWithTag("session-search").performTextInput("fullscreen")
+            compose.onNodeWithText("Codex fullscreen").performClick()
+            fixture.awaitTerminal("w2:p2")
+            compose.onNodeWithTag("terminal-scroll-program-hint").assertIsDisplayed()
+            compose.runOnIdle { assertTrue(fixture.inputs.isEmpty()) }
+            compose.onNodeWithTag("terminal-surface").performTouchInput {
+                swipe(center - Offset(0f, 180f), center + Offset(0f, 180f), 500)
+            }
+            compose.waitUntil(10_000) { fixture.inputs.isNotEmpty() && !fixture.vm.state.value.sending }
+            compose.runOnIdle {
+                assertTrue(fixture.inputs.size in 1..3)
+                fixture.inputs.forEach {
+                    assertEquals("/v1/panes/w2:p2/terminal-input", it.path)
+                    assertEquals("\u001B[5~", it.text)
+                }
+                fixture.vm.selectPane("w1:p1")
+            }
+            fixture.awaitTerminal("w1:p1")
+            compose.onNodeWithTag("terminal-scroll-program-hint").assertDoesNotExist()
+        }
+    }
+
     private data class Input(val path: String, val text: String?, val keys: List<String>)
 
     private inner class Fixture : AutoCloseable {
@@ -124,6 +217,7 @@ class NativeTerminalWorkflowTest {
         private val server = MockWebServer()
         val inputs = CopyOnWriteArrayList<Input>()
         val conversationReads = AtomicInteger()
+        val historyReads = AtomicInteger()
         lateinit var vm: HerdrViewModel
 
         init {
@@ -132,7 +226,7 @@ class NativeTerminalWorkflowTest {
                     val path = request.requestUrl!!.encodedPath
                     return when {
                         path == "/v1/health" -> json("""{"service":"herdr-android-bridge","protocol":1,"herdrVersion":"0.9.3","capabilities":["terminal-input","terminal-history"]}""")
-                        path == "/v1/snapshot" -> json("""{"herdrVersion":"0.9.3","workspaces":[{"id":"w1","label":"Shell workspace","cwd":"/tmp/synthetic-shell"},{"id":"w2","label":"Other project","cwd":"/tmp/synthetic-agent"}],"tabs":[{"id":"w1:t1","workspaceId":"w1","label":"main"},{"id":"w2:t1","workspaceId":"w2","label":"planning"}],"panes":[{"id":"w1:p1","workspaceId":"w1","tabId":"w1:t1","title":"Shell project","cwd":"/tmp/synthetic-shell","status":"idle"},{"id":"w2:p1","workspaceId":"w2","tabId":"w2:t1","title":"Claude planning","cwd":"/tmp/synthetic-agent","agent":"claude","status":"idle"}]}""")
+                        path == "/v1/snapshot" -> json("""{"herdrVersion":"0.9.3","workspaces":[{"id":"w1","label":"Shell workspace","cwd":"/tmp/synthetic-shell"},{"id":"w2","label":"Other project","cwd":"/tmp/synthetic-agent"}],"tabs":[{"id":"w1:t1","workspaceId":"w1","label":"main"},{"id":"w2:t1","workspaceId":"w2","label":"planning"}],"panes":[{"id":"w1:p1","workspaceId":"w1","tabId":"w1:t1","title":"Shell project","cwd":"/tmp/synthetic-shell","status":"idle"},{"id":"w2:p1","workspaceId":"w2","tabId":"w2:t1","title":"Claude planning","cwd":"/tmp/synthetic-agent","agent":"claude","status":"idle"},{"id":"w2:p2","workspaceId":"w2","tabId":"w2:t1","title":"Codex fullscreen","cwd":"/tmp/synthetic-agent","agent":"codex","status":"idle"}]}""")
                         path.endsWith("/stream") -> {
                             val ansi = syntheticFrame(if (path.contains("w2:p1")) "CLAUDE SYNTHETIC OUTPUT" else "SHELL SYNTHETIC OUTPUT")
                             val bytes = Base64.getEncoder().encodeToString(ansi.toByteArray(Charsets.UTF_8))
@@ -150,6 +244,14 @@ class NativeTerminalWorkflowTest {
                             json("""{"ok":true}""")
                         }
                         path.endsWith("/conversation") -> { conversationReads.incrementAndGet(); MockResponse().setResponseCode(404) }
+                        path.endsWith("/scrollback") -> {
+                            historyReads.incrementAndGet()
+                            assertEquals("GET", request.method)
+                            assertEquals("Bearer native-terminal-isolated-public-test-token", request.getHeader("Authorization"))
+                            val pane = if (path.contains("w2:p1")) "w2:p1" else "w1:p1"
+                            json(JSONObject().put("paneId", pane).put("text", (1..100).joinToString("\n") { "Synthetic saved output $it" })
+                                .put("truncated", false).toString())
+                        }
                         else -> MockResponse().setResponseCode(404)
                     }
                 }

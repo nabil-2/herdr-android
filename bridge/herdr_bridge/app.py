@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager, suppress
 import hmac
 import json
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import anyio
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
@@ -16,7 +16,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from . import __version__
-from .herdr import BridgeError, HerdrClient, stop_observer, validate_pane_id, validate_terminal_frame
+from .herdr import BridgeError, HerdrClient, stop_observer, validate_pane_id, validate_terminal_frame, validate_workspace_id
+from .codex_integration import CodexIntegrationResult, ensure_codex_integration
 from .pairing import PairingError, PairingStore, valid_name
 from .codex import CodexReader, Conversations
 
@@ -143,6 +144,27 @@ class WorkspaceRequest(BaseModel):
         return value
 
 
+class TabRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    kind: Literal["terminal", "codex"]
+    label: str = Field(min_length=1, max_length=128)
+    cwd: str | None = Field(default=None, min_length=1, max_length=4096)
+
+    @field_validator("cwd")
+    @classmethod
+    def scoped_directory(cls, value: str | None) -> str | None:
+        if value is not None and (any(ord(c) < 32 or ord(c) == 127 for c in value)
+                                  or not (value.startswith("/") or value.startswith("~/") or value == "~")):
+            raise ValueError("Working directory must be an absolute or home-relative path without controls")
+        return value
+
+    @field_validator("label")
+    @classmethod
+    def readable_label(cls, value: str) -> str:
+        if not value.strip() or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError("Label must be nonempty text without controls")
+        return value
+
 class PairRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     # Incorrect code values receive the same 401 as used/expired codes. JSON
@@ -173,23 +195,58 @@ class MessageRequest(BaseModel):
 
 def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | None = None, *,
                codex_executable: str | None = None, codex_home: Path | None = None,
-               codex_path: str | None = None) -> FastAPI:
+               codex_path: str | None = None, prepare_codex_integration: bool = False) -> FastAPI:
     if not 32 <= len(token) <= 4096 or not token.isascii() or any(c.isspace() for c in token):
         raise ValueError("Use a generated bearer token of at least 32 ASCII characters")
     reader = CodexReader(codex_executable, codex_home, codex_path)
     conversations = Conversations(client, reader)
 
+    async def prepare_integration() -> CodexIntegrationResult:
+        try:
+            result = await asyncio.to_thread(ensure_codex_integration, client.executable, reader.home)
+        except Exception:
+            result = CodexIntegrationResult(ready=False, advisory="Could not prepare Herdr's Codex integration.")
+        app.state.codex_integration_result = result
+        return result
+
+    def integration_task() -> asyncio.Task:
+        task = app.state.codex_integration_task
+        # Each deliberate creation rechecks the installed hooks, while requests
+        # arriving during preparation share that work. Never retry topology.
+        if task is None or task.done():
+            task = asyncio.create_task(prepare_integration())
+            app.state.codex_integration_task = task
+        return task
+
+    async def require_integration() -> None:
+        try:
+            async with asyncio.timeout(8):
+                result = await asyncio.shield(integration_task())
+        except TimeoutError as exc:
+            raise BridgeError(503, "Codex integration is still being prepared; wait a moment and try again") from exc
+        if not result.ready:
+            raise BridgeError(503, (result.advisory or "Codex integration is unavailable.")
+                              + " Run herdr-pocket setup on the host before creating a Codex chat.")
+
     @asynccontextmanager
     async def lifespan(_app):
+        if prepare_codex_integration and reader.enabled:
+            integration_task()
         try:
             yield
         finally:
             with anyio.CancelScope(shield=True):
                 await reader.close()
+                task = app.state.codex_integration_task
+                if task is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
 
     app = FastAPI(title="Herdr Android Bridge", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.codex_reader = reader
     app.state.conversations = conversations
+    app.state.codex_integration_task = None
+    app.state.codex_integration_result = None
     app.add_middleware(AuthAndBodyLimit, token=token, pairing_store=pairing_store)
 
     @app.exception_handler(BridgeError)
@@ -214,9 +271,12 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
     async def health():
         snapshot = await client.snapshot()
         result = {"service": "herdr-android-bridge", "protocol": 1, "companionVersion": __version__, "herdrVersion": snapshot["herdrVersion"], "pairing": pairing_store is not None}
-        result["capabilities"] = ["terminal-input", "terminal-history"]
+        result["capabilities"] = ["terminal-input", "terminal-history", "workspace-tabs"]
         if reader.enabled:
-            result["capabilities"].extend(["codex-chat", "codex-chat-working-input"])
+            result["capabilities"].extend(["codex-chat", "codex-chat-working-input", "codex-chat-fresh-input", "codex-create"])
+        integration = app.state.codex_integration_result
+        if integration is not None and integration.advisory:
+            result["codexIntegrationAdvisory"] = integration.advisory
         return result
 
     @app.get("/v1/snapshot")
@@ -232,12 +292,14 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
     async def conversation(pane_id: str, request: Request, cursor: Annotated[str | None, Query(max_length=2048)] = None,
                            revision: Annotated[str | None, Query(max_length=256)] = None):
         return await conversations.page(pane_id, cursor, revision,
-                                        allow_working=request.headers.get("X-Herdr-Chat-Working-Input") == "1")
+                                        allow_working=request.headers.get("X-Herdr-Chat-Working-Input") == "1",
+                                        allow_fresh=request.headers.get("X-Herdr-Chat-Fresh-Input") == "1")
 
     @app.post("/v1/panes/{pane_id}/messages")
     async def message(pane_id: str, request: MessageRequest, http_request: Request):
         return await conversations.send(pane_id, request.binding, request.text,
-                                        allow_working=http_request.headers.get("X-Herdr-Chat-Working-Input") == "1")
+                                        allow_working=http_request.headers.get("X-Herdr-Chat-Working-Input") == "1",
+                                        allow_fresh=http_request.headers.get("X-Herdr-Chat-Fresh-Input") == "1")
 
     @app.post("/v1/panes/{pane_id}/input")
     async def send_input(pane_id: str, request: InputRequest):
@@ -256,6 +318,35 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
     @app.post("/v1/workspaces", status_code=201)
     async def create_workspace(request: WorkspaceRequest):
         return {"id": await client.create_workspace(request.cwd, request.label)}
+
+    @app.post("/v1/workspaces/{workspace_id}/tabs", status_code=201)
+    async def create_tab(workspace_id: str, request: TabRequest):
+        validate_workspace_id(workspace_id)
+        selected = await client.snapshot()
+        if not any(workspace["id"] == workspace_id for workspace in selected["workspaces"]):
+            raise BridgeError(409, "Workspace is no longer available; refresh before creating a tab")
+        if request.kind == "codex":
+            if not reader.enabled:
+                raise BridgeError(503, "Codex conversation support is not configured; run herdr-pocket setup on the host")
+            await require_integration()
+        launch_environment = None
+        if request.kind == "codex":
+            launch_environment = {"CODEX_HOME": str(reader.home)}
+            if reader.search_path is not None:
+                launch_environment["PATH"] = reader.search_path
+        created = await client.create_tab(workspace_id, request.cwd, request.label, env=launch_environment)
+        if (any(tab["id"] == created.tab_id for tab in selected["tabs"])
+                or any(pane["id"] == created.pane_id for pane in selected["panes"])):
+            raise BridgeError(503, "Tab creation returned an existing target; refresh the workspace before creating another")
+        warning = None
+        if request.kind == "codex":
+            try:
+                agent = await client.start_codex(created)
+                conversations.register_created_codex(created, agent)
+                warning = "Codex is starting. If it asks for login or permissions, open Terminal to continue."
+            except BridgeError:
+                warning = "The tab was created, but Codex launch could not be confirmed. Open Terminal and inspect it before creating another chat."
+        return created.public_result(warning)
 
     @app.websocket("/v1/terminals/{pane_id}/stream")
     async def terminal(websocket: WebSocket, pane_id: str):

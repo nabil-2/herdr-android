@@ -112,6 +112,13 @@ internal class HerdrClient(
         }
     }
 
+    suspend fun createTab(workspaceId: String, label: String, cwd: String, codex: Boolean): CreatedTab {
+        val input = TabCreationProtocol.input(workspaceId, label, cwd, codex)
+        return TabCreationProtocol.decode(
+            request("POST", listOf("v1", "workspaces", workspaceId, "tabs"), input), workspaceId,
+        )
+    }
+
     fun observe(paneId: String, cols: Int, rows: Int): Flow<TerminalMessage> = callbackFlow {
         val url = endpoint(listOf("v1", "terminals", paneId, "stream")).newBuilder()
             .addQueryParameter("cols", cols.coerceIn(20, 300).toString())
@@ -179,7 +186,10 @@ internal class HerdrClient(
     ): String {
         val url = endpoint(segments).newBuilder().apply { query.forEach { (name, value) -> addQueryParameter(name, value) } }.build()
         val builder = authenticatedRequest(url)
-        if (chatWorkingInput) builder.header("X-Herdr-Chat-Working-Input", "1")
+        if (chatWorkingInput) {
+            builder.header("X-Herdr-Chat-Working-Input", "1")
+            builder.header("X-Herdr-Chat-Fresh-Input", "1")
+        }
         if (method == "POST") {
             val delegate = (body ?: "{}").toRequestBody("application/json; charset=utf-8".toMediaType())
             builder.post(object : RequestBody() {

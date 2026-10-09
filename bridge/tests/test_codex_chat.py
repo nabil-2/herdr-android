@@ -171,7 +171,7 @@ async def chat(socket_server, codex_stub):
 
 async def test_chat_capability_and_metadata_do_not_disclose_native_session(chat):
     client, _, _, _, _, _, _, _, _ = chat
-    assert (await client.get("/v1/health")).json()["capabilities"] == ["terminal-input", "terminal-history", "codex-chat", "codex-chat-working-input"]
+    assert (await client.get("/v1/health")).json()["capabilities"] == ["terminal-input", "terminal-history", "workspace-tabs", "codex-chat", "codex-chat-working-input", "codex-chat-fresh-input", "codex-create"]
     response = await client.get("/v1/snapshot")
     assert response.json()["panes"][1]["conversation"] == {"provider": "codex", "available": True, "reason": None}
     assert THREAD_ID not in response.text and "term-test-generation" not in response.text
@@ -492,7 +492,7 @@ async def test_no_reader_disables_chat_without_breaking_terminal_api(socket_serv
     backend, _, _, _ = socket_server
     app = create_app(backend, TOKEN)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost", headers=AUTH) as client:
-        assert (await client.get("/v1/health")).json()["capabilities"] == ["terminal-input", "terminal-history"]
+        assert (await client.get("/v1/health")).json()["capabilities"] == ["terminal-input", "terminal-history", "workspace-tabs"]
         assert (await client.get("/v1/panes/w1:p2/conversation")).status_code == 503
         assert (await client.post("/v1/panes/w1:p1/input", json={"keys": ["enter"]})).status_code == 200
 

@@ -49,6 +49,7 @@ data class ChatMessage(
     val phase: String? = null,
     val timestamp: Long? = null,
     val timestampSource: String? = null,
+    val messageTimestamp: Long? = null,
 )
 
 @Serializable
@@ -61,6 +62,7 @@ internal data class ConversationPage(
     val unchanged: Boolean,
     val canSend: Boolean,
     val status: String,
+    val freshBootstrap: Boolean = false,
     val warning: String? = null,
     val canSendReason: String? = null,
 )
@@ -80,6 +82,7 @@ data class ChatContent(
     val canSend: Boolean = false,
     val canSendReason: String? = null,
     val status: String = "unknown",
+    val freshBootstrap: Boolean = false,
     val warning: String? = null,
     val error: String? = null,
     val sending: Boolean = false,
@@ -88,7 +91,7 @@ data class ChatContent(
     val deliveryUncertain: Boolean = false,
 ) {
     /** Herdr accepts follow-ups while Codex is working; server readiness stays authoritative. */
-    fun canSubmitMessage(): Boolean = canSend && status in setOf("idle", "done", "working") &&
+    fun canSubmitMessage(): Boolean = canSend && (status in setOf("idle", "done", "working") || (status == "unknown" && freshBootstrap)) &&
         bindingId != null && error == null && !loading && !sending && !deliveryUncertain
 
     override fun toString(): String = "ChatContent(messages=${messages.size}, loading=$loading, sending=$sending)"
@@ -110,6 +113,12 @@ internal data class WorkspaceInput(val cwd: String, val label: String)
 
 @Serializable
 internal data class CreatedWorkspace(val id: String)
+
+@Serializable
+internal data class TabInput(val kind: String, val label: String, val cwd: String? = null)
+
+@Serializable
+internal data class CreatedTab(val workspaceId: String, val tabId: String, val paneId: String, val warning: String? = null)
 
 enum class ConnectionState { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
 
@@ -152,6 +161,9 @@ data class HerdrUiState(
     val refreshing: Boolean = false,
     val sending: Boolean = false,
     val creatingWorkspace: Boolean = false,
+    val creatingTab: Boolean = false,
+    val creationUncertain: Boolean = false,
+    val creationRevision: Long = 0,
     val inputRevision: Long = 0,
     val pairing: Boolean = false,
     val pairingSuccessRevision: Long = 0,

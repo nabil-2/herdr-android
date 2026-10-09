@@ -20,6 +20,9 @@ internal object TerminalInputEncoder {
                 else -> key.name.lowercase()
             }
 
+    /** SGR wheel reports are emitted only for an explicit local scroll gesture. */
+    fun mouseWheel(older: Boolean): ByteArray = "\u001B[<${if (older) 64 else 65};1;1M".toByteArray(Charsets.US_ASCII)
+
     fun key(key: Key, modifiers: Modifiers = Modifiers(), applicationCursor: Boolean = false): ByteArray {
         val parameter = modifiers.parameter
         fun cursor(final: Char): String = when {
@@ -106,13 +109,16 @@ internal class TerminalInputModes {
         private set
     var bracketedPaste: Boolean = false
         private set
+    var sgrMouse: Boolean = false
+        private set
+    private val mouseTrackingModes = mutableSetOf<String>()
+    val supportsSgrWheel: Boolean get() = sgrMouse && mouseTrackingModes.isNotEmpty()
     private var state = 0
     private val sequence = StringBuilder()
 
     fun observe(bytes: ByteArray, reset: Boolean = false) {
         if (reset) {
-            applicationCursor = false
-            bracketedPaste = false
+            clearModes()
             state = 0
             sequence.setLength(0)
         }
@@ -123,7 +129,7 @@ internal class TerminalInputModes {
                 1 -> when (value) {
                     '['.code -> { state = 2; sequence.setLength(0) }
                     ']'.code, 'P'.code, '_'.code, '^'.code, 'X'.code -> state = 3
-                    'c'.code -> { applicationCursor = false; bracketedPaste = false; state = 0 }
+                    'c'.code -> { clearModes(); state = 0 }
                     27 -> Unit
                     else -> state = 0
                 }
@@ -142,12 +148,21 @@ internal class TerminalInputModes {
         }
     }
 
+    private fun clearModes() {
+        applicationCursor = false
+        bracketedPaste = false
+        sgrMouse = false
+        mouseTrackingModes.clear()
+    }
+
     private fun applyMode(enabled: Boolean) {
         if (!sequence.startsWith("?")) return
         sequence.substring(1).split(';').forEach { mode ->
             when (mode) {
                 "1" -> applicationCursor = enabled
                 "2004" -> bracketedPaste = enabled
+                "1000", "1002", "1003" -> if (enabled) mouseTrackingModes.add(mode) else mouseTrackingModes.remove(mode)
+                "1006" -> sgrMouse = enabled
             }
         }
     }

@@ -17,7 +17,8 @@ import time
 
 import anyio
 
-from .herdr import BridgeError, HerdrClient, canonical_codex_session, stop_observer
+from .herdr import BridgeError, CreatedTab, HerdrClient, canonical_codex_session, stop_observer
+from .message_times import ITEM_TIME_FIELD, MAX_TIMESTAMP, enrich_message_times
 from .runtime import external_environment
 
 MAX_RPC_BYTES = 32 * 1024 * 1024
@@ -26,6 +27,7 @@ MAX_TEXT_BYTES = 256 * 1024
 PAGE_SIZE = 50
 MAX_CACHES = 32
 MAX_CACHE_BYTES = 64 * 1024 * 1024
+FRESH_CHAT_TTL_SECONDS = 30 * 60
 TRUNCATED = "\n[Message truncated; open Terminal to inspect the full output]"
 
 
@@ -103,6 +105,9 @@ def normalize_thread(result: dict, thread_id: str) -> tuple[list[dict], str | No
                 timestamp = completed if phase == "final_answer" and completed is not None else started
                 if timestamp is not None:
                     message.update(timestamp=timestamp, timestampSource="turn_end" if phase == "final_answer" and completed is not None else "turn_start")
+                recorded = item.get(ITEM_TIME_FIELD)
+                if type(recorded) is int and 0 <= recorded <= MAX_TIMESTAMP:
+                    message["messageTimestamp"] = recorded
                 messages.append(message)
         return messages, "Some messages were truncated; use Terminal for complete output" if truncated else None
     except (KeyError, TypeError, ValueError, UnicodeError) as exc:
@@ -146,7 +151,21 @@ class CodexReader:
                 if "id" in response:
                     raise ValueError("Unexpected server request")
                 continue
-            if response.get("id") != request_id or "error" in response or not isinstance(response.get("result"), dict):
+            if response.get("id") != request_id:
+                raise BridgeError(503, "Codex could not read this saved conversation; use Terminal")
+            if "error" in response:
+                error = response["error"]
+                thread_id = params.get("threadId")
+                # These exact 0.162 errors mean there is no stored thread in this
+                # read-only sidecar. They prove an empty first conversation only
+                # together with a separately confirmed, fresh creation receipt.
+                if (method == "thread/read" and isinstance(thread_id, str) and isinstance(error, dict)
+                        and type(error.get("code")) is int and error["code"] == -32600
+                        and error.get("message") in (f"thread not loaded: {thread_id}",
+                                                      f"no rollout found for thread id {thread_id}")):
+                    raise CodexHistoryNotPersisted(thread_id)
+                raise BridgeError(503, "Codex could not read this saved conversation; use Terminal")
+            if not isinstance(response.get("result"), dict):
                 raise BridgeError(503, "Codex could not read this saved conversation; use Terminal")
             return response["result"]
 
@@ -191,7 +210,12 @@ class CodexReader:
                         assert self.process.stdin
                         self.process.stdin.write(b'{"method":"initialized","params":{}}\n')
                         await self.process.stdin.drain()
-                    return await self._rpc("thread/read", {"threadId": thread_id, "includeTurns": True})
+                    result = await self._rpc("thread/read", {"threadId": thread_id, "includeTurns": True})
+                    await enrich_message_times(result, thread_id, self.home)
+                    return result
+            except CodexHistoryNotPersisted:
+                # The request completed normally; the RPC channel remains usable.
+                raise
             except asyncio.CancelledError:
                 await self._stop()
                 raise
@@ -226,6 +250,22 @@ class ConversationCache:
     error: BridgeError | None = None
     history_epoch: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     byte_size: int = 0
+    bootstrapping: bool = False
+
+
+class CodexHistoryNotPersisted(BridgeError):
+    def __init__(self, thread_id: str):
+        super().__init__(503, "Codex has not saved this conversation yet; use Terminal")
+        self.thread_id = thread_id
+
+
+@dataclass
+class FreshChatReceipt:
+    tab: CreatedTab
+    name: str
+    socket_identity: tuple[int, int]
+    expires_at: float
+    thread_id: str | None = None
 
 
 class Conversations:
@@ -234,6 +274,50 @@ class Conversations:
         self.secret = secrets.token_bytes(32)
         self.caches: OrderedDict[str, ConversationCache] = OrderedDict()
         self.send_lock = asyncio.Lock()
+        self.fresh_chats: OrderedDict[str, FreshChatReceipt] = OrderedDict()
+
+    def register_created_codex(self, tab: CreatedTab, agent: dict) -> None:
+        """Only an acknowledged, newly created terminal can bootstrap empty chat."""
+        name = agent.get("name")
+        if (not isinstance(name, str) or not name.startswith("pocket-") or len(name) != 31
+                or agent.get("pane_id") != tab.pane_id or agent.get("terminal_id") != tab.terminal_id
+                or agent.get("workspace_id") != tab.workspace_id or agent.get("tab_id") != tab.tab_id):
+            return
+        try:
+            info = self.client.socket_path.stat()
+        except OSError:
+            return
+        self.fresh_chats[tab.pane_id] = FreshChatReceipt(tab, name, (info.st_dev, info.st_ino),
+                                                       self.clock() + FRESH_CHAT_TTL_SECONDS,
+                                                       canonical_codex_session(agent))
+        self.fresh_chats.move_to_end(tab.pane_id)
+        while len(self.fresh_chats) > MAX_CACHES:
+            self.fresh_chats.popitem(last=False)
+
+    def _fresh_chat(self, pane_id: str, agent: dict, thread_id: str) -> FreshChatReceipt | None:
+        receipt = self.fresh_chats.get(pane_id)
+        if receipt is None:
+            return None
+        try:
+            info = self.client.socket_path.stat()
+            matches = (self.clock() < receipt.expires_at
+                       and (info.st_dev, info.st_ino) == receipt.socket_identity
+                       and agent.get("pane_id") == receipt.tab.pane_id
+                       and agent.get("workspace_id") == receipt.tab.workspace_id
+                       and agent.get("tab_id") == receipt.tab.tab_id
+                       and agent.get("terminal_id") == receipt.tab.terminal_id
+                       and agent.get("name") == receipt.name
+                       and canonical_codex_session(agent) == thread_id
+                       and receipt.thread_id in (None, thread_id))
+        except OSError:
+            matches = False
+        if not matches:
+            self.fresh_chats.pop(pane_id, None)
+            return None
+        # SessionStart's exact canonical hook report is pinned once; a later
+        # session in the same terminal cannot inherit this empty-chat receipt.
+        receipt.thread_id = thread_id
+        return receipt
 
     async def target(self, pane_id: str) -> tuple[dict, str, str]:
         agent = await self.client.agent(pane_id)
@@ -256,13 +340,14 @@ class Conversations:
         return Conversations.send_unavailable_reason(agent, allow_working=allow_working) is None
 
     @staticmethod
-    def send_unavailable_reason(agent: dict, *, allow_working: bool = True) -> str | None:
+    def send_unavailable_reason(agent: dict, *, allow_working: bool = True, fresh_bootstrap: bool = False) -> str | None:
         status = agent.get("agent_status")
         if status == "working" and not allow_working:
             return "Update Herdr Pocket to send while Codex works."
         if status == "blocked":
             return "Codex needs your attention. Open Terminal to answer a question or approve an action."
-        if status not in ("idle", "done", "working"):
+        if status not in ("idle", "done", "working") and not (status == "unknown" and fresh_bootstrap
+                                                               and agent.get("interactive_ready") is True):
             return "Codex has not reported that it is ready for a message. Check Terminal."
         pending = agent.get("launch_pending", False)
         if pending is True:
@@ -309,7 +394,8 @@ class Conversations:
                 break
             self.caches.pop(victim)
 
-    async def page(self, pane_id: str, cursor: str | None = None, revision: str | None = None, *, allow_working: bool = True) -> dict:
+    async def page(self, pane_id: str, cursor: str | None = None, revision: str | None = None, *, allow_working: bool = True,
+                   allow_fresh: bool = False) -> dict:
         if not self.reader.enabled:
             raise BridgeError(503, "Codex conversation reader is not configured; use Terminal")
         agent, thread_id, binding = await self.target(pane_id)
@@ -320,9 +406,31 @@ class Conversations:
         async with cache.lock:
             if self.clock() - cache.refreshed_at >= 1:
                 try:
-                    result = await self.reader.read(thread_id)
-                    messages, cache.warning = normalize_thread(result, thread_id)
-                    if cache.messages != messages[:len(cache.messages)]:
+                    try:
+                        result = await self.reader.read(thread_id)
+                    except CodexHistoryNotPersisted as exc:
+                        if exc.thread_id != thread_id or self._fresh_chat(pane_id, agent, thread_id) is None:
+                            raise
+                        messages, cache.warning, cache.bootstrapping = [], None, True
+                    else:
+                        messages, cache.warning = normalize_thread(result, thread_id)
+                        # Startup can persist an empty thread before its first
+                        # turn. Retain only our verified new-chat receipt until
+                        # there is a real saved turn or a first prompt attempt.
+                        cache.bootstrapping = (result["thread"]["turns"] == []
+                                               and (cache.bootstrapping
+                                                    or self._fresh_chat(pane_id, agent, thread_id) is not None))
+                        if not cache.bootstrapping:
+                            self.fresh_chats.pop(pane_id, None)
+                    # Timing metadata can arrive after a partial rollout append.
+                    # It changes the revision, but is not a rewritten conversation.
+                    timing = {"timestamp", "timestampSource", "messageTimestamp"}
+                    unchanged_prefix = len(messages) >= len(cache.messages) and all(
+                        {key: value for key, value in before.items() if key not in timing}
+                        == {key: value for key, value in after.items() if key not in timing}
+                        for before, after in zip(cache.messages, messages)
+                    )
+                    if not unchanged_prefix:
                         cache.history_epoch = secrets.token_urlsafe(32)
                     serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode()
                     if len(serialized) > MAX_CACHE_BYTES:
@@ -342,17 +450,22 @@ class Conversations:
             if cache.error:
                 raise cache.error
             # Recheck binding after a potentially slow saved-history read.
-            agent, _, current_binding = await self.target(pane_id)
+            agent, thread_id, current_binding = await self.target(pane_id)
             if current_binding != binding:
                 raise BridgeError(409, "Pane changed while history was loading; refresh the workspace")
             end = self._end(cursor, binding, cache.revision, len(cache.messages)) if cursor else len(cache.messages)
             start = max(0, end - PAGE_SIZE)
             unchanged = not cursor and revision == cache.revision
-            send_unavailable_reason = self.send_unavailable_reason(agent, allow_working=allow_working)
+            fresh_bootstrap = cache.bootstrapping and self._fresh_chat(pane_id, agent, thread_id) is not None
+            send_unavailable_reason = self.send_unavailable_reason(agent, allow_working=allow_working,
+                                                                   fresh_bootstrap=allow_fresh and fresh_bootstrap)
+            if cache.bootstrapping and not fresh_bootstrap:
+                send_unavailable_reason = "The first message needs saved-history confirmation. Refresh or inspect Terminal before sending again."
             response = {"binding": binding, "revision": cache.revision, "historyEpoch": cache.history_epoch,
                         "messages": cache.messages[start:end],
                         "olderCursor": self._cursor(binding, cache.revision, start) if start else None,
                         "unchanged": unchanged, "canSend": send_unavailable_reason is None,
+                        "freshBootstrap": fresh_bootstrap,
                         "canSendReason": send_unavailable_reason,
                         "status": agent.get("agent_status") if agent.get("agent_status") in ("idle", "working", "blocked", "done", "unknown") else "unknown",
                         "warning": cache.warning}
@@ -367,19 +480,29 @@ class Conversations:
                 response["messages"] = []
             return response
 
-    async def send(self, pane_id: str, binding: str, text: str, *, allow_working: bool = True) -> dict:
+    async def send(self, pane_id: str, binding: str, text: str, *, allow_working: bool = True,
+                   allow_fresh: bool = False) -> dict:
         if not self.reader.enabled:
             raise BridgeError(503, "Codex conversation reader is not configured; use Terminal")
         async with self.send_lock:
-            agent, _, current_binding = await self.target(pane_id)
+            agent, thread_id, current_binding = await self.target(pane_id)
             if not hmac.compare_digest(binding, current_binding):
                 raise BridgeError(409, "Pane or conversation changed; refresh before sending")
             cache = self.caches.get(binding)
             if cache is None or cache.error is not None:
                 raise BridgeError(409, "Read the saved conversation successfully before sending")
-            send_unavailable_reason = self.send_unavailable_reason(agent, allow_working=allow_working)
+            fresh_bootstrap = cache.bootstrapping and self._fresh_chat(pane_id, agent, thread_id) is not None
+            send_unavailable_reason = self.send_unavailable_reason(agent, allow_working=allow_working,
+                                                                   fresh_bootstrap=allow_fresh and fresh_bootstrap)
             if send_unavailable_reason is not None:
                 raise BridgeError(409, send_unavailable_reason)
+            if cache.bootstrapping:
+                if self._fresh_chat(pane_id, agent, thread_id) is None:
+                    raise BridgeError(503, "The first message has not been confirmed in saved history; inspect Terminal before sending again")
+                # Consume before the one permitted mutation. An uncertain result
+                # cannot authorize a duplicate first prompt on the next request.
+                self.fresh_chats.pop(pane_id, None)
+                cache.refreshed_at = float("-inf")
             await self.client.prompt(pane_id, text)
             warning = None
             try:

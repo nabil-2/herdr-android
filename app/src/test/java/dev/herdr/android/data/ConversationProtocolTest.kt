@@ -28,6 +28,42 @@ class ConversationProtocolTest {
         ).forEach { invalid -> assertThrows(IOException::class.java) { ConversationProtocol.decode(invalid) } }
     }
 
+    @Test fun `message clocks remain separate from legacy turn times and reject invented clock values`() {
+        val precise = page.replace("\"phase\":\"final_answer\"",
+            "\"phase\":\"final_answer\",\"timestamp\":1791540000,\"timestampSource\":\"turn_start\",\"messageTimestamp\":1791540187")
+        val message = ConversationProtocol.decode(precise).messages.single()
+        assertEquals(1791540187L, message.messageTimestamp)
+        assertEquals(1791540000L, message.timestamp)
+        assertEquals("turn_start", message.timestampSource)
+        assertNull(ConversationProtocol.decode(page).messages.single().messageTimestamp)
+        assertNull(ConversationProtocol.decode(precise.replace("\"messageTimestamp\":1791540187", "\"messageTimestamp\":null"))
+            .messages.single().messageTimestamp)
+        listOf("\"1791540187\"", "1791540187.5", "1791540187000", "-1", "true", "{}", "[]")
+            .forEach { value ->
+                assertThrows(IOException::class.java) {
+                    ConversationProtocol.decode(precise.replace("\"messageTimestamp\":1791540187", "\"messageTimestamp\":$value"))
+                }
+            }
+    }
+
+    @Test fun `message clocks survive refresh older page merging and rollback without adopting turn time`() {
+        val precise = page.replace("\"phase\":\"final_answer\"",
+            "\"phase\":\"final_answer\",\"timestamp\":1791540000,\"timestampSource\":\"turn_start\",\"messageTimestamp\":1791540187")
+        val newest = ConversationProtocol.decode(precise)
+        val current = ChatState.latest(ChatContent(), newest)
+        val refreshed = ChatState.latest(current, newest)
+        assertEquals(1791540187L, refreshed.messages.single().messageTimestamp)
+        val older = ConversationProtocol.decode(precise.replace("\"m1\"", "\"m0\"")
+            .replace("\"messageTimestamp\":1791540187", "\"messageTimestamp\":1791540071"))
+        val merged = ChatState.older(refreshed, older)
+        assertEquals(listOf(1791540071L, 1791540187L), merged.messages.map { it.messageTimestamp })
+        val rolledBack = ConversationProtocol.decode(precise.replace("epoch-1", "epoch-2").replace("revision-1", "revision-2"))
+        val remaining = ChatState.latest(merged, rolledBack)
+        assertEquals(listOf("m1"), remaining.messages.map { it.id })
+        assertEquals(1791540187L, remaining.messages.single().messageTimestamp)
+        assertEquals(1791540000L, remaining.messages.single().timestamp)
+    }
+
     @Test fun `delayed older history cannot overwrite newer agent readiness`() {
         val oldReadyPage = ConversationProtocol.decode(page)
         val current = ChatState.latest(ChatContent(), oldReadyPage).copy(

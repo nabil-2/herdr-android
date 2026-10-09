@@ -277,6 +277,10 @@ def test_setup_reads_selected_session_and_installs_only_its_companion(tmp_path, 
     monkeypatch.setattr(setup, "tailscale_state", lambda: ("tailscale", "test.example.ts.net"))
     monkeypatch.setattr(setup, "free_port", lambda: 8768)
     monkeypatch.setattr(setup, "command_prefix", lambda: ["/installed/herdr-pocket"])
+    monkeypatch.setattr(setup, "codex_settings", lambda *args: {})
+    monkeypatch.setattr(setup, "ensure_codex_integration", lambda binary, home:
+                        calls.append(("integration", (binary, home))) or
+                        SimpleNamespace(ready=True, changed=False, advisory=None))
     monkeypatch.setattr(setup, "wait_healthy", lambda *args, **kwargs: None)
     monkeypatch.setattr(setup, "show_pairing", lambda value, **kwargs: calls.append(("pair", value)))
     monkeypatch.setattr(setup, "start_service", lambda *args: calls.append(("service", args)))
@@ -312,6 +316,7 @@ def test_setup_reads_selected_session_and_installs_only_its_companion(tmp_path, 
     assert upgraded["codexBin"] == str(custom_codex)
     assert upgraded["codexHome"] == custom_home
     assert upgraded["codexPath"] == "/usr/bin:/bin"
+    assert ("integration", (executable, Path(custom_home))) in calls
     assert upgraded["port"] == value["port"] and upgraded["httpsPort"] == value["httpsPort"]
     assert read_token(Path(upgraded["tokenFile"])) == owner
     assert registry.authorized(device["token"])

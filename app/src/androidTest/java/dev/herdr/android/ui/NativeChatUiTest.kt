@@ -2,6 +2,8 @@ package dev.herdr.android.ui
 
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.ParcelFileDescriptor
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -34,6 +36,7 @@ import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.sp
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import dev.herdr.android.data.ChatContent
 import dev.herdr.android.data.ChatMessage
 import dev.herdr.android.data.ConnectionState
@@ -203,8 +206,100 @@ class NativeChatUiTest {
         compose.onNodeWithTag("chat-date-$earlier").assertIsDisplayed()
         compose.onNodeWithTag("chat-messages").performScrollToNode(hasTestTag("chat-date-$later"))
         compose.onNodeWithTag("chat-date-$later").assertIsDisplayed()
-        compose.onNodeWithTag("chat-time-second").assertTextEquals("Turn finished " + android.text.format.DateFormat.getTimeFormat(compose.activity).format(Date(second * 1000)))
+        compose.onNodeWithTag("chat-turn-time-second").assertTextEquals("Turn finished " + android.text.format.DateFormat.getTimeFormat(compose.activity).format(Date(second * 1000)))
+        compose.onNodeWithTag("chat-time-second").assertDoesNotExist()
         compose.onNodeWithTag("chat-time-undated").assertDoesNotExist()
+    }
+
+    @Test
+    fun distinctMessageClocksUseThePhonesTwelveHourPreferenceAndSurviveHistoryUpdates() {
+        verifyDistinctMessageClocks("12")
+    }
+
+    @Test
+    fun distinctMessageClocksUseThePhonesTwentyFourHourPreferenceAndSurviveHistoryUpdates() {
+        verifyDistinctMessageClocks("24")
+    }
+
+    private fun verifyDistinctMessageClocks(clockFormat: String) {
+        val previous = Settings.System.getString(compose.activity.contentResolver, Settings.System.TIME_12_24)
+        fun clockSetting(value: String?) {
+            val command = if (value == null) "settings delete system time_12_24" else "settings put system time_12_24 $value"
+            ParcelFileDescriptor.AutoCloseInputStream(
+                InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command),
+            ).use { it.readBytes() }
+        }
+        try {
+            // Change only the disposable device setting, then restore it below.
+            clockSetting(clockFormat)
+            compose.activityRule.scenario.recreate()
+            compose.waitUntil(5_000) { android.text.format.DateFormat.is24HourFormat(compose.activity) == (clockFormat == "24") }
+            val zone = ZoneId.systemDefault()
+            val earlier = LocalDate.of(2024, 6, 12)
+            val later = earlier.plusDays(1)
+            val turnStart = earlier.atTime(23, 56).atZone(zone).toEpochSecond()
+            val offsets = listOf(1L, 130L, 260L, 390L, 520L)
+            val original = offsets.mapIndexed { index, offset ->
+                ChatMessage("clock-$index", if (index % 2 == 0 && index != 4) "user" else "assistant",
+                    if (index % 2 == 0) "A repeated update" else "A repeated commentary", phase = when { index == 4 -> "final_answer"; index % 2 == 0 -> null; else -> "commentary" },
+                    timestamp = turnStart, timestampSource = "turn_start", messageTimestamp = turnStart + offset)
+            }
+            var chat by mutableStateOf(ChatContent(bindingId = "precise-clocks", messages = original, olderCursor = "earlier"))
+            val earlierMessage = ChatMessage("earlier-clock", "user", "Earlier saved history", messageTimestamp = turnStart - 86_400)
+            compose.setContent {
+                HerdrTheme {
+                    ConversationMessages(chat, {
+                        chat = chat.copy(messages = listOf(earlierMessage) + chat.messages, olderCursor = null)
+                    }, Modifier.fillMaxSize())
+                }
+            }
+            val formatter = android.text.format.DateFormat.getTimeFormat(compose.activity)
+            val clocks = original.associate { it.id to formatter.format(Date(it.messageTimestamp!! * 1000)) }
+            compose.runOnIdle { assertEquals(5, clocks.values.toSet().size) }
+            fun assertClocks() {
+                clocks.forEach { (id, time) ->
+                    compose.onNodeWithTag("chat-messages").performScrollToNode(hasTestTag("chat-time-$id"))
+                    compose.onNodeWithTag("chat-time-$id").assertTextEquals(time)
+                    compose.onNodeWithTag("chat-turn-time-$id").assertDoesNotExist()
+                }
+            }
+            assertClocks()
+            compose.onNodeWithTag("chat-messages").performScrollToNode(hasTestTag("chat-date-$earlier"))
+            compose.onNodeWithTag("chat-date-$earlier").assertIsDisplayed()
+            compose.onNodeWithTag("chat-messages").performScrollToNode(hasTestTag("chat-date-$later"))
+            compose.onNodeWithTag("chat-date-$later").assertIsDisplayed()
+
+            compose.runOnIdle {
+                // A refreshed reply changes its content, while its persisted clock stays fixed.
+                chat = chat.copy(messages = chat.messages.map { if (it.id == "clock-1") it.copy(text = it.text + "\nStill working") else it })
+            }
+            assertClocks()
+            compose.onNodeWithTag("chat-messages").performScrollToNode(hasTestTag("load-older-messages"))
+            compose.onNodeWithTag("load-older-messages").performClick()
+            assertClocks()
+            compose.onNodeWithTag("chat-messages").performScrollToNode(hasTestTag("chat-time-earlier-clock"))
+            compose.onNodeWithTag("chat-time-earlier-clock").assertTextEquals(formatter.format(Date(earlierMessage.messageTimestamp!! * 1000)))
+        } finally {
+            clockSetting(previous)
+        }
+    }
+
+    @Test
+    fun repeatedTurnFallbackIsDisplayedOnceAndDoesNotPretendToBeEachMessagesClock() {
+        val timestamp = LocalDate.of(2024, 6, 12).atTime(10, 3).atZone(ZoneId.systemDefault()).toEpochSecond()
+        val messages = (1..3).map {
+            ChatMessage("fallback-$it", "assistant", "Saved commentary $it", phase = "commentary",
+                timestamp = timestamp, timestampSource = "turn_start")
+        }
+        compose.setContent { HerdrTheme { ConversationMessages(ChatContent(bindingId = "fallback", messages = messages), {}, Modifier.fillMaxSize()) } }
+        compose.onNodeWithTag("chat-messages").performScrollToNode(hasTestTag("chat-turn-time-fallback-1"))
+        compose.onNodeWithTag("chat-turn-time-fallback-1").assertTextEquals("Turn started " + android.text.format.DateFormat.getTimeFormat(compose.activity).format(Date(timestamp * 1000)))
+        messages.forEach { message ->
+            compose.onNodeWithTag("chat-messages").performScrollToNode(hasTestTag("chat-message-${message.id}"))
+            compose.onNodeWithTag("chat-time-${message.id}").assertDoesNotExist()
+        }
+        compose.onNodeWithTag("chat-turn-time-fallback-2").assertDoesNotExist()
+        compose.onNodeWithTag("chat-turn-time-fallback-3").assertDoesNotExist()
     }
 
     @Test

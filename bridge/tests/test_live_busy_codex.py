@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from herdr_bridge.app import create_app
-from herdr_bridge.herdr import HerdrClient, canonical_codex_session
+from herdr_bridge.herdr import BridgeError, HerdrClient, canonical_codex_session
 from .conftest import AUTH, TOKEN
 
 
@@ -86,11 +86,18 @@ async def test_working_manual_codex_accepts_exactly_one_phone_message_in_an_isol
             "pane_id": pane_id, "source": "herdr:codex", "agent": "codex",
             "state": "working", "agent_session_id": thread,
         })
-        reported = await backend.agent(pane_id)
-        assert canonical_codex_session(reported) == thread, reported
+        # The report is acknowledged before Herdr's foreground process detector
+        # necessarily publishes this just-started fake runtime as an agent.
+        # Poll only metadata; never repeat the report, launch or prompt.
         async with asyncio.timeout(10):
             while True:
-                agent = await backend.agent(pane_id)
+                try:
+                    agent = await backend.agent(pane_id)
+                except BridgeError as exc:
+                    if exc.status != 409 or exc.detail != "Target is no longer available or cannot accept input; refresh the workspace":
+                        raise
+                    await asyncio.sleep(0.05)
+                    continue
                 if agent.get("agent_status") == "working" and canonical_codex_session(agent) == thread:
                     break
                 await asyncio.sleep(0.05)

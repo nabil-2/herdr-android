@@ -30,7 +30,7 @@ async def test_snapshot_and_health_normalize_real_schema(socket_server):
         assert snapshot["tabs"][1] == {"id": "w1:t2", "workspaceId": "w1", "label": "Agent"}
         assert snapshot["panes"][1] == {"id": "w1:p2", "workspaceId": "w1", "tabId": "w1:t2", "title": "Claude Code", "cwd": "/repo/subdir", "agent": "claude", "status": "blocked"}
         health = await client.get("/v1/health")
-        assert health.json() == {"service": "herdr-android-bridge", "protocol": 1, "companionVersion": __version__, "herdrVersion": "0.9.3", "pairing": False, "capabilities": ["terminal-input", "terminal-history"]}
+        assert health.json() == {"service": "herdr-android-bridge", "protocol": 1, "companionVersion": __version__, "herdrVersion": "0.9.3", "pairing": False, "capabilities": ["terminal-input", "terminal-history", "workspace-tabs"]}
 
 
 async def test_text_and_keys_are_sent_atomically_to_explicit_target(socket_server):

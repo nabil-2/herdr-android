@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from .runtime import external_environment
 
 
 PANE_ID = re.compile(r"w[1-9][0-9]*:p[1-9][0-9]*\Z")
+WORKSPACE_ID = re.compile(r"w[1-9][0-9]*\Z")
 MAX_FRAME_BYTES = 2 * 1024 * 1024
 
 
@@ -29,6 +31,22 @@ class BridgeError(Exception):
 def validate_pane_id(pane_id: str) -> None:
     if len(pane_id) > 96 or not PANE_ID.fullmatch(pane_id):
         raise BridgeError(400, "Select a valid Herdr pane ID")
+
+
+def validate_workspace_id(workspace_id: str) -> None:
+    if len(workspace_id) > 96 or not WORKSPACE_ID.fullmatch(workspace_id):
+        raise BridgeError(400, "Select a valid Herdr workspace ID")
+
+
+@dataclass(frozen=True)
+class CreatedTab:
+    workspace_id: str
+    tab_id: str
+    pane_id: str
+    terminal_id: str
+
+    def public_result(self, warning: str | None = None) -> dict:
+        return {"workspaceId": self.workspace_id, "tabId": self.tab_id, "paneId": self.pane_id, "warning": warning}
 
 
 class HerdrClient:
@@ -113,6 +131,76 @@ class HerdrClient:
         if not isinstance(workspace, dict) or not isinstance(workspace.get("workspace_id"), str):
             raise BridgeError(503, "Herdr could not confirm workspace creation; refresh before retrying")
         return workspace["workspace_id"]
+
+    async def create_tab(self, workspace_id: str, cwd: str | None, label: str, *, env: dict[str, str] | None = None) -> CreatedTab:
+        validate_workspace_id(workspace_id)
+        params = {"workspace_id": workspace_id, "label": label, "focus": False}
+        if cwd is not None:
+            params["cwd"] = str(Path(cwd).expanduser())
+        if env:
+            params["env"] = env
+        result = await self.call("tab.create", params)
+        tab, pane = result.get("tab"), result.get("root_pane")
+        try:
+            if result.get("type") != "tab_created" or not isinstance(tab, dict) or not isinstance(pane, dict):
+                raise ValueError()
+            tab_id, pane_id, terminal_id = tab["tab_id"], pane["pane_id"], pane["terminal_id"]
+            if (tab.get("workspace_id") != workspace_id or pane.get("workspace_id") != workspace_id
+                    or pane.get("tab_id") != tab_id or not isinstance(tab_id, str) or len(tab_id) > 96
+                    or not re.fullmatch(re.escape(workspace_id) + r":t[1-9][0-9]*", tab_id)
+                    or not isinstance(pane_id, str) or len(pane_id) > 96
+                    or not re.fullmatch(re.escape(workspace_id) + r":p[1-9][0-9]*", pane_id)
+                    or not isinstance(terminal_id, str) or not 1 <= len(terminal_id) <= 256):
+                raise ValueError()
+            return CreatedTab(workspace_id, tab_id, pane_id, terminal_id)
+        except (KeyError, ValueError, TypeError) as exc:
+            raise BridgeError(503, "Tab creation could not be confirmed; refresh the workspace before creating another") from exc
+
+    async def start_codex(self, tab: CreatedTab) -> dict:
+        # Only the pane returned by this tab.create operation is a launch target.
+        # Herdr quotes its fixed executable/argument vector; no shell text is built here.
+        await self._wait_created_shell(tab)
+        name = "pocket-" + uuid.uuid4().hex[:24]
+        result = await self.call("agent.start", {"name": name, "kind": "codex", "pane_id": tab.pane_id,
+                                                  "args": [], "timeout_ms": 30000})
+        agent = result.get("agent")
+        if (result.get("type") != "agent_started" or not isinstance(agent, dict)
+                or agent.get("workspace_id") != tab.workspace_id or agent.get("tab_id") != tab.tab_id
+                or agent.get("pane_id") != tab.pane_id or agent.get("terminal_id") != tab.terminal_id
+                or agent.get("name") != name or agent.get("agent") not in (None, "codex")):
+            raise BridgeError(503, "Codex launch could not be confirmed; inspect the new terminal before creating another chat")
+        return agent
+
+    async def _wait_created_shell(self, tab: CreatedTab) -> None:
+        # New tabs return before their shell has finished spawning. Observe its
+        # exact terminal and foreground job before the one agent.start mutation.
+        shells = {"sh", "bash", "dash", "zsh", "fish", "ksh", "mksh", "csh", "tcsh",
+                  "elvish", "xonsh", "nu", "pwsh", "powershell", "cmd"}
+        try:
+            async with asyncio.timeout(3):
+                while True:
+                    pane = (await self.call("pane.get", {"pane_id": tab.pane_id})).get("pane")
+                    if (not isinstance(pane, dict) or pane.get("pane_id") != tab.pane_id
+                            or pane.get("workspace_id") != tab.workspace_id or pane.get("tab_id") != tab.tab_id
+                            or pane.get("terminal_id") != tab.terminal_id):
+                        raise BridgeError(503, "The new terminal changed before launch; inspect it before creating another chat")
+                    info = (await self.call("pane.process_info", {"pane_id": tab.pane_id})).get("process_info")
+                    if not isinstance(info, dict) or info.get("pane_id") != tab.pane_id:
+                        raise BridgeError(503, "The new terminal's shell could not be verified; inspect it before creating another chat")
+                    pid = info.get("shell_pid")
+                    processes = info.get("foreground_processes")
+                    if type(pid) is int and pid > 0 and info.get("foreground_process_group_id") == pid:
+                        if not isinstance(processes, list) or not all(isinstance(process, dict) for process in processes):
+                            raise BridgeError(503, "The new terminal returned incompatible process metadata")
+                        if len(processes) == 1 and processes[0].get("pid") == pid:
+                            name = processes[0].get("name")
+                            if isinstance(name, str):
+                                normalized = name.replace("\\", "/").rsplit("/", 1)[-1].lstrip("-").lower().removesuffix(".exe")
+                                if normalized in shells:
+                                    return
+                    await asyncio.sleep(0.05)
+        except TimeoutError as exc:
+            raise BridgeError(503, "The new terminal's shell is still starting; inspect it before creating another chat") from exc
 
     async def send_terminal_input(self, pane_id: str, text: str) -> None:
         validate_pane_id(pane_id)

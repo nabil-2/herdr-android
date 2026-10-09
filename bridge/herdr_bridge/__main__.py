@@ -123,7 +123,8 @@ def main() -> None:
         uvicorn.run(create_app(client, token, PairingStore(registry_path),
                                codex_executable=chat.get("codexBin"),
                                codex_home=Path(chat["codexHome"]) if chat.get("codexHome") else None,
-                               codex_path=chat.get("codexPath")), host=host, port=port, access_log=False)
+                               codex_path=chat.get("codexPath"),
+                               prepare_codex_integration=bool(args.service_config)), host=host, port=port, access_log=False)
     except (OSError, ValueError) as exc:
         # Do not print exceptions that could embed submitted credentials.
         if isinstance(exc, FileNotFoundError):

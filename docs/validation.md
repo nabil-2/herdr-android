@@ -1,59 +1,64 @@
-# Preview 0.5.1 validation
+# Preview 0.6.0 validation
 
-Validated on 9 October 2026. This release fixes the remaining disabled Send button while Codex is working, including manually renamed sessions. The Android 13 TLS fix and native chat layout from 0.5.0 are retained.
+Validated on 9 October 2026. This release adds terminal tabs and new Codex chats from Android, recorded message times, Codex session-report compatibility, width fitting, stable full-frame rendering, and terminal scrolling. The previous TLS and working-state Send fixes are retained. The [0.5.1 report](validation-0.5.1.md) records the earlier release.
 
 ## Results
 
 | Check | Result | Coverage |
 | --- | --- | --- |
-| Android JVM | 119 passed | Working-state conversation readiness, shared Send guard, client retirement, timestamps/provenance, pagination and existing pairing/terminal/state tests |
-| Android lint | 0 errors, 19 warnings | Debug app, tests and dependencies |
-| Bridge offline | 318 passed | Working updates, named/unnamed manual-agent readiness, legacy-client negotiation, guarded submission, timestamps, pairing, authentication, terminal and host management |
-| Actual Codex 0.162 | 4 passed | Isolated legacy/paginated saved histories, official turn times present/absent, append/rollback, single mocked Herdr submission; no model calls |
-| Actual Herdr 0.9.3 | 3 passed | Owned terminal fixture plus exactly-once submissions to unnamed and manually renamed working synthetic Codex processes |
-| Android 13 device | 64 passed | 61 ordinary cases plus three live fixtures; complete working-chat typing/Send/acknowledgement/follow-up flow, disabled duplicate input, five real Conscrypt TLS regressions, chat and terminal |
-| Frozen Linux package | Passed | Authenticated API, Codex chat, single-use pairing/revocation, QR helpers and licenses |
-| Linux/macOS CI packages | Passed | Linux x86_64, macOS arm64 and macOS x86_64 builds and packaged smoke checks |
-| Installed 005 companion | Passed | Checksummed 0.5.0→0.5.1 update; authenticated health and working-input capability; configuration and paired-device data byte-identical |
+| Android JVM | 132 passed | Strict creation acknowledgements, fresh-chat readiness, message times, frame deduplication, paging encoders, retained pairing/chat/terminal guards |
+| Android lint | 0 errors, 19 warnings | App, tests and terminal dependency; source text scan described below |
+| Bridge offline | 467 passed | Scoped tab/agent creation, shell readiness, fresh receipts, timestamp provenance, official helper compatibility, existing authentication/pairing/input/host management |
+| Actual Codex 0.162 | 7 passed | Legacy/paginated histories, 54 duplicate messages across midnight, append/rollback, persisted times, and fresh reader continuity; no model calls |
+| Actual Herdr 0.9.3 | 5 passed | Owned shell, unnamed/renamed working synthetic agents, new managed Codex launch and first message, canonical ID-only SessionStart reporting |
+| Android 13 device | Final run pending | Chat, creation, uncertainty inspection, terminal fit/scroll/input and retained real TLS regressions |
+| Frozen Linux package | Passed | Authenticated API, clean Codex history, single-use pairing/revocation, frozen QR helpers and bundled licenses |
+| Linux/macOS CI packages | Pending | Linux x86_64, macOS arm64 and macOS x86_64 packages and smoke checks |
+| Installed 005 companion | Passed | Checksummed 0.5.1→0.6.0 update; expected capabilities; all companion configuration/device files and Codex config byte-identical |
+| Normal Android update | Pending | Files/PackageInstaller update from 0.5.1 with stable signing identity and retained app data |
 
-These are **508 distinct automated passing cases**, plus packaged-runtime and installed-host checks. The offline bridge run skips seven optional real-runtime cases, run separately. Gradle passed all 61 ordinary Android cases with the live class excluded. The optional Android class reported `OK (3 tests)` in 13.64 seconds against an owned UUID fixture. No existing user agent received test input, and no user conversation was read for testing.
+The offline run skips 12 opt-in real-runtime cases, which passed separately. A combined real-runtime run reported 40 passes, including 28 helper cases already counted offline. Tests use owned UUID Herdr sessions, temporary Codex homes, synthetic conversations and fake interactive agents; no existing user agent received test input and no user conversation was read for testing.
 
-The first optional fixture run failed before exercising the app because an adb-created external directory was owned by the shell. The passing rerun supplied its QR in app-private storage and let the app create its screenshot directory. Ordinary Gradle device commands explicitly exclude the opt-in live class; see the repeat commands below.
+## Creation and Codex identity
 
-## Reported failures
+Activity tests create a terminal tab and a Codex chat in the selected workspace, check the editable working directory, disable a second Create while acknowledgement is pending, and send one first message through the new chat composer. Additional tests lose a creation acknowledgement or return an already-existing pane ID; automatic polling does not unlock another creation. Explicit **Refresh workspaces** requires successful inspection before another attempt.
 
-A real idle HTTPS socket on the API 33 emulator reproduces `NetworkOnMainThreadException` when the original synchronous `ConnectionPool.evictAll()` runs on Android's main thread. The fixed Herdr and pairing clients close those sockets from detached IO workers; the real `HerdrViewModel.pairServer` replacement path and in-flight cancellation pass with Android's network guard enabled. Retirement rejects new calls immediately, remains idempotent, and evicts connections returned after initial cleanup. Production certificate validation is unchanged. This establishes the supplied crash mechanism; it does not depend on reproducing the user's private server state.
+The real Herdr launch test exposed a race between tab creation and shell startup. The companion now polls only read-only metadata for up to three seconds before calling `agent.start` once in the new pane. Confirmation failures retain the created tab and advise inspecting Terminal. Creation, launch and prompts never retry automatically.
 
-The 0.5.0 fix addressed stock Herdr omitting its managed-only `interactive_ready` flag, but still rejected the `working` status in the companion, Android protocol parser, ViewModel and composer. All four now accept authoritative working-state readiness. The ViewModel and composer share the same submission guard. Renaming a manually launched agent only changes its display label; it does not create a managed launch or require a missing readiness field.
+Codex 0.162 can emit a canonical SessionStart ID with no transcript path, while Herdr's official v8 helper ignores that event. The companion recognizes the complete pinned official helper, saves an owner-only original backup, and changes only its exact session-event guards. Official hook registration and `features.hooks` are verified; unrelated settings and custom helpers are preserved. The real hook test proves a new exact ID replaces a stale ID only in its owned pane. Existing unattributed panes are never matched by directory, title or newest file.
 
-The complete Android activity test types a literal Unicode/multiline message into a working conversation, presses Send, holds the HTTP acknowledgement, checks that a second touch does not submit twice, releases the acknowledgement and sends another follow-up while the agent remains working. It verifies exact text, binding, authentication and negotiation headers. Two real isolated Herdr fixtures additionally prove that `agent.prompt` delivers the follow-up and submission boundary exactly once, including after a real `agent.rename`. These fixtures use fake Codex processes and synthetic history; no model calls are made.
+A fresh Codex process may defer saving its rollout until its first message. A short-lived, in-memory receipt bound to an acknowledged new launch permits an empty composer after a specific completed not-persisted RPC reply or a verified zero-turn saved thread. Exact pane/session/terminal identity and managed readiness remain required. The receipt is consumed before submission; Android independently pauses uncertain delivery. This is not durable server-side deduplication across restart/cache eviction.
 
-Both conversation GETs and message POSTs opt in with `X-Herdr-Chat-Working-Input: 1`. Without it, the new companion retains the idle/done readiness understood by older phone versions, so upgrading the host does not break their history parser. The new phone explains when an older companion needs updating. Blocked, pending launch, explicit false/malformed readiness, stale binding, read errors and uncertain delivery remain guarded. Herdr rechecks the foreground runtime at submission; the app never retries automatically. Codex [Enter while working updates the current turn](https://learn.chatgpt.com/docs/cli/reference#interactive-shortcuts).
+## Recorded message times
 
-## Chat review
+Structured `thread/read` remains the sole content source. A bounded worker optionally matches recorded timestamps from that exact thread's verified owner-only rollout inside its configured Codex home. It rejects unsafe paths, mismatched identity, ambiguous records and unsupported shapes. Duplicate messages remain distinct. The actual Codex tests cover both history formats, more than one page, same-turn repeats, midnight, append and rollback.
 
-The [chat layout screenshot from 0.5.0](screenshots/chat.png) contains only synthetic fixture text: compact user bubbles, assistant text on the canvas, restrained Markdown headings, readable code, accessible copy controls and an anchored composer. The 0.5.1 device tests retain those checks. Working remains a static caption and now explains that Send updates the current task.
+Android displays each available recorded message time with the phone's time zone and 12/24-hour setting. If only a turn boundary time exists, one turn caption replaces repeated per-message times. Missing timing stays empty. Timing enrichment preserves previously loaded history pages.
 
-Codex 0.162 exposes saved turn start/completion times rather than exact item times. The app labels that provenance explicitly and respects the phone's time zone and 12/24-hour format. Histories without official turn times omit dates rather than borrowing file/item timestamps or the current clock. Both cases were verified against the actual app-server in isolated temporary Codex homes.
+## Terminal behavior
 
-Design references: [official Android JetChat](https://github.com/android/compose-samples/blob/main/Jetchat/app/src/main/java/com/example/compose/jetchat/conversation/Conversation.kt), [Material typography](https://m3.material.io/styles/typography/applying-type), and [Compose accessibility](https://developer.android.com/develop/ui/compose/accessibility/api-defaults).
+Full frames reset and repaint in one native emulator write; identical full frames are skipped, avoiding a separately rendered blank reset. Fit width is the default and migrates the old default once. Fitting measures the actual monospace paint/font scale and leaves desktop geometry unchanged. Device checks draw synthetic markers in columns 1 and 80 at large system text size and require both to fit.
+
+Vertical swipes can read local scrollback; **Live** returns to the current viewport. Codex panes default to bounded explicit PgUp/PgDn gestures because Herdr 0.9.3's observer strips mouse/alternate-screen advertisements. **Read** uses local history instead. Shell panes default to reading, and the mode resets per observer. Page keys use raw encoding because Herdr has no logical aliases for them. All gesture input uses the existing scoped FIFO, composition, refusal and uncertain-delivery guards. Emulator replies never become remote input.
+
+Herdr recent output remains bounded to 1,000 lines and 64 KiB. The actual observer probe showed fullscreen output can expose only the current viewport, so the UI explains that limit and offers program paging rather than claiming unlimited scrollback.
+
+The terminal dependency's Kotlin sources are pinned and vendored solely to expose its existing ScrollController/accessibility component; the four-ABI native libraries remain byte-identical to 0.5.1. See [vendor notes](../third_party/termlib/README.md). AGP's BidirectionalText lint detector hung walking this dependency's Kotlin comments. Only that detector is disabled in the dependency module; mandatory strict UTF-8/bidirectional-control scanning covers its Kotlin/XML inputs on build and lint. Other app/dependency checks remain enabled.
 
 ## Environment and artifact
 
 - Pixel 7 emulator, Android 13/API 33, x86_64, hardware virtualization.
-- JDK 17, Kotlin 2.4.20, Gradle 9.6.0, Android Gradle Plugin 9.4.0; compile/target SDK 37.0 and build tools 36.0.0; minimum Android API 26.
+- JDK 17, Kotlin 2.4.20, Gradle 9.6.0, Android Gradle Plugin 9.4.0; compile/target SDK 37.0, build tools 36.0.0; minimum API 26.
 - Linux x86_64 package: glibc 2.34, portable Python 3.11.17, PyInstaller 6.22.3.
-- APK: **34,770,762 bytes**, version code **7**, version name **0.5.1**; signature and 16 KiB ZIP alignment checks passed.
+- APK: **31,590,475 bytes**, version code **8**, version name **0.6.0**. API 33 signature, ZIP CRC/no duplicates and 16 KiB alignment checks passed. All 16 native libraries across four ABIs match 0.5.1 byte-for-byte.
 
 APK SHA-256:
 
 ```text
-2b9c848b802210aaf1b3f029acdb3874a17957827d60340a6711d87c0680b1fa
+98923777d8c82fe0b53fb57a65236ddb24d041e51c9c41af31384e4619a6c373
 ```
 
-The signing certificate matches earlier previews (`ad045612a56a05953afb2162ac0b277a8a579dd8e70269caa18db37c26125c9c`), allowing installation over the existing app. Release assets and platform license bundles are covered by `SHA256SUMS`. Phone profiles and host device credentials do not need to be recreated for this update.
-
-Production payloads were built from `67fe73b23da5e20fa2034bdc09b18d6fef3ee6ec`. [Android/bridge CI](https://github.com/nabil-2/herdr-android/actions/runs/37915895987) and [host package CI](https://github.com/nabil-2/herdr-android/actions/runs/37915896024) passed for that source. Later edits only record these results and correct the live fixture invocation.
+The signing certificate is unchanged (`ad045612a56a05953afb2162ac0b277a8a579dd8e70269caa18db37c26125c9c`). Release assets and platform license bundles are covered by SHA256SUMS. Phone profiles and host credentials do not need to be recreated.
 
 ## Repeat
 
@@ -62,14 +67,16 @@ Production payloads were built from `67fe73b23da5e20fa2034bdc09b18d6fef3ee6ec`. 
 ./gradlew :app:connectedDebugAndroidTest \
   -Pandroid.testInstrumentationRunnerArguments.notClass=dev.herdr.android.LiveBridgeDeviceTest
 bridge/.venv/bin/python -m pytest bridge/tests -q
-HERDR_INTEGRATION=1 bridge/.venv/bin/python -m pytest bridge/tests/test_live_herdr.py bridge/tests/test_live_busy_codex.py -q
-CODEX_INTEGRATION=1 bridge/.venv/bin/python -m pytest bridge/tests/test_live_codex_chat.py -q
+HERDR_INTEGRATION=1 CODEX_INTEGRATION=1 bridge/.venv/bin/python -m pytest \
+  bridge/tests/test_live_herdr.py bridge/tests/test_live_busy_codex.py \
+  bridge/tests/test_live_codex_chat.py bridge/tests/test_live_fresh_reader.py \
+  bridge/tests/test_live_new_codex.py bridge/tests/test_codex_integration.py -q
 bridge/.venv/bin/python scripts/build_host.py
 bridge/.venv/bin/python scripts/smoke_host_package.py artifacts/host/herdr-pocket-linux-x86_64
 ```
 
-Use the [owned live Android fixture](../bridge/README.md#live-android-device-fixture) for the three optional end-to-end cases. Start it immediately before testing and clean up its process and adb reverse mapping afterward; its one-use invitation expires after five minutes.
+Use the [owned live Android fixture](../bridge/README.md#live-android-device-fixture) for the three optional end-to-end cases. Its one-use invitation expires after five minutes.
 
 ## Practical limits
 
-Native chat supports saved Codex text conversations; tools/reasoning stay out of chat, and interactive approvals use Terminal. Completed persisted messages refresh once per second rather than streaming tokens. Old saved histories may lack official turn times. Background notifications and direct SSH are not included. The actual reported phone has not been tested directly, and physical camera/keyboard and macOS login-service behavior remain outside emulator/CI evidence. Herdr and Tailscale continue to run independently.
+Chat refreshes persisted text rather than streaming tokens; tool/reasoning output is omitted and approvals use Terminal. Login/trust prompts can require the new Codex chat's terminal. Recorded message times may be unavailable in old or unsupported histories. Background notifications and direct SSH are not included. The user's physical phone and macOS login services have not been tested directly; emulator and CI evidence do not establish those hardware results. Herdr and Tailscale run independently.

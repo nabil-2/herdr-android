@@ -71,6 +71,22 @@ class TerminalOutputTest {
         compose.runOnIdle { assertEquals(3, attempts) }
     }
 
+    @Test fun fullScreenHistoryExplainsItsLimitAndProgramKeysRequireAnExplicitTap() {
+        var openedKeys = 0
+        var closed = 0
+        compose.setContent {
+            HerdrTheme {
+                TerminalOutputSheet("synthetic-codex", { TerminalHistory("synthetic-codex", "Current synthetic screen", false) },
+                    { closed++ }, fullScreenHint = true, onOpenKeys = { openedKeys++ })
+            }
+        }
+        compose.onNodeWithTag("terminal-output-fullscreen-hint").assertTextEquals(
+            "Full-screen apps may expose only their current screen. To scroll inside the app, use PgUp / PgDn in Keys.")
+        compose.runOnIdle { assertEquals(0, openedKeys); assertEquals(0, closed) }
+        compose.onNodeWithTag("terminal-output-program-keys").performClick()
+        compose.runOnIdle { assertEquals(1, openedKeys); assertEquals(1, closed) }
+    }
+
     private class OutputLifecycleOwner : LifecycleOwner {
         val registry = LifecycleRegistry(this)
         override val lifecycle: Lifecycle get() = registry

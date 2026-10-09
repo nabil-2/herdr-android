@@ -24,6 +24,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 from . import __version__
 from .config import default_token_path, initialize_token, read_token
+from .codex_integration import ensure_codex_integration
 from .herdr import HerdrClient
 from .pairing import PairingStore
 from .runtime import external_environment
@@ -484,6 +485,10 @@ def setup(*, session: str | None = None, socket_path: Path | None = None, herdr_
               "url": f"https://{dns_name}:{https_port}/", "name": (socket.gethostname() + (" / " + name if name != "default" else ""))[:100]}
     config.update(chat)
     print(f"Preparing phone access to Herdr session {name}…")
+    if chat.get("codexBin") and chat.get("codexHome"):
+        integration = ensure_codex_integration(executable, Path(chat["codexHome"]))
+        if integration.advisory:
+            print(f"Codex chat: {integration.advisory}")
     # Stop all readers of the common frozen archive before atomically replacing
     # it. Old one-file processes can otherwise lazily read the new archive.
     from .host_manage import installer_upgrade

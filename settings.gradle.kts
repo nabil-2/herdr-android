@@ -16,3 +16,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "HerdrAndroid"
 include(":app")
+include(":termlib")
+project(":termlib").projectDir = file("third_party/termlib")

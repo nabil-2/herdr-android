@@ -77,6 +77,7 @@ import dev.herdr.android.data.Pane
 import dev.herdr.android.data.PaneMode
 import dev.herdr.android.data.ChatState
 import dev.herdr.android.data.ServerProfile
+import dev.herdr.android.data.Workspace
 
 @Composable
 fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalRetry: (String) -> Unit, onPair: (String) -> Unit) {
@@ -86,6 +87,8 @@ fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalR
     var editingProfileId by rememberSaveable { mutableStateOf<String?>(null) }
     val editingProfile = state.profiles.firstOrNull { it.id == editingProfileId }
     var showNewWorkspace by rememberSaveable { mutableStateOf(false) }
+    var newTabWorkspaceId by rememberSaveable(state.activeProfileId) { mutableStateOf<String?>(null) }
+    var newTabIsCodex by rememberSaveable(state.activeProfileId) { mutableStateOf(false) }
     var showPairing by rememberSaveable { mutableStateOf(false) }
     var pairingMode by rememberSaveable { mutableStateOf(PairingEntryMode.SCAN) }
     var pairingStartRevision by rememberSaveable { mutableLongStateOf(0L) }
@@ -197,6 +200,11 @@ fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalR
                 onTab = viewModel::selectTab,
                 onPane = viewModel::selectPane,
                 onCreate = { viewModel.clearError(); showNewWorkspace = true },
+                onCreateTab = { codex ->
+                    viewModel.clearError()
+                    newTabIsCodex = codex
+                    newTabWorkspaceId = state.workspaceId
+                },
                 onDismissError = viewModel::clearError,
                 onRetry = { state.activeProfileId?.let(onConnect) },
             )
@@ -219,6 +227,18 @@ fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalR
             onDismiss = { showNewWorkspace = false; viewModel.clearError() },
             onCreate = { cwd, name -> viewModel.createWorkspace(cwd, name) },
         )
+        newTabWorkspaceId?.let { workspaceId ->
+            val workspace = state.snapshot?.workspaces?.firstOrNull { it.id == workspaceId }
+            if (workspace != null) NewTabDialog(
+                state = state,
+                workspace = workspace,
+                codex = newTabIsCodex,
+                onDismiss = { newTabWorkspaceId = null; viewModel.clearError() },
+                onCreated = { newTabWorkspaceId = null },
+                onInspect = { newTabWorkspaceId = null; viewModel.inspectCreatedTabs(workspaceId) },
+                onCreate = { label, cwd -> viewModel.createTab(workspaceId, label, cwd, newTabIsCodex) },
+            )
+        }
     }
 }
 
@@ -335,7 +355,7 @@ private fun BrandMark() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DashboardScreen(
+internal fun DashboardScreen(
     state: HerdrUiState,
     onServers: () -> Unit,
     onRefresh: () -> Unit,
@@ -343,6 +363,7 @@ private fun DashboardScreen(
     onTab: (String) -> Unit,
     onPane: (String) -> Unit,
     onCreate: () -> Unit,
+    onCreateTab: (Boolean) -> Unit,
     onDismissError: () -> Unit,
     onRetry: () -> Unit,
 ) {
@@ -445,6 +466,29 @@ private fun DashboardScreen(
                         )
                     }
                 }
+                if (!searching && selectedWorkspace != null) item {
+                    val enabled = state.connection == ConnectionState.CONNECTED && !state.creatingWorkspace && !state.creatingTab
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { onCreateTab(false) }, enabled = enabled,
+                                modifier = Modifier.weight(1f).testTag("new-tab")) {
+                                SymbolIcon(Symbol.PLUS)
+                                Spacer(Modifier.width(6.dp))
+                                Text("New tab")
+                            }
+                            Button(onClick = { onCreateTab(true) }, enabled = enabled,
+                                modifier = Modifier.weight(1f).testTag("new-codex-chat")) {
+                                SymbolIcon(Symbol.CHAT)
+                                Spacer(Modifier.width(6.dp))
+                                Text("New Codex chat")
+                            }
+                        }
+                        if ("workspace-tabs" !in state.capabilities || "codex-create" !in state.capabilities) {
+                            Text("Update the host companion to create tabs and Codex chats here.",
+                                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
                 if (!searching && tabs.isNotEmpty()) item {
                     LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         items(tabs, key = { it.id }) { tab ->
@@ -462,7 +506,7 @@ private fun DashboardScreen(
                 }
                 if (panes.isEmpty()) item {
                     if (searching) EmptyPanel("No matching sessions", "Try an agent name, terminal title, workspace, or directory.")
-                    else EmptyPanel("No terminals in this tab", "Open a terminal in Herdr on your computer, or create a new workspace here.")
+                    else EmptyPanel("No terminals in this tab", "Create a new tab or Codex chat in this workspace.")
                 }
             } else if (state.connection == ConnectionState.CONNECTED && snapshot != null) item {
                 EmptyPanel("Ready for your first workspace", "Create a workspace to open a shell on your server. Then launch your preferred agent from its terminal.")
@@ -474,6 +518,55 @@ private fun DashboardScreen(
             }
         }
     }
+}
+
+@Composable
+internal fun NewTabDialog(
+    state: HerdrUiState,
+    workspace: Workspace,
+    codex: Boolean,
+    onDismiss: () -> Unit,
+    onCreated: () -> Unit,
+    onInspect: () -> Unit,
+    onCreate: (String, String) -> Unit,
+) {
+    var label by rememberSaveable(workspace.id, codex) { mutableStateOf(if (codex) "Codex chat" else "Terminal") }
+    var cwd by rememberSaveable(workspace.id, codex) { mutableStateOf(workspace.cwd) }
+    val initialRevision = remember { state.creationRevision }
+    val capability = if (codex) "codex-create" else "workspace-tabs"
+    val supported = capability in state.capabilities
+    val busy = state.creatingTab || state.creatingWorkspace
+    LaunchedEffect(state.creationRevision) {
+        if (state.creationRevision > initialRevision) onCreated()
+    }
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text(if (codex) "New Codex chat" else "New tab") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(if (codex) "Start a new Codex conversation in ${workspace.label}." else "Open a new terminal in ${workspace.label}.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                OutlinedTextField(label, { label = it.take(100) }, label = { Text("Tab name") }, singleLine = true,
+                    enabled = !busy, modifier = Modifier.fillMaxWidth().testTag("new-tab-name"))
+                OutlinedTextField(cwd, { cwd = it.take(4096) }, label = { Text("Server directory") }, singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), enabled = !busy,
+                    modifier = Modifier.fillMaxWidth().testTag("new-tab-directory"))
+                if (!supported) Text("Run herdr-pocket update on this server, then reconnect.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                if (state.error != null) Text(state.error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                if (state.creationUncertain) TextButton(onClick = onInspect, modifier = Modifier.testTag("inspect-created-tabs")) {
+                    Text("Refresh workspaces")
+                }
+                if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onCreate(label, cwd) },
+                enabled = label.isNotBlank() && cwd.isNotBlank() && supported && !busy && !state.creationUncertain && state.connection == ConnectionState.CONNECTED,
+                modifier = Modifier.testTag("create-tab")) { Text(if (codex) "Start chat" else "Create tab") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") } },
+    )
 }
 
 @Composable

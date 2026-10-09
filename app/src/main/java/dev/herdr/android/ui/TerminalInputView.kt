@@ -252,6 +252,12 @@ internal class TerminalInputView(context: Context) : View(context), TerminalInpu
     private fun Char.isAsciiPrintableKey(): Boolean = code in 33..126
 
     private fun forwardKey(name: String): Boolean {
+        // Herdr0.9.3 does not accept its logical pageup/pagedown spellings.
+        // Preserve native composition/refusal handling, then send these two
+        // standard sequences through the same scoped raw-input queue as typing.
+        if (name.substringAfterLast('+') in setOf("pageup", "pagedown")) {
+            return terminalShortcutBytes(name, false, false, inputModes)?.let(onInput) ?: false
+        }
         onKeyInput?.let { return it(listOf(name)) }
         // Fallback supports isolated adapter tests. Production always supplies
         // logical key transport because observer snapshots omit PTY input modes.

@@ -78,6 +78,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     // Kept in memory across selection/reconnects so an uncertain old write is not
     // silently cleared by a new observer. No input text is retained here.
     private val uncertainTerminalTargets = mutableSetOf<Pair<String, String>>()
+    private val uncertainCreations = mutableSetOf<Pair<String, String>>()
     private val terminalInputs = TerminalInputQueue<TerminalInputTarget>(
         scope = viewModelScope,
         send = { target, input ->
@@ -283,7 +284,8 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         if (snapshot.workspaces.none { it.id == id }) return
         stopChatWork()
         mutableState.update {
-            it.copy(workspaceId = id, tabId = snapshot.tabs.firstOrNull { tab -> tab.workspaceId == id }?.id, paneId = null, chat = ChatContent())
+            it.copy(workspaceId = id, tabId = snapshot.tabs.firstOrNull { tab -> tab.workspaceId == id }?.id, paneId = null, chat = ChatContent(),
+                creationUncertain = it.activeProfileId?.let { profile -> profile to id in uncertainCreations } == true)
         }
         restartObservation()
     }
@@ -291,7 +293,8 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     fun selectTab(id: String) {
         val tab = state.value.snapshot?.tabs?.firstOrNull { it.id == id } ?: return
         stopChatWork()
-        mutableState.update { it.copy(workspaceId = tab.workspaceId, tabId = tab.id, paneId = null, chat = ChatContent()) }
+        mutableState.update { it.copy(workspaceId = tab.workspaceId, tabId = tab.id, paneId = null, chat = ChatContent(),
+            creationUncertain = it.activeProfileId?.let { profile -> profile to tab.workspaceId in uncertainCreations } == true) }
         restartObservation()
     }
 
@@ -574,7 +577,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     fun createWorkspace(cwd: String, label: String) {
         val currentClient = client ?: return
         if (!ensureNetworkPermission()) return
-        if (state.value.connection != ConnectionState.CONNECTED || state.value.creatingWorkspace) return
+        if (state.value.connection != ConnectionState.CONNECTED || state.value.creatingWorkspace || state.value.creatingTab) return
         val currentGeneration = generation
         mutableState.update { it.copy(creatingWorkspace = true, error = null) }
         createJob = viewModelScope.launch {
@@ -592,6 +595,95 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
                 if (generation == currentGeneration) showError("${readableError(error)} Workspace creation was not retried.")
             } finally {
                 if (generation == currentGeneration) mutableState.update { it.copy(creatingWorkspace = false) }
+            }
+        }
+    }
+
+    fun createTab(workspaceId: String, label: String, cwd: String, codex: Boolean) {
+        val currentClient = client ?: return
+        if (!ensureNetworkPermission()) return
+        val current = state.value
+        val profileId = current.activeProfileId ?: return
+        if (current.connection != ConnectionState.CONNECTED || current.creatingWorkspace || current.creatingTab) return
+        if (profileId to workspaceId in uncertainCreations) {
+            mutableState.update { it.copy(creationUncertain = true, error = "Refresh workspaces and inspect the existing tabs before creating another.") }
+            return
+        }
+        val initialSnapshot = current.snapshot ?: return
+        if (initialSnapshot.workspaces.none { it.id == workspaceId }) return
+        val capability = if (codex) "codex-create" else "workspace-tabs"
+        if (capability !in current.capabilities) {
+            showError("Update the host companion with herdr-pocket update to create ${if (codex) "Codex chats" else "tabs"} here.")
+            return
+        }
+        val currentGeneration = generation
+        mutableState.update { it.copy(creatingTab = true, creationUncertain = false, error = null) }
+        // Keep the guard if connection teardown cancels an in-flight write.
+        uncertainCreations.add(profileId to workspaceId)
+        createJob = viewModelScope.launch {
+            var created = false
+            try {
+                val result = currentClient.createTab(workspaceId, label, cwd, codex)
+                if (initialSnapshot.tabs.any { it.id == result.tabId } || initialSnapshot.panes.any { it.id == result.paneId }) {
+                    throw java.io.IOException("The server returned an existing tab. Inspect workspaces before creating another.")
+                }
+                created = true
+                uncertainCreations.remove(profileId to workspaceId)
+                if (generation != currentGeneration) return@launch
+                mutableState.update { it.copy(creationRevision = it.creationRevision + 1) }
+                val snapshot = currentClient.snapshot()
+                if (generation != currentGeneration) return@launch
+                updateSnapshot(snapshot)
+                val pane = snapshot.panes.firstOrNull {
+                    it.id == result.paneId && it.tabId == result.tabId && it.workspaceId == result.workspaceId
+                }
+                if (pane == null) {
+                    showError("The tab was created. Refresh workspaces to open it.")
+                } else {
+                    selectPane(pane.id)
+                    if (codex && state.value.paneMode != PaneMode.CHAT) showChat()
+                    if (result.warning != null) {
+                        if (codex) mutableState.update { it.copy(chat = it.chat.copy(warning = result.warning)) }
+                        else showError(result.warning)
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (generation == currentGeneration) {
+                    val uncertain = !created && error !is IllegalArgumentException &&
+                        !(error is BridgeException && error.statusCode in setOf(400, 401, 403, 404, 409, 422))
+                    if (uncertain) uncertainCreations.add(profileId to workspaceId)
+                    else uncertainCreations.remove(profileId to workspaceId)
+                    mutableState.update { it.copy(creationUncertain = uncertain) }
+                    showError(if (created) "The tab was created, but could not be opened. Refresh workspaces."
+                        else "${readableError(error)} Creation was not retried. Refresh workspaces before trying again.")
+                }
+            } finally {
+                if (generation == currentGeneration) mutableState.update { it.copy(creatingTab = false) }
+            }
+        }
+    }
+
+    /** Explicit inspection after an uncertain mutation; normal polling cannot acknowledge it. */
+    fun inspectCreatedTabs(workspaceId: String) {
+        val currentClient = client ?: return
+        val profileId = state.value.activeProfileId ?: return
+        if (state.value.connection != ConnectionState.CONNECTED || !ensureNetworkPermission()) return
+        val currentGeneration = generation
+        viewModelScope.launch {
+            try {
+                val snapshot = currentClient.snapshot()
+                if (generation != currentGeneration) return@launch
+                updateSnapshot(snapshot)
+                selectWorkspace(workspaceId)
+                uncertainCreations.remove(profileId to workspaceId)
+                mutableState.update {
+                    it.copy(creationUncertain = it.workspaceId?.let { selected -> profileId to selected in uncertainCreations } == true, error = null)
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (generation == currentGeneration) showError("${readableError(error)} Inspect the tabs before creating another.")
             }
         }
     }
@@ -623,7 +715,8 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
             val tabId = old.tabId?.takeIf { id -> snapshot.tabs.any { it.id == id && it.workspaceId == workspaceId } }
                 ?: snapshot.tabs.firstOrNull { it.workspaceId == workspaceId }?.id
             val paneId = old.paneId?.takeIf { id -> snapshot.panes.any { it.id == id && it.tabId == tabId } }
-            old.copy(snapshot = snapshot, workspaceId = workspaceId, tabId = tabId, paneId = paneId)
+            old.copy(snapshot = snapshot, workspaceId = workspaceId, tabId = tabId, paneId = paneId,
+                creationUncertain = !old.creatingTab && old.activeProfileId?.let { profile -> profile to workspaceId in uncertainCreations } == true)
         }
         if (state.value.paneId != previousPaneId) {
             stopChatWork()

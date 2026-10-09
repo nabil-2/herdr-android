@@ -159,6 +159,41 @@ class TerminalSurfaceDeviceTest {
     }
 
     @Test
+    fun pageKeysUseNativeSequencesWithCompositionAndRefusalGuardsWhileOtherKeysStayLogical() {
+        val actions = mutableListOf<String>()
+        var composing = ""
+        var consumed = 0
+        compose.runOnUiThread {
+            val input = TerminalInputView(InstrumentationRegistry.getInstrumentation().targetContext).apply {
+                onInput = { actions += "text:${it.toString(Charsets.UTF_8)}"; true }
+                onKeyInput = { actions += "keys:${it.joinToString(",")}"; true }
+                onComposingChanged = { composing = it }
+                onModifierConsumed = { consumed++ }
+                configure(enabled = true, showKeyboard = false)
+            }
+            val connection = input.onCreateInputConnection(EditorInfo())!!
+            connection.setComposingText("pending word", 1)
+            assertTrue(input.sendKey("pageup"))
+            assertEquals(listOf("text:pending word", "text:\u001B[5~"), actions)
+            assertEquals("", composing)
+            assertTrue(input.sendKey("ctrl+shift+pagedown"))
+            assertEquals("text:\u001B[6;6~", actions.last())
+            assertTrue(input.sendKey("left"))
+            assertEquals("keys:left", actions.last())
+            val accepted = actions.size
+            input.ctrlPressed = true
+            input.onInput = { false }
+            assertFalse(input.sendKey("pageup"))
+            assertTrue("A refused page key retains the screen modifier", input.ctrlPressed)
+            assertEquals(3, consumed)
+            input.configure(enabled = false, showKeyboard = false)
+            assertFalse(input.sendKey("pagedown"))
+            assertEquals(accepted, actions.size)
+            input.dispose()
+        }
+    }
+
+    @Test
     fun imeClipboardAndHardwarePasteRequirePreviewWhileEnterRemainsDirect() {
         val sent = mutableListOf<ByteArray>()
         var preview: String? = null

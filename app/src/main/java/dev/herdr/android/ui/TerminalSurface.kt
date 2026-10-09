@@ -55,7 +55,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import org.connectbot.terminal.SelectionController
-import org.connectbot.terminal.Terminal
+import org.connectbot.terminal.ScrollController
+import org.connectbot.terminal.TerminalWithAccessibility
 import org.connectbot.terminal.TerminalEmulator
 import kotlin.math.ceil
 import kotlin.math.roundToInt
@@ -88,12 +89,16 @@ internal fun TerminalSurface(
     onPasteTextRequest: ((String) -> Unit)? = null,
     onKeyboardRequested: () -> Unit = {},
     onImeVisibilityChanged: (Boolean) -> Unit = {},
-    fitToWidth: Boolean = false,
+    fitToWidth: Boolean = true,
     viewportResetKey: Int = 0,
     inputModes: TerminalInputModes = remember { TerminalInputModes() },
     inputSessionKey: Any? = null,
     onInputControllerAvailable: (TerminalInputController) -> Unit = {},
     onSelectionControllerAvailable: (SelectionController) -> Unit = {},
+    onScrollControllerAvailable: (ScrollController) -> Unit = {},
+    onHistoryRequested: (() -> Unit)? = null,
+    scrollProgram: Boolean = false,
+    onProgramScroll: ((Boolean) -> Boolean)? = null,
 ) {
     val density = LocalDensity.current
     val uriHandler = LocalUriHandler.current
@@ -102,7 +107,9 @@ internal fun TerminalSurface(
     var inputView by remember(emulator) { mutableStateOf<TerminalInputView?>(null) }
     var composing by remember(emulator) { mutableStateOf("") }
     var selectionController by remember(emulator) { mutableStateOf<SelectionController?>(null) }
+    var scrollController by remember(emulator) { mutableStateOf<ScrollController?>(null) }
     val selectionActive by remember(emulator) { derivedStateOf { selectionController?.isSelectionActive == true } }
+    val scrollbackPosition by remember(emulator) { derivedStateOf { scrollController?.scrollbackPosition ?: 0 } }
     val currentInput by rememberUpdatedState(onInput)
     val currentKeyInput by rememberUpdatedState(onKeyInput)
     val currentConsume by rememberUpdatedState(onModifierConsumed)
@@ -111,16 +118,31 @@ internal fun TerminalSurface(
     val currentPasteRequest by rememberUpdatedState(onPasteRequest)
     val currentPasteTextRequest by rememberUpdatedState(onPasteTextRequest)
     val currentEnabled by rememberUpdatedState(enabled)
+    val currentHistoryRequest by rememberUpdatedState(onHistoryRequested)
+    val currentProgramScroll by rememberUpdatedState(onProgramScroll)
 
     val requestedSize = fontSize.takeIf { it.isFinite() }?.coerceIn(8f, 28f) ?: 14f
     val actualSize = remember(requestedSize, fitToWidth, viewport.width, cols, density) {
         if (fitToWidth && viewport.width > 0) {
-            val paint = TextPaint().apply { typeface = Typeface.MONOSPACE; textSize = with(density) { 1.sp.toPx() } }
-            (viewport.width / (cols.coerceAtLeast(1) * paint.measureText("M"))).coerceIn(4f, 28f)
+            val paint = TextPaint().apply { typeface = Typeface.MONOSPACE; isAntiAlias = true }
+            val availableWidth = (viewport.width - 1).coerceAtLeast(1)
+            var smallest = 0.5f
+            var largest = 28f
+            // Measure at the size that will actually be drawn. Font hinting
+            // quantizes glyph advances, so scaling a measurement made at 1sp
+            // can leave the last columns outside the viewport.
+            repeat(24) {
+                val candidate = (smallest + largest) / 2f
+                paint.textSize = with(density) { candidate.sp.toPx() }
+                if (ceil(paint.measureText("M") * cols.coerceAtLeast(1)) <= availableWidth) {
+                    smallest = candidate
+                } else largest = candidate
+            }
+            smallest
         } else requestedSize
     }
     val grid = remember(actualSize, cols, rows, density) {
-        val paint = TextPaint().apply { typeface = Typeface.MONOSPACE; textSize = with(density) { actualSize.sp.toPx() } }
+        val paint = TextPaint().apply { typeface = Typeface.MONOSPACE; isAntiAlias = true; textSize = with(density) { actualSize.sp.toPx() } }
         val charHeight = ceil(paint.fontMetrics.descent - paint.fontMetrics.ascent).coerceAtLeast(1f)
         IntSize(ceil(paint.measureText("M") * cols).toInt().coerceAtLeast(1), (charHeight * rows).roundToInt().coerceAtLeast(1))
     }
@@ -146,6 +168,7 @@ internal fun TerminalSurface(
     LaunchedEffect(viewportResetKey) {
         pan = Offset(0f, -(grid.height - viewport.height).coerceAtLeast(0).toFloat())
         selectionController?.clearSelection()
+        scrollController?.scrollToBottom()
     }
     val imeVisible = WindowInsets.ime.getBottom(density) > 0
     LaunchedEffect(imeVisible) { onImeVisibilityChanged(imeVisible) }
@@ -157,8 +180,8 @@ internal fun TerminalSurface(
         modifier.fillMaxSize().background(background).clipToBounds()
             .onSizeChanged { viewport = it }
             .semantics {
-                contentDescription = "Live terminal output. Tap to type; pinch to zoom; drag to pan; hold to select text."
-                stateDescription = "Remote grid $cols columns by $rows rows. ${actualSize.roundToInt()} point text."
+                contentDescription = "Live terminal output. Tap to type; pinch to zoom; swipe vertically through output; hold to select text."
+                stateDescription = "Remote grid $cols columns by $rows rows. ${actualSize.roundToInt()} point text. Scrollback $scrollbackPosition."
                 onClick(label = "Open terminal keyboard") {
                     if (currentEnabled) {
                         currentKeyboardRequest()
@@ -168,13 +191,22 @@ internal fun TerminalSurface(
                 }
             }
             .testTag("terminal-surface")
-            .pointerInput(emulator) {
+            .pointerInput(emulator, inputSessionKey, scrollProgram) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
                     val start = down.position
                     var panning = false
                     var pinching = false
                     var zoomSize = currentFont
+                    var verticalDrag = false
+                    var scrollRemainder = 0f
+                    var olderEdgeDrag = 0f
+                    var requestHistory = false
+                    var remoteRemainder = 0f
+                    var remoteReports = 0
+                    var lastRemoteAt: Long? = null
+                    var remoteRefused = false
+                    var usedRemoteScroll = false
                     val outsideGrid = down.position.x !in pan.x..(pan.x + currentGrid.width) ||
                         down.position.y !in pan.y..(pan.y + currentGrid.height)
                     var releasedAt = down.uptimeMillis
@@ -200,9 +232,68 @@ internal fun TerminalSurface(
                             val change = event.changes.firstOrNull { it.id == down.id } ?: break
                             val distance = change.position - start
                             val beforeLongPress = change.uptimeMillis - down.uptimeMillis < viewConfiguration.longPressTimeoutMillis
-                            if (!panning && beforeLongPress && distance.getDistance() > viewConfiguration.touchSlop) panning = true
+                            if (!panning && beforeLongPress && distance.getDistance() > viewConfiguration.touchSlop) {
+                                panning = true
+                                verticalDrag = kotlin.math.abs(distance.y) > kotlin.math.abs(distance.x)
+                            }
                             if (panning) {
-                                pan = clampTerminalPan(pan + (change.position - change.previousPosition), currentGrid, currentViewport)
+                                val movement = change.position - change.previousPosition
+                                if (verticalDrag) {
+                                    val oldPan = pan
+                                    pan = clampTerminalPan(pan.copy(y = pan.y + movement.y), currentGrid, currentViewport)
+                                    val remainder = movement.y - (pan.y - oldPan.y)
+                                    val controller = scrollController
+                                    val canScroll = controller != null &&
+                                        ((remainder > 0 && controller.scrollbackPosition < controller.maxScrollback) ||
+                                            (remainder < 0 && controller.scrollbackPosition > 0))
+                                    if (canScroll) {
+                                        scrollRemainder += remainder
+                                        val lineHeight = (currentGrid.height.toFloat() / rows.coerceAtLeast(1)).coerceAtLeast(1f)
+                                        val lines = (scrollRemainder / lineHeight).toInt()
+                                        if (lines != 0) {
+                                            controller!!.scrollBy(lines)
+                                            scrollRemainder -= lines * lineHeight
+                                        }
+                                        olderEdgeDrag = 0f
+                                    } else if (currentEnabled && (scrollProgram || inputModes.supportsSgrWheel)) {
+                                        // Input requires an actual one-finger drag, an advertised
+                                        // mouse mode or explicit Page scroll opt-in, and the edge
+                                        // of local history. Observer updates never enter this path.
+                                        usedRemoteScroll = true
+                                        remoteRemainder += remainder
+                                        val lineHeight = (currentGrid.height.toFloat() / rows.coerceAtLeast(1)).coerceAtLeast(1f)
+                                        val step = if (scrollProgram) (lineHeight * 5).coerceAtLeast(viewConfiguration.touchSlop * 6)
+                                            else (lineHeight * 2).coerceAtLeast(viewConfiguration.touchSlop * 2)
+                                        val limit = if (scrollProgram) 3 else 12
+                                        val interval = if (scrollProgram) 160L else 50L
+                                        val count = (kotlin.math.abs(remoteRemainder) / step).toInt()
+                                            .coerceAtMost(if (scrollProgram) 1 else 3).coerceAtMost((limit - remoteReports).coerceAtLeast(0))
+                                        if (!remoteRefused && count > 0 && (lastRemoteAt == null || change.uptimeMillis - lastRemoteAt!! >= interval)) {
+                                            val older = remoteRemainder > 0
+                                            val accepted = if (scrollProgram) currentProgramScroll?.invoke(older) == true else {
+                                                val report = TerminalInputEncoder.mouseWheel(older)
+                                                currentInput(ByteArray(report.size * count) { report[it % report.size] })
+                                            }
+                                            if (accepted) {
+                                                remoteRemainder -= step * count * (if (older) 1 else -1)
+                                                remoteReports += count
+                                                lastRemoteAt = change.uptimeMillis
+                                            } else remoteRefused = true
+                                        }
+                                        olderEdgeDrag = 0f
+                                        requestHistory = false
+                                    } else if (remainder > 0f && currentHistoryRequest != null) {
+                                        // Full-screen programs often expose no local scrollback.
+                                        // Read the host's bounded history instead of sending wheel
+                                        // reports or keys into the program under the user's finger.
+                                        olderEdgeDrag += remainder
+                                        if (olderEdgeDrag > viewConfiguration.touchSlop * 4) requestHistory = true
+                                    } else if (remainder < 0f) {
+                                        olderEdgeDrag = 0f
+                                    }
+                                } else {
+                                    pan = clampTerminalPan(pan.copy(x = pan.x + movement.x), currentGrid, currentViewport)
+                                }
                                 change.consume()
                             }
                         } else if (pinching) {
@@ -211,6 +302,7 @@ internal fun TerminalSurface(
                             change.consume()
                         }
                     }
+                    if (requestHistory && !pinching && !usedRemoteScroll) currentHistoryRequest?.invoke()
                     if (outsideGrid && !panning && !pinching && currentEnabled &&
                         releasedAt - down.uptimeMillis < viewConfiguration.longPressTimeoutMillis) {
                         currentKeyboardRequest()
@@ -226,7 +318,7 @@ internal fun TerminalSurface(
                 .offset { IntOffset(pan.x.roundToInt(), pan.y.roundToInt()) }
                 .size(with(density) { grid.width.toDp() }, with(density) { grid.height.toDp() }),
         ) {
-            Terminal(
+            TerminalWithAccessibility(
                 terminalEmulator = emulator,
                 modifier = Modifier.fillMaxSize(),
                 forcedSize = rows to cols,
@@ -249,11 +341,26 @@ internal fun TerminalSurface(
                     selectionController = it
                     onSelectionControllerAvailable(it)
                 },
+                onScrollControllerAvailable = {
+                    scrollController = it
+                    onScrollControllerAvailable(it)
+                },
                 onPasteRequest = { if (currentEnabled) currentPasteRequest() },
                 onHyperlinkClick = { url ->
                     if (url.startsWith("https://") || url.startsWith("http://")) runCatching { uriHandler.openUri(url) }
                 },
             )
+        }
+        if (scrollbackPosition > 0 || pan.y > -(grid.height - viewport.height).coerceAtLeast(0).toFloat() + 2f) {
+            TextButton(
+                onClick = {
+                    scrollController?.scrollToBottom()
+                    pan = Offset(0f, -(grid.height - viewport.height).coerceAtLeast(0).toFloat())
+                    selectionController?.clearSelection()
+                },
+                modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp)
+                    .background(background.copy(alpha = 0.95f), RoundedCornerShape(12.dp)).testTag("terminal-follow-live"),
+            ) { Text("↓ Live", color = foreground) }
         }
         key(emulator, inputSessionKey) {
             AndroidView(
