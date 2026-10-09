@@ -323,6 +323,38 @@ def test_missing_tailscale_fails_before_installing_services(monkeypatch):
         setup.tailscale_state()
 
 
+@pytest.mark.parametrize("hostname", ["current-host.example", "host\nsecret-host-detail", "host\x1b[31m"])
+def test_unreachable_tailscale_explains_machine_local_service_without_raw_details(monkeypatch, hostname):
+    monkeypatch.setattr(setup.shutil, "which", lambda _: "/installed/tailscale")
+    monkeypatch.setattr(setup.socket, "gethostname", lambda: hostname)
+    calls = []
+
+    def failed_status(args):
+        calls.append(args)
+        raise setup.SetupError("private subprocess detail: https://private.example/?token=secret")
+
+    monkeypatch.setattr(setup, "run", failed_status)
+    with pytest.raises(setup.SetupError) as failure:
+        setup.tailscale_state()
+    message = str(failure.value)
+    assert "Run 'tailscale status' on this computer" in message
+    assert "A shared home directory shares files, not a running Tailscale service" in message
+    assert "Start and connect Tailscale on this computer before running setup" in message
+    assert "private" not in message and "secret" not in message
+    assert "\n" not in message and "\x1b" not in message
+    assert f"on {hostname}." in message if hostname == "current-host.example" else "on this computer." in message
+    assert failure.value.__suppress_context__ is True
+    assert calls == [["/installed/tailscale", "status", "--json"]]
+
+
+def test_reachable_tailscale_still_requires_user_to_connect(monkeypatch):
+    monkeypatch.setattr(setup.shutil, "which", lambda _: "/installed/tailscale")
+    monkeypatch.setattr(setup, "run", lambda _: SimpleNamespace(stdout=json.dumps(
+        {"BackendState": "NeedsLogin", "Self": {"Online": False, "DNSName": "test.example.ts.net."}})))
+    with pytest.raises(setup.SetupError, match="Connect Tailscale on this computer before running setup"):
+        setup.tailscale_state()
+
+
 @pytest.fixture
 def local_health_listener():
     """An owned HTTP listener representing an old daemon on the preserved port."""

@@ -242,7 +242,16 @@ def tailscale_state() -> tuple[str, str]:
     if not executable:
         raise SetupError("Install and connect Tailscale on this computer and your phone first: https://tailscale.com/download")
     try:
-        status = json.loads(run([executable, "status", "--json"]).stdout)
+        result = run([executable, "status", "--json"])
+    except SetupError:
+        hostname = socket.gethostname()
+        computer = hostname if HOST_NAME.fullmatch(hostname) else "this computer"
+        raise SetupError(f"Tailscale is installed, but its local service could not be reached on {computer}. "
+                         "Run 'tailscale status' on this computer to check the service and socket. "
+                         "A shared home directory shares files, not a running Tailscale service. "
+                         "Start and connect Tailscale on this computer before running setup.") from None
+    try:
+        status = json.loads(result.stdout)
         own = status["Self"]
         dns_name = own["DNSName"].rstrip(".")
         if status.get("BackendState") != "Running" or not own.get("Online") or not dns_name.endswith(".ts.net"):
