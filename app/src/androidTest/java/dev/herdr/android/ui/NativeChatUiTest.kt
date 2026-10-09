@@ -18,6 +18,7 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
@@ -112,7 +113,8 @@ class NativeChatUiTest {
         val expected = "def example():\n    return 42"
         compose.waitUntil(5_000) { clipboard.primaryClip?.getItemAt(0)?.text?.toString()?.contains(expected) == true }
         compose.runOnIdle { assertTrue(clipboard.primaryClip?.getItemAt(0)?.text?.toString()?.contains(expected) == true) }
-        compose.onNodeWithText("Passed").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("chat-messages").performScrollToNode(hasText("Passed", substring = true))
+        compose.onNodeWithText("Passed", substring = true).performScrollTo().assertIsDisplayed()
     }
 
     @Test

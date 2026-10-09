@@ -1,39 +1,42 @@
-# Preview 0.2.0 validation
+# Preview 0.3.0 validation
 
-Validated on 2026-10-09 against the installed, unmodified **Herdr 0.9.3**. Live tests created UUID-named Herdr sessions and temporary shell directories. No commands were sent to existing user panes.
+Validated on 2026-10-09 against installed, unmodified **Herdr 0.9.3** and **Codex 0.162.0**. Live Herdr tests create UUID-named sessions and temporary workspaces. Codex checks use temporary provider homes with synthetic conversations. No input was sent to existing user panes, and no user conversations or model calls were needed.
 
 ## Environment
 
-- Native Android: Kotlin 2.4.20, Jetpack Compose, ConnectBot Terminal 0.3.11/libvterm, CameraX 1.6.2, ZXing Core 3.5.4.
-- Build: JDK 17, Gradle 9.6.0, Android Gradle Plugin 9.4.0, Android SDK 37.0; minimum API 26, target API 37.
+- Native Android: Kotlin 2.4.20, Jetpack Compose, ConnectBot Terminal 0.3.11/libvterm, CameraX 1.6.2, ZXing Core 3.5.4, multiplatform Markdown renderer 0.41.0.
+- Build: JDK 17, Gradle 9.6.0, Android Gradle Plugin 9.4.0, Android SDK 37.0 and build tools 36.0.0; minimum API 26, target API 37.
 - Device: Pixel 7 emulator, Android 16/API 36, x86_64, hardware virtualization.
-- Host: Linux x86_64, glibc 2.34, Python 3.11.17; packaged runtime built with PyInstaller 6.22.3. Normal packaged installation requires no separate Python runtime.
+- Host: Linux x86_64, glibc 2.34, packaged Python 3.11.17 and PyInstaller 6.22.3. Packaged installation requires no separate Python runtime.
 
 ## Results
 
 | Check | Result | Coverage |
 | --- | --- | --- |
-| Android JVM suite | 37 passed | Strict QR parsing, redacted diagnostics, pairing authentication, no redirect/replay, cancellation, terminal frames, input limits, and permissions |
-| Android lint | Zero errors, 14 warnings | API compatibility, manifest/resources, Kotlin/Compose; dependency/style warnings and intentional private-network HTTP support |
-| Bridge offline suite | 133 passed | Pairing expiration, concurrent one-use exchanges, durable hashed credentials, revocation, body limits, socket routing, setup/service generation, Tailscale endpoint preservation, frozen external-command environments, terminal cleanup |
-| Live bridge integration | 1 passed | Stock Herdr snapshots, workspace creation, atomic input, logical keys, and read-only ANSI observation |
-| Android device suite with live fixture | 15 passed | Native JNI/libvterm, explicit terminal controls, Keystore persistence, pairing UI review/cancellation/denial, host-generated QR decoding, real pairing and command delivery |
-| Frozen Linux package smoke | Passed | Self-contained authenticated HTTP server, phone pairing, one-use rejection, snapshot access, device revocation, packaged QR CLI helpers, private credential files, bundled licenses |
-| Installer extraction | Passed | Embedded binary checksum and execution of the extracted packaged CLI |
-| Linux installer and systemd service | Passed | Installed binary/link, real enabled and active user service, stock Herdr health/snapshots, packaged terminal WebSocket, device revocation closing the stream with 1008 |
+| Android JVM suite | 67 passed | Pairing/authentication, input limits, strict conversation decoding, stable IDs, pagination/rollback, stale binding rejection, scoped drafts, canceled-send uncertainty, acknowledgment, safe links |
+| Android lint | Zero errors, 16 warnings | API compatibility, manifest/resources, Kotlin/Compose; dependency/style warnings and intentional private-network HTTP support |
+| Bridge offline suite | 195 passed | Existing pairing/terminal behavior plus Codex attribution, RPC allowlist, history normalization, bounded cache/reads, paging, rollback epochs, ready-state checks, single prompt dispatch, uncertainty, config discovery and upgrade preservation |
+| Real Codex reader | 2 passed | Legacy and indexed Paginated histories, commentary/final messages, external updates, stable IDs, repeated text, rollback, multiline prompt routing, unchanged provider configuration |
+| Live stock Herdr integration | 1 passed | Isolated snapshots, workspace creation, atomic input, logical keys, read-only ANSI observation |
+| Android device cases | 23 passed across full and focused runs | Native JNI/libvterm, Keystore, pairing/QR/live command delivery, chat default routing, Markdown/code clipboard/tables, safe links, blocked/error/send states, earlier-page anchors, draft retention, terminal/back navigation, activity recreation, foreground polling |
+| Frozen package smoke | Passed on all three hosts | Authenticated API, clean Codex conversation, frozen child-process environment, single-use pairing, revocation, QR CLI helpers, bundled licenses |
+| Installer extraction | Passed | Embedded checksum and execution of the extracted companion |
+| Linux installer and systemd service | Passed | Actual enabled/active user service, installed binary/link, live stock Herdr health/snapshot/ANSI stream, revocation closing the observer with 1008, removal of owned service/files |
 
-The 186 automated tests above passed. Optional live cases are skipped in ordinary runs without their fixture arguments. The packaged smoke is an additional end-to-end check against an isolated mock Unix daemon and does not require installed Herdr or Tailscale.
+The 288 distinct automated cases above passed. Optional live cases are skipped without their fixture arguments. Frozen-package and real installer/service checks are additional end-to-end checks.
 
-The real Android pairing test reviews and confirms a one-use invitation, stores its device credential through Keystore, opens a live Herdr pane, and sends `printf 'PHONE_QR_PAIRING_E2E_OK\n'`. A separate read-only observer confirmed that marker in the isolated pane's output. Another device test decodes a Segno-generated host PNG using the same ZXing decoder as the CameraX scanner. The legacy manual-profile connection also passed. Tests remove their own saved profiles afterward.
+The Codex checks launch the actual installed `codex app-server` in disposable homes. Legacy history uses synthetic saved events; Paginated history also has a source-compatible projection database, as required by Codex's saved-history reader. Only initialization and `thread/read` are sent to the provider. These checks do not start or resume a model conversation. A mock Herdr socket records the literal multiline prompt once; the separate stock Herdr test covers the real public input/observer APIs.
 
-The self-extracting installer was also run against that isolated Herdr session with a real systemd user service manager. Its installed executable served authenticated requests and native Herdr ANSI frames after the installer exited. The test revoked a paired device and verified HTTP rejection and active-stream closure. Only Tailscale and lingering CLI commands were simulated; no real tailnet settings were changed. Cleanup disabled and removed only the temporary companion unit and its files.
+The phone tests include a real one-use pairing exchange with the isolated host bridge, host-generated QR decoding, and explicit shell command delivery. Native chat navigation uses a disposable loopback HTTP/WebSocket server with synthetic messages. It verifies that opening an identified Codex pane shows Chat, Terminal and backgrounding stop chat polling, Back restores Chat, and drafts survive navigation and activity recreation. A focused Markdown test additionally verifies native code copying and scrolling to a table cell.
 
-[Pairing review](screenshots/pairing.png) · [Workspace dashboard](screenshots/dashboard.png) · [Native terminal](screenshots/terminal.png)
+The self-extracting Linux installer runs against its own Herdr session with an actual systemd user service manager. Only Tailscale and lingering CLI commands are simulated; no real tailnet settings change. Its binary serves authenticated requests after setup exits. Revocation rejects the paired phone and closes its active observer. Cleanup removes only the temporary unit, install directory, credentials, and source fixture, restoring prior directory permissions.
 
-The updated APK is **33,423,065 bytes**, uses the same signing certificate as preview 0.1.0, and can update that installation. APK signature verification and 16 KiB ZIP alignment checks passed; all eight packaged 64-bit native libraries have 16 KiB-aligned ELF load segments. APK SHA-256:
+[Native Codex chat](screenshots/chat.png) · [Pairing review](screenshots/pairing.png) · [Workspace dashboard](screenshots/dashboard.png) · [Native terminal](screenshots/terminal.png)
+
+The APK is **34,287,184 bytes**, has version code **3**, and uses the same signing certificate as previews 0.1.0 and 0.2.0. It can update those installations without removing profiles. Signature verification and 16 KiB ZIP alignment passed; all eight 64-bit native libraries have 16 KiB-aligned ELF load segments. APK SHA-256:
 
 ```text
-495fdd294898254ef4ee425d5e5067093735ae1671ae4ba55987b4a0d33eb78e
+33ebdde0e764b35235f8c4914f5846b262df3c9b3b048d5905ad790a2bf48ef6
 ```
 
 ## Repeat the checks
@@ -44,16 +47,19 @@ From the repository root, with the Android SDK configured:
 ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleDebugAndroidTest
 bridge/.venv/bin/python -m pytest bridge/tests -q
 HERDR_INTEGRATION=1 bridge/.venv/bin/python -m pytest bridge/tests/test_live_herdr.py -q
+CODEX_INTEGRATION=1 bridge/.venv/bin/python -m pytest bridge/tests/test_live_codex_chat.py -q
 bridge/.venv/bin/python scripts/build_host.py
 bridge/.venv/bin/python scripts/smoke_host_package.py artifacts/host/herdr-pocket-linux-x86_64
 ```
 
-For all device tests, follow the [isolated fixture instructions](../bridge/README.md#live-android-device-fixture), omitting the `class` filter. Build first, then start the fixture immediately before testing because its invitation expires after five minutes. Stop the fixture and remove its `adb reverse` mapping afterward.
+For device checks, follow the [isolated fixture instructions](../bridge/README.md#live-android-device-fixture), omitting the `class` filter. Build first and start the fixture immediately before testing because its invitation expires after five minutes. Stop it and remove its `adb reverse` mapping afterward. The optional Codex check requires an installed Codex 0.162.0 executable and uses only temporary histories.
 
-GitHub Actions checks Android JVM/lint/APK and the offline bridge suite. The separate host packaging workflow builds and exercises self-contained companions on Linux x86_64, macOS Apple Silicon, and macOS Intel. [Android/bridge checks](https://github.com/nabil-2/herdr-android/actions/runs/37857944286) and [all three host package checks](https://github.com/nabil-2/herdr-android/actions/runs/37858901369) passed. The delivered Linux package was built with a portable Python 3.11.17 distribution and passed the real installer/service check on glibc 2.34; the Mac packages were downloaded from the successful CI run.
+[Android/bridge CI checks](https://github.com/nabil-2/herdr-android/actions/runs/37889298916) and [all three host package checks](https://github.com/nabil-2/herdr-android/actions/runs/37889298944) passed. Delivered Mac assets come from that successful packaging run. The delivered Linux assets were built and installer-tested locally on glibc 2.34 using the same source and portable runtime. Release `SHA256SUMS` covers the APK, all companion binaries/installers, and platform license bundles.
 
 ## Scope of validation
 
-The live Android connection used `adb reverse` to a real loopback bridge. A physical phone over a real Tailscale network, physical camera scanning, and macOS LaunchAgent/login behavior remain untested. QR image decoding and permission/onboarding logic were tested separately. Tailscale configuration behavior is covered with simulated CLI responses; tests never modify the user's real Serve/Funnel endpoints. The Android 17 local-network permission flow has JVM grant/denial tests; device checks used Android 16. Android 8 compatibility was checked by lint and compilation.
+Chat currently supports confirmed Codex identities reported by Herdr. Missing integration metadata, other providers, old bridges, and unavailable history keep an explicit Terminal action. Saved messages refresh while Chat is visible; token streaming and inline approvals are outside this preview. Sends use Herdr's public `agent.prompt` with binding preflight. Herdr 0.9.3 does not offer an atomic expected-thread condition, so a simultaneous desktop session change can produce a warning; uncertain submissions require checking the conversation before resending. Drafts are bounded and memory-only, and process death or eviction loses them. See [the protocol](protocol.md#native-saved-codex-conversation) for exact bounds and behavior.
 
-The preview APK is debug-signed for sideloading. It includes native libraries for arm64-v8a, armeabi-v7a, x86 and x86_64. Herdr itself is not bundled; it must remain running independently on the host. The host executable includes its Python runtime and license texts. Background notifications, remote scrollback, and direct SSH are outside the implemented preview.
+Device networking used loopback and `adb reverse`. A physical phone over a real Tailscale network, physical camera scanning, and macOS LaunchAgent/login behavior remain untested. QR decoding and permission/onboarding behavior have separate coverage. Android 17 local-network permission logic has JVM grant/denial checks; device tests used Android 16. Android 8 compatibility was checked through compilation and lint.
+
+The APK is debug-signed for sideloading and contains arm64-v8a, armeabi-v7a, x86, and x86_64 native libraries. Herdr remains independently installed and running on the host; Codex chat uses the existing host installation and agent pane. Background notifications, terminal scrollback, and direct SSH are outside this preview.
