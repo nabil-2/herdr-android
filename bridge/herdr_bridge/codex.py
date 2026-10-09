@@ -54,6 +54,12 @@ def normalize_thread(result: dict, thread_id: str) -> tuple[list[dict], str | No
         for turn in thread["turns"]:
             if not isinstance(turn, dict) or not isinstance(turn.get("id"), str) or not 1 <= len(turn["id"]) <= 1024 or not isinstance(turn.get("items"), list):
                 raise ValueError()
+            # App-server supplies turn times, not exact item times. Keep their
+            # provenance and never substitute the clock or the thread creation time.
+            started = turn.get("startedAt")
+            completed = turn.get("completedAt")
+            started = started if type(started) is int and 0 <= started <= 253402300799 else None
+            completed = completed if type(completed) is int and 0 <= completed <= 253402300799 else None
             for item in turn["items"]:
                 if not isinstance(item, dict):
                     raise ValueError()
@@ -93,7 +99,11 @@ def normalize_thread(result: dict, thread_id: str) -> tuple[list[dict], str | No
                 if not text:
                     continue
                 message_id = opaque(hashlib.sha256(json.dumps(identity).encode()).digest())
-                messages.append({"id": message_id, "role": "user" if kind == "userMessage" else "assistant", "text": text, "phase": phase})
+                message = {"id": message_id, "role": "user" if kind == "userMessage" else "assistant", "text": text, "phase": phase}
+                timestamp = completed if phase == "final_answer" and completed is not None else started
+                if timestamp is not None:
+                    message.update(timestamp=timestamp, timestampSource="turn_end" if phase == "final_answer" and completed is not None else "turn_start")
+                messages.append(message)
         return messages, "Some messages were truncated; use Terminal for complete output" if truncated else None
     except (KeyError, TypeError, ValueError, UnicodeError) as exc:
         raise BridgeError(503, "Codex returned incompatible saved history; use Terminal") from exc
@@ -243,7 +253,31 @@ class Conversations:
 
     @staticmethod
     def ready(agent: dict) -> bool:
-        return agent.get("agent_status") in ("idle", "done") and agent.get("interactive_ready") is True and agent.get("launch_pending", False) is False
+        return Conversations.send_unavailable_reason(agent) is None
+
+    @staticmethod
+    def send_unavailable_reason(agent: dict) -> str | None:
+        status = agent.get("agent_status")
+        if status == "working":
+            return "Codex is working. Wait for it to finish before sending another message."
+        if status == "blocked":
+            return "Codex needs your attention. Open Terminal to answer a question or approve an action."
+        if status not in ("idle", "done"):
+            return "Codex has not reported that it is ready for a message. Check Terminal."
+        pending = agent.get("launch_pending", False)
+        if pending is True:
+            return "Codex is starting. Wait for its prompt to become ready."
+        if pending is not False:
+            return "The server returned invalid Codex readiness information. Check Terminal."
+        if agent.get("interactive_ready") is True:
+            return None
+        # Herdr 0.9.3 reports interactive_ready only for managed agent.start launches.
+        # Manually launched Codex panes omit this false-valued managed-only field.
+        # Their canonical conversation and idle/done status were verified by target();
+        # agent.prompt still checks the live foreground agent before accepting input.
+        if "interactive_ready" not in agent and agent.get("name") is None:
+            return None
+        return "Codex has not reported interactive readiness. Check Terminal before sending."
 
     def _cursor(self, binding: str, revision: str, end: int) -> str:
         payload = json.dumps([binding, revision, end], separators=(",", ":")).encode()
@@ -312,10 +346,12 @@ class Conversations:
             end = self._end(cursor, binding, cache.revision, len(cache.messages)) if cursor else len(cache.messages)
             start = max(0, end - PAGE_SIZE)
             unchanged = not cursor and revision == cache.revision
+            send_unavailable_reason = self.send_unavailable_reason(agent)
             response = {"binding": binding, "revision": cache.revision, "historyEpoch": cache.history_epoch,
                         "messages": cache.messages[start:end],
                         "olderCursor": self._cursor(binding, cache.revision, start) if start else None,
-                        "unchanged": unchanged, "canSend": self.ready(agent),
+                        "unchanged": unchanged, "canSend": send_unavailable_reason is None,
+                        "canSendReason": send_unavailable_reason,
                         "status": agent.get("agent_status") if agent.get("agent_status") in ("idle", "working", "blocked", "done", "unknown") else "unknown",
                         "warning": cache.warning}
             # JSON escaping can expand controls. Shrink the page, never truncate JSON.
@@ -339,8 +375,9 @@ class Conversations:
             cache = self.caches.get(binding)
             if cache is None or cache.error is not None:
                 raise BridgeError(409, "Read the saved conversation successfully before sending")
-            if not self.ready(agent):
-                raise BridgeError(409, "Codex is busy, blocked or starting; use Terminal for interactive input")
+            send_unavailable_reason = self.send_unavailable_reason(agent)
+            if send_unavailable_reason is not None:
+                raise BridgeError(409, send_unavailable_reason)
             await self.client.prompt(pane_id, text)
             warning = None
             try:

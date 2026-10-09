@@ -366,7 +366,9 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         val currentClient = client ?: return
         if (!ensureNetworkPermission()) return
         if (!foreground || !paneVisible || current.paneMode != PaneMode.CHAT ||
-            current.connection != ConnectionState.CONNECTED || current.chat.sending || current.chat.deliveryUncertain || !current.chat.canSend
+            current.connection != ConnectionState.CONNECTED || current.chat.loading || current.chat.sending ||
+            current.chat.deliveryUncertain || current.chat.error != null || !current.chat.canSend ||
+            current.chat.status !in setOf("idle", "done")
         ) return
         val text = current.chat.draft
         if (text.isBlank()) return
@@ -397,7 +399,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
             } catch (error: Exception) {
                 if (chatTargetMatches(currentGeneration, paneId, binding) && chatWriteSequence == writeSequence) mutableState.update {
                     val uncertain = error !is BridgeException || error.statusCode !in listOf(400, 401, 403, 404, 409, 413, 422)
-                    it.copy(chat = it.chat.copy(canSend = false, deliveryUncertain = uncertain,
+                    it.copy(chat = it.chat.copy(canSend = false, canSendReason = readableError(error), deliveryUncertain = uncertain,
                         error = "${readableError(error)} Message was not retried${if (uncertain) "; check the conversation before sending again" else ""}."))
                 }
             } finally {
@@ -737,7 +739,8 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         val session = ++chatSession
         mutableState.update {
             it.copy(chat = it.chat.copy(loading = false, refreshing = false, loadingOlder = false,
-                revision = if (resetRevision) null else it.chat.revision, canSend = false))
+                revision = if (resetRevision) null else it.chat.revision, canSend = false,
+                canSendReason = "Checking whether Codex is ready to receive a message."))
         }
         val current = state.value
         val paneId = current.paneId ?: return
@@ -749,7 +752,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
                 pane.conversation?.provider != "codex" -> "Native chat is available for confirmed Codex conversations. Use Terminal for this pane."
                 else -> pane.conversation.reason ?: "This Codex conversation is unavailable. Use Terminal to inspect it."
             }
-            mutableState.update { it.copy(chat = it.chat.copy(error = reason, canSend = false)) }
+            mutableState.update { it.copy(chat = it.chat.copy(error = reason, canSend = false, canSendReason = reason)) }
             return
         }
         val currentClient = client ?: return
@@ -786,6 +789,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
                 catch (error: Exception) {
                     if (chatSession != session || generation != currentGeneration || state.value.paneId != paneId) return@launch
                     mutableState.update { it.copy(chat = it.chat.copy(loading = false, refreshing = false, canSend = false,
+                        canSendReason = readableError(error),
                         error = if (it.chat.deliveryUncertain) it.chat.error else readableError(error))) }
                     if (error is BridgeException && error.statusCode in listOf(401, 403, 404)) return@launch
                     failures++

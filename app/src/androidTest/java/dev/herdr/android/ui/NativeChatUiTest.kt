@@ -17,6 +17,10 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -28,6 +32,7 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.sp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.herdr.android.data.ChatContent
 import dev.herdr.android.data.ChatMessage
@@ -39,6 +44,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.time.LocalDate
+import java.time.ZoneId
+import java.util.Date
 
 @RunWith(AndroidJUnit4::class)
 class NativeChatUiTest {
@@ -88,6 +96,22 @@ class NativeChatUiTest {
     }
 
     @Test
+    fun workingStateUsesAQuietCaptionAndDisabledSendExplainsItsReason() {
+        var chat by mutableStateOf(ChatContent(bindingId = "binding", canSend = false, status = "working", draft = "Follow up"))
+        compose.setContent {
+            HerdrTheme {
+                ChatScreen(HerdrUiState(connection = ConnectionState.CONNECTED, chat = chat), {}, {}, {}, {}, {}, {}, {})
+            }
+        }
+        compose.onNodeWithTag("chat-working").assertTextEquals("Working…")
+        compose.onNodeWithTag("send-chat").assertIsNotEnabled()
+        compose.runOnIdle { chat = chat.copy(status = "idle", canSendReason = "Open the terminal to resume this session.") }
+        compose.onNodeWithTag("chat-working").assertDoesNotExist()
+        compose.onNodeWithTag("chat-send-reason").assertTextEquals("Open the terminal to resume this session.")
+        compose.onNodeWithTag("chat-draft").assertIsEnabled()
+    }
+
+    @Test
     fun transcriptContainsOnlyMessagesAndUserTextStaysLiteral() {
         val chat = ChatContent(bindingId = "binding", messages = listOf(
             ChatMessage("user", "user", "**Literal input**"),
@@ -115,6 +139,41 @@ class NativeChatUiTest {
         compose.runOnIdle { assertTrue(clipboard.primaryClip?.getItemAt(0)?.text?.toString()?.contains(expected) == true) }
         compose.onNodeWithTag("chat-messages").performScrollToNode(hasText("Passed", substring = true))
         compose.onNodeWithText("Passed", substring = true).performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun realDatesAndTimesAreGroupedAndMissingTimestampsStayUnknown() {
+        val zone = ZoneId.systemDefault()
+        val earlier = LocalDate.of(2024, 6, 12)
+        val later = earlier.plusDays(1)
+        val first = earlier.atTime(10, 3).atZone(zone).toEpochSecond()
+        val second = later.atTime(14, 8).atZone(zone).toEpochSecond()
+        val chat = ChatContent(bindingId = "dated", messages = listOf(
+            ChatMessage("first", "user", "Yesterday's request", timestamp = first),
+            ChatMessage("second", "assistant", "Today's answer", timestamp = second, timestampSource = "turn_end"),
+            ChatMessage("third", "user", "A follow-up", timestamp = second + 60),
+            ChatMessage("undated", "user", "A legacy message"),
+        ))
+        compose.setContent { HerdrTheme { ConversationMessages(chat, {}, Modifier.fillMaxSize()) } }
+        compose.onNodeWithTag("chat-messages").performScrollToNode(hasTestTag("chat-date-$earlier"))
+        compose.onNodeWithTag("chat-date-$earlier").assertIsDisplayed()
+        compose.onNodeWithTag("chat-messages").performScrollToNode(hasTestTag("chat-date-$later"))
+        compose.onNodeWithTag("chat-date-$later").assertIsDisplayed()
+        compose.onNodeWithTag("chat-time-second").assertTextEquals("Turn finished " + android.text.format.DateFormat.getTimeFormat(compose.activity).format(Date(second * 1000)))
+        compose.onNodeWithTag("chat-time-undated").assertDoesNotExist()
+    }
+
+    @Test
+    fun markdownHeadingsUseReadableChatSizingAndMessagesHaveAccessibleCopyActions() {
+        val message = ChatMessage("compact", "assistant", "# Clear answer\n\nA short explanation.")
+        compose.setContent { HerdrTheme { ChatMessageCard(message) } }
+        compose.waitUntil(5_000) { compose.onAllNodesWithText("Clear answer").fetchSemanticsNodes().isNotEmpty() }
+        val results = mutableListOf<TextLayoutResult>()
+        compose.onNodeWithText("Clear answer").performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(results) }
+        compose.runOnIdle { assertEquals(20.sp, results.single().layoutInput.style.fontSize) }
+        compose.onNodeWithContentDescription("Copy Codex message").assertIsDisplayed().performClick()
+        val clipboard = compose.activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        compose.waitUntil(5_000) { clipboard.primaryClip?.getItemAt(0)?.text?.toString() == message.text }
     }
 
     @Test

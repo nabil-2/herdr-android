@@ -10,6 +10,35 @@ import java.io.IOException
 class ConversationProtocolTest {
     private val page = """{"binding":"binding-1","revision":"revision-1","historyEpoch":"epoch-1","messages":[{"id":"m1","role":"assistant","text":"Hello","phase":"final_answer"}],"olderCursor":"older-1","unchanged":false,"canSend":true,"status":"idle","warning":null}"""
 
+    @Test fun `turn timestamps and readiness explanation remain optional and validated`() {
+        val timed = page.replace("\"phase\":\"final_answer\"", "\"phase\":\"final_answer\",\"timestamp\":1791540060,\"timestampSource\":\"turn_end\"")
+        val message = ConversationProtocol.decode(timed).messages.single()
+        assertEquals(1791540060L, message.timestamp)
+        assertEquals("turn_end", message.timestampSource)
+        assertNull(ConversationProtocol.decode(page).messages.single().timestamp)
+        val waiting = page.replace("\"canSend\":true", "\"canSend\":false,\"canSendReason\":\"Waiting for the agent.\"")
+        assertEquals("Waiting for the agent.", ChatState.latest(ChatContent(), ConversationProtocol.decode(waiting)).canSendReason)
+        listOf(
+            timed.replace("1791540060", "\"1791540060\""),
+            timed.replace("1791540060", "1791540060.5"),
+            timed.replace("1791540060", "1791540060000"),
+            timed.replace("1791540060", "-1"),
+            timed.replace("1791540060", "null"),
+            timed.replace("turn_end", "exact_message"),
+        ).forEach { invalid -> assertThrows(IOException::class.java) { ConversationProtocol.decode(invalid) } }
+    }
+
+    @Test fun `delayed older history cannot overwrite newer agent readiness`() {
+        val oldReadyPage = ConversationProtocol.decode(page)
+        val current = ChatState.latest(ChatContent(), oldReadyPage).copy(
+            canSend = false, status = "working", canSendReason = "Codex is working.",
+        )
+        val merged = ChatState.older(current, oldReadyPage)
+        assertFalse(merged.canSend)
+        assertEquals("working", merged.status)
+        assertEquals("Codex is working.", merged.canSendReason)
+    }
+
     @Test fun `only confirmed structured user and assistant messages are displayed`() {
         val decoded = ConversationProtocol.decode(page)
         assertEquals("Hello", decoded.messages.single().text)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -25,9 +26,13 @@ from .conftest import AUTH, SNAPSHOT, TOKEN
 
 pytestmark = pytest.mark.skipif(os.environ.get("CODEX_INTEGRATION") != "1", reason="Opt-in isolated Codex reader test")
 STAMP = "2026-10-09T10:00:00Z"
+FIRST_START = 1791540000
+FIRST_END = FIRST_START + 12
+SECOND_START = FIRST_START + 300
+SECOND_END = SECOND_START + 24
 
 
-def history(home: Path, thread: str, mode: str) -> tuple[Path, list[dict]]:
+def history(home: Path, thread: str, mode: str, *, with_turn_times: bool = True) -> tuple[Path, list[dict]]:
     path = home / "sessions/2026/10/09" / f"rollout-2026-10-09T10-00-00-{thread}.jsonl"
     path.parent.mkdir(parents=True)
     lines = [{"timestamp": STAMP, "type": "session_meta", "payload": {
@@ -35,29 +40,42 @@ def history(home: Path, thread: str, mode: str) -> tuple[Path, list[dict]]:
         "originator": "codex", "cli_version": "0.162.0", "source": "cli", "model_provider": "openai",
         "base_instructions": None, "dynamic_tools": None, "history_mode": mode,
     }}]
-    append_turn(lines, thread, mode, "turn-1", "Hello from the phone", "**Ready.**", "final_answer")
+    append_turn(lines, thread, mode, "turn-1", "Hello from the phone", "**Ready.**", "final_answer",
+                with_turn_times=with_turn_times)
     write_history(path, lines, mode)
     return path, lines
 
 
-def append_turn(lines: list[dict], thread: str, mode: str, turn: str, user: str, reply: str, phase: str) -> None:
-    def event(payload):
-        lines.append({"timestamp": STAMP, "type": "event_msg", "payload": payload})
+def append_turn(lines: list[dict], thread: str, mode: str, turn: str, user: str, reply: str, phase: str, *,
+                started_at: int = FIRST_START, completed_at: int = FIRST_END, with_turn_times: bool = True) -> None:
+    def event(payload, timestamp: int):
+        stamp = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lines.append({"timestamp": stamp, "type": "event_msg", "payload": payload})
 
-    event({"type": "task_started", "turn_id": turn, "model_context_window": None})
+    # Codex exports the optional turn payload times, not the JSONL envelope or
+    # item-completion times. Untimed fixtures deliberately retain both of those.
+    start_fields = {"started_at": started_at} if with_turn_times else {}
+    end_fields = {"started_at": started_at, "completed_at": completed_at,
+                  "duration_ms": (completed_at - started_at) * 1000} if with_turn_times else {}
+    event({"type": "task_started", "turn_id": turn, "model_context_window": None} | start_fields, started_at)
     if mode == "legacy":
-        event({"type": "user_message", "message": user, "images": [], "local_images": []})
-        event({"type": "agent_message", "message": reply, "phase": phase})
+        event({"type": "user_message", "message": user, "images": [], "local_images": []}, started_at + 1)
+        event({"type": "agent_message", "message": reply, "phase": phase}, started_at + 7)
     else:
-        for item in [{"type": "UserMessage", "id": turn + "-user", "content": [{"type": "text", "text": user}]},
-                     {"type": "AgentMessage", "id": turn + "-agent", "content": [{"type": "Text", "text": reply}], "phase": phase}]:
-            event({"type": "item_completed", "thread_id": thread, "turn_id": turn, "item": item, "completed_at_ms": 1})
+        for index, item in enumerate([
+            {"type": "UserMessage", "id": turn + "-user", "content": [{"type": "text", "text": user}]},
+            {"type": "AgentMessage", "id": turn + "-agent", "content": [{"type": "Text", "text": reply}], "phase": phase},
+        ]):
+            item_completed_at = started_at + (1 if index == 0 else 7)
+            event({"type": "item_completed", "thread_id": thread, "turn_id": turn, "item": item,
+                   "started_at_ms": (item_completed_at - 1) * 1000,
+                   "completed_at_ms": item_completed_at * 1000}, item_completed_at)
     # Raw model context must not become a human conversation message.
     lines.append({"timestamp": STAMP, "type": "response_item", "payload": {
         "type": "message", "role": "user", "content": [{"type": "input_text", "text": "HIDDEN_AGENTS_CONTEXT"}],
     }})
-    event({"type": "agent_reasoning", "text": "HIDDEN_REASONING"})
-    event({"type": "task_complete", "turn_id": turn, "last_agent_message": reply})
+    event({"type": "agent_reasoning", "text": "HIDDEN_REASONING"}, started_at + 9)
+    event({"type": "task_complete", "turn_id": turn, "last_agent_message": reply} | end_fields, completed_at)
 
 
 def write_history(path: Path, lines: list[dict], mode: str) -> None:
@@ -85,17 +103,20 @@ def project_paginated(home: Path, thread: str, lines: list[dict]) -> None:
                 continue
             turn = payload.get("turn_id")
             if kind == "task_started":
-                db.execute("INSERT INTO thread_turns (thread_id,turn_id,rollout_ordinal,status) VALUES (?,?,?,?)",
-                           (thread, turn, ordinal, "completed"))
+                db.execute("INSERT INTO thread_turns (thread_id,turn_id,rollout_ordinal,status,started_at) VALUES (?,?,?,?,?)",
+                           (thread, turn, ordinal, "completed", payload.get("started_at")))
             elif kind == "item_completed":
                 item = payload["item"]
                 user = item["type"] == "UserMessage"
                 wire = ({"type": "userMessage", "id": item["id"], "content": item["content"]} if user else
                         {"type": "agentMessage", "id": item["id"], "text": item["content"][0]["text"], "phase": item.get("phase")})
                 db.execute("INSERT INTO thread_items (thread_id,turn_id,item_id,rollout_ordinal,created_at_ms,item_json,item_type,updated_at_ordinal) VALUES (?,?,?,?,?,?,?,?)",
-                           (thread, turn, item["id"], ordinal, 1, json.dumps(wire), wire["type"], ordinal))
+                           (thread, turn, item["id"], ordinal, payload["completed_at_ms"], json.dumps(wire), wire["type"], ordinal))
                 column = "first_user_item_id" if user else "final_agent_item_id"
                 db.execute(f"UPDATE thread_turns SET {column}=? WHERE thread_id=? AND turn_id=?", (item["id"], thread, turn))
+            elif kind == "task_complete":
+                db.execute("UPDATE thread_turns SET completed_at=?,duration_ms=? WHERE thread_id=? AND turn_id=?",
+                           (payload.get("completed_at"), payload.get("duration_ms"), thread, turn))
 
 
 @asynccontextmanager
@@ -133,13 +154,14 @@ async def mock_herdr(path: Path, thread: str):
 
 
 @pytest.mark.parametrize("mode", ["legacy", "paginated"])
-async def test_real_codex_reads_updates_without_resuming_and_excludes_model_context(tmp_path, mode):
+@pytest.mark.parametrize("with_turn_times", [True, False], ids=["official-turn-times", "untimed-history"])
+async def test_real_codex_reads_updates_without_resuming_and_excludes_model_context(tmp_path, mode, with_turn_times):
     executable = os.environ.get("CODEX_BIN") or shutil.which("codex")
     if executable is None:
         pytest.skip("Codex executable unavailable")
     home = tmp_path / "codex"
     thread = str(uuid.uuid4())
-    path, lines = history(home, thread, mode)
+    path, lines = history(home, thread, mode, with_turn_times=with_turn_times)
     original_config = home / "config.toml"
     original_config.write_text("check_for_update_on_startup = false\n[analytics]\nenabled = false\n")
     async with mock_herdr(tmp_path / "herdr.sock", thread) as (herdr, requests):
@@ -155,11 +177,16 @@ async def test_real_codex_reads_updates_without_resuming_and_excludes_model_cont
                 page = response.json()
                 assert [(m["role"], m["text"]) for m in page["messages"]] == [
                     ("user", "Hello from the phone"), ("assistant", "**Ready.**")]
+                first_times = [(FIRST_START, "turn_start"), (FIRST_END, "turn_end")] if with_turn_times else [(None, None)] * 2
+                assert [(m.get("timestamp"), m.get("timestampSource")) for m in page["messages"]] == first_times
+                if not with_turn_times:
+                    assert all("timestamp" not in m and "timestampSource" not in m for m in page["messages"])
                 assert "HIDDEN_" not in response.text
                 first_ids = [m["id"] for m in page["messages"]]
                 first_epoch = page.get("historyEpoch")
                 # Simulate a running CLI persisting a completed message externally.
-                append_turn(lines, thread, mode, "turn-2", "Hello from the phone", "Second reply", "commentary")
+                append_turn(lines, thread, mode, "turn-2", "Hello from the phone", "Second reply", "commentary",
+                            started_at=SECOND_START, completed_at=SECOND_END, with_turn_times=with_turn_times)
                 write_history(path, lines, mode)
                 if mode == "paginated":
                     project_paginated(home, thread, lines)
@@ -170,6 +197,8 @@ async def test_real_codex_reads_updates_without_resuming_and_excludes_model_cont
                 assert [m["text"] for m in updated["messages"]] == ["Hello from the phone", "**Ready.**", "Hello from the phone", "Second reply"]
                 assert [m["id"] for m in updated["messages"][:2]] == first_ids
                 assert len({m["id"] for m in updated["messages"]}) == 4
+                updated_times = first_times + ([(SECOND_START, "turn_start")] * 2 if with_turn_times else [(None, None)] * 2)
+                assert [(m.get("timestamp"), m.get("timestampSource")) for m in updated["messages"]] == updated_times
                 assert updated.get("historyEpoch") == first_epoch
                 assert "HIDDEN_" not in response.text
                 sent = await phone.post("/v1/panes/w1:p2/messages", json={"binding": updated["binding"], "text": "First line\nSecond line"})
@@ -189,6 +218,7 @@ async def test_real_codex_reads_updates_without_resuming_and_excludes_model_cont
                 rolled_back = await phone.get("/v1/panes/w1:p2/conversation")
                 assert rolled_back.status_code == 200, rolled_back.text
                 assert [m["id"] for m in rolled_back.json()["messages"]] == first_ids
+                assert [(m.get("timestamp"), m.get("timestampSource")) for m in rolled_back.json()["messages"]] == first_times
                 assert rolled_back.json()["historyEpoch"] != first_epoch
         assert original_config.read_text().startswith("check_for_update_on_startup = false")
     # No second transcript/thread was created by the read-only sidecar.

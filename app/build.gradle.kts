@@ -14,8 +14,8 @@ android {
         applicationId = "dev.herdr.android"
         minSdk = 26
         targetSdk = 37
-        versionCode = 5
-        versionName = "0.4.0"
+        versionCode = 6
+        versionName = "0.5.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -63,5 +63,6 @@ dependencies {
     androidTestImplementation(platform("androidx.compose:compose-bom:2026.09.00"))
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     androidTestImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    androidTestImplementation("com.squareup.okhttp3:okhttp-tls:4.12.0")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }

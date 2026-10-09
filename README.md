@@ -10,7 +10,7 @@ The app uses Kotlin, Jetpack Compose, and ConnectBot's native libvterm terminal 
 - Choose a QR screenshot from the phone's gallery. The system photo picker needs no camera or storage permission; images decode locally and are never uploaded.
 - Save multiple server profiles and switch between them.
 - Browse workspaces, tabs, agent states, and shell panes, with agents needing input grouped together. Find sessions across a server's workspaces by name, agent, or directory. Status refreshes while the app is in the foreground.
-- Open supported Codex panes in native chat: user messages and agent replies, selectable Markdown and code, older conversation history, and a multiline reply box. Commands, tool results, reasoning, and injected instructions stay out of the conversation.
+- Open supported Codex panes in native chat: user bubbles and readable agent replies, selectable Markdown and code, date dividers and saved turn times, older conversation history, and a multiline reply box. Commands, tool results, reasoning, and injected instructions stay out of the conversation.
 - Open the terminal from chat to inspect activity or answer an approval prompt. The desktop keeps control of the same agent session.
 - Use a live native terminal with direct phone or hardware keyboard input, persistent pinch zoom, viewport panning, text selection, font and color settings, and focus mode.
 - Use one-shot Ctrl/Alt modifiers, navigation and function keys, safe paste review, or an optional multiline command composer. Composer drafts and reused snippets wait for explicit Send; failed writes are never replayed automatically.
@@ -158,6 +158,12 @@ CODEX_INTEGRATION=1 bridge/.venv/bin/python -m pytest bridge/tests/test_live_cod
 The live integration test creates and cleans up an isolated named Herdr session. It does not send commands to an existing user pane. The [Android device fixture](bridge/README.md#live-android-device-fixture) exercises the app against a real companion and Herdr shell, including host-generated QR decoding and pairing. GitHub Actions builds the APK, runs JVM/lint and host checks, and packages the supported host installers.
 
 See [protocol](docs/protocol.md) for the app/service interface and [validation](docs/validation.md) for this preview's results. Physical camera scanning and macOS login-service behavior need testing on their respective hardware; emulator checks do not establish those results.
+
+## Chat layout
+
+The conversation uses compact author/time captions, right-aligned user bubbles, plain assistant text, restrained Markdown headings, and a fixed reply composer. Working appears as a quiet static caption. Disabled submission explains readiness; ordinary manually launched Codex sessions can reply when idle. Saved times are labeled as turn start/finish times, and unavailable history dates are omitted.
+
+Layout and behavior follow the [official Android JetChat example](https://github.com/android/compose-samples/blob/main/Jetchat/app/src/main/java/com/example/compose/jetchat/conversation/Conversation.kt), [Material typography guidance](https://m3.material.io/styles/typography/applying-type), and [Android accessibility defaults](https://developer.android.com/develop/ui/compose/accessibility/api-defaults). Copy, navigation, and Send retain accessible touch targets.
 
 ## Current limits
 

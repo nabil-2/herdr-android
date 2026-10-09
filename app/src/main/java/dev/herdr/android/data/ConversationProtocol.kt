@@ -5,6 +5,8 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.longOrNull
 import java.io.IOException
 
 /** Conversation pages are structured Codex records, never parsed terminal output. */
@@ -19,6 +21,12 @@ internal object ConversationProtocol {
                 val value = objectValue[field] as? JsonPrimitive
                 require(value != null && !value.isString && value.booleanOrNull != null)
             }
+            objectValue["messages"]?.jsonArray?.forEach { item ->
+                val timestamp = item.jsonObject["timestamp"]
+                if (timestamp != null && timestamp.toString() != "null") {
+                    require(timestamp is JsonPrimitive && !timestamp.isString && timestamp.longOrNull != null)
+                }
+            }
             val page = json.decodeFromString<ConversationPage>(body)
             validateOpaque(page.binding, 256)
             validateOpaque(page.revision, 256)
@@ -29,11 +37,15 @@ internal object ConversationProtocol {
             require(page.status in statuses)
             require(!page.canSend || page.status in setOf("idle", "done"))
             require(page.warning == null || page.warning.length <= 1000)
+            require(page.canSendReason == null || page.canSendReason.length <= 1000)
             page.messages.forEach { message ->
                 require(message.id.isNotBlank() && message.id.length <= 512 && message.id.none { it.code < 32 || it.code == 127 })
                 require(message.role in setOf("user", "assistant"))
                 require(message.phase == null || message.phase in setOf("commentary", "final_answer"))
                 require(message.text.length <= 256 * 1024)
+                require(message.timestamp == null || message.timestamp in 0..253402300799L)
+                require(message.timestampSource == null || message.timestampSource in setOf("turn_start", "turn_end"))
+                require(message.timestampSource == null || message.timestamp != null)
             }
             return page
         } catch (_: Exception) {
@@ -101,6 +113,7 @@ internal object ChatState {
             loading = false,
             refreshing = false,
             canSend = page.canSend,
+            canSendReason = page.canSendReason,
             status = page.status,
             warning = page.warning,
             error = if (initial.deliveryUncertain) initial.error else null,
@@ -126,6 +139,7 @@ internal object ChatState {
             draft = if (current.draft == submitted) "" else current.draft,
             sending = false,
             canSend = false, // The next authoritative read confirms readiness again.
+            canSendReason = "Waiting for the agent to receive your message.",
             ackRevision = current.ackRevision + 1,
             warning = warning ?: current.warning,
             error = null,

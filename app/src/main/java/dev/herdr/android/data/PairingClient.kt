@@ -18,15 +18,17 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /** Exchanges a one-use invitation for a device credential, without owner auth. */
-internal class PairingClient {
-    private val http = OkHttpClient.Builder()
+internal class PairingClient(
+    private val http: OkHttpClient = OkHttpClient.Builder()
         .retryOnConnectionFailure(false)
         .followRedirects(false)
         .followSslRedirects(false)
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .callTimeout(25, TimeUnit.SECONDS)
-        .build()
+        .build(),
+) {
+    private val lifecycle = HttpClientLifecycle(http)
 
     suspend fun pair(invitation: PairingInvitation, deviceName: String): PairingResult {
         try {
@@ -50,17 +52,20 @@ internal class PairingClient {
     }
 
     fun close() {
-        http.dispatcher.cancelAll()
-        http.connectionPool.evictAll()
+        lifecycle.close()
     }
 
     private suspend fun Call.awaitResponse(): String = suspendCancellableCoroutine { continuation ->
-        continuation.invokeOnCancellation { cancel() }
-        enqueue(object : Callback {
+        continuation.invokeOnCancellation { NetworkCleanup.cancel(this) }
+        val callback = object : Callback {
             override fun onFailure(call: Call, error: IOException) {
-                if (continuation.isActive) continuation.resumeWithException(
-                    PairingException("Could not reach the pairing server. Check Tailscale and generate a new code before trying again."),
-                )
+                try {
+                    if (continuation.isActive) continuation.resumeWithException(
+                        PairingException("Could not reach the pairing server. Check Tailscale and generate a new code before trying again."),
+                    )
+                } finally {
+                    lifecycle.finishedCall()
+                }
             }
 
             override fun onResponse(call: Call, response: Response) {
@@ -83,9 +88,16 @@ internal class PairingClient {
                     if (continuation.isActive) continuation.resumeWithException(
                         if (error is PairingException) error else PairingException("Could not read the pairing response. Generate a new code before trying again."),
                     )
+                } finally {
+                    lifecycle.finishedCall()
                 }
             }
-        })
+        }
+        try {
+            lifecycle.enqueue(this, callback) { continuation.isActive }
+        } catch (error: IOException) {
+            if (continuation.isActive) continuation.resumeWithException(error)
+        }
     }
 
     private companion object { const val MAX_BYTES = 16384L }

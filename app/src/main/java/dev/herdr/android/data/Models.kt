@@ -42,7 +42,14 @@ data class Health(
 enum class PaneMode { CHAT, TERMINAL }
 
 @Serializable
-data class ChatMessage(val id: String, val role: String, val text: String, val phase: String? = null)
+data class ChatMessage(
+    val id: String,
+    val role: String,
+    val text: String,
+    val phase: String? = null,
+    val timestamp: Long? = null,
+    val timestampSource: String? = null,
+)
 
 @Serializable
 internal data class ConversationPage(
@@ -55,6 +62,7 @@ internal data class ConversationPage(
     val canSend: Boolean,
     val status: String,
     val warning: String? = null,
+    val canSendReason: String? = null,
 )
 
 @Serializable
@@ -70,6 +78,7 @@ data class ChatContent(
     val refreshing: Boolean = false,
     val loadingOlder: Boolean = false,
     val canSend: Boolean = false,
+    val canSendReason: String? = null,
     val status: String = "unknown",
     val warning: String? = null,
     val error: String? = null,

@@ -38,9 +38,9 @@ internal class ServerCredentials(val baseUrl: HttpUrl, val token: String) {
 class BridgeException(val statusCode: Int, message: String) : IOException(message)
 class TerminalEndedException(message: String) : IOException(message)
 
-internal class HerdrClient(private val credentials: ServerCredentials) {
-    private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
-    private val http = OkHttpClient.Builder()
+internal class HerdrClient(
+    private val credentials: ServerCredentials,
+    private val http: OkHttpClient = OkHttpClient.Builder()
         .retryOnConnectionFailure(false) // A timed-out write may already have reached the agent.
         .followRedirects(false)
         .followSslRedirects(false)
@@ -48,7 +48,10 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
         .readTimeout(20, TimeUnit.SECONDS)
         .callTimeout(30, TimeUnit.SECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
-        .build()
+        .build(),
+) {
+    private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
+    private val lifecycle = HttpClientLifecycle(http)
 
     suspend fun health(): Health {
         val health: Health = json.decodeFromString(request("GET", listOf("v1", "health")))
@@ -113,7 +116,7 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
         val url = endpoint(listOf("v1", "terminals", paneId, "stream")).newBuilder()
             .addQueryParameter("cols", cols.coerceIn(20, 300).toString())
             .addQueryParameter("rows", rows.coerceIn(5, 150).toString()).build()
-        val socket = http.newWebSocket(authenticatedRequest(url).build(), object : WebSocketListener() {
+        val socket = lifecycle.newWebSocket(authenticatedRequest(url).build(), object : WebSocketListener() {
             override fun onMessage(webSocket: WebSocket, text: String) {
                 try {
                     val message = TerminalProtocol.decode(text)
@@ -123,17 +126,17 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
                     } else if (trySend(message).isFailure) {
                         // A fresh observer will send a complete screen. Never silently lose ANSI deltas.
                         close(IOException("Terminal updates arrived too quickly; reconnecting."))
-                        webSocket.cancel()
+                        lifecycle.cancel(webSocket)
                     }
                 } catch (error: Exception) {
                     close(IOException("Invalid terminal frame received.", error))
-                    webSocket.cancel()
+                    lifecycle.cancel(webSocket)
                 }
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 close(IOException("The bridge sent an unsupported binary terminal frame."))
-                webSocket.cancel()
+                lifecycle.cancel(webSocket)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -150,12 +153,11 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
                 close(if (status != null) BridgeException(status, statusMessage(status)) else IOException("Could not reach the terminal stream."))
             }
         })
-        awaitClose { socket.cancel() }
+        awaitClose { lifecycle.cancel(socket) }
     }
 
     fun close() {
-        http.dispatcher.cancelAll()
-        http.connectionPool.evictAll()
+        lifecycle.close()
     }
 
     private fun endpoint(segments: List<String>): HttpUrl = credentials.baseUrl.newBuilder().apply {
@@ -190,10 +192,14 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
     }
 
     private suspend fun Call.awaitBody(maxBytes: Long): String = suspendCancellableCoroutine { continuation ->
-        continuation.invokeOnCancellation { cancel() }
-        enqueue(object : Callback {
+        continuation.invokeOnCancellation { NetworkCleanup.cancel(this) }
+        val callback = object : Callback {
             override fun onFailure(call: Call, error: IOException) {
-                if (continuation.isActive) continuation.resumeWithException(IOException("Could not reach the server. Check Tailscale and the bridge."))
+                try {
+                    if (continuation.isActive) continuation.resumeWithException(IOException("Could not reach the server. Check Tailscale and the bridge."))
+                } finally {
+                    lifecycle.finishedCall()
+                }
             }
 
             override fun onResponse(call: Call, response: Response) {
@@ -215,9 +221,16 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
                     }
                 } catch (error: Exception) {
                     if (continuation.isActive) continuation.resumeWithException(error)
+                } finally {
+                    lifecycle.finishedCall()
                 }
             }
-        })
+        }
+        try {
+            lifecycle.enqueue(this, callback) { continuation.isActive }
+        } catch (error: IOException) {
+            if (continuation.isActive) continuation.resumeWithException(error)
+        }
     }
 
     private fun safeMessage(value: String): String = value.replace(credentials.token, "[redacted]").take(500)

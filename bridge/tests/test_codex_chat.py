@@ -313,7 +313,44 @@ async def test_busy_blocked_or_unready_targets_cannot_receive_chat_messages(chat
     response = await client.post("/v1/panes/w1:p2/messages", json={"binding": page["binding"], "text": "Do not send"})
     assert response.status_code == 409
     assert not any(r["method"] == "agent.prompt" for r in requests)
-    assert not (await client.get("/v1/panes/w1:p2/conversation")).json()["canSend"]
+    unavailable_page = (await client.get("/v1/panes/w1:p2/conversation")).json()
+    assert not unavailable_page["canSend"]
+    assert isinstance(unavailable_page["canSendReason"], str) and unavailable_page["canSendReason"]
+
+
+@pytest.mark.parametrize("status", ["idle", "done"])
+async def test_manually_launched_codex_omits_managed_flags_and_can_receive_chat_messages(chat, status):
+    client, _, agent, requests, _, _, _, _, _ = chat
+    agent.pop("interactive_ready")
+    agent.pop("launch_pending")
+    agent["agent_status"] = status
+    page = (await client.get("/v1/panes/w1:p2/conversation")).json()
+    assert page["canSend"] and page["canSendReason"] is None
+    result = await client.post("/v1/panes/w1:p2/messages", json={"binding": page["binding"], "text": "One explicit prompt"})
+    assert result.status_code == 200
+    prompts = [r for r in requests if r["method"] == "agent.prompt"]
+    assert len(prompts) == 1
+    assert prompts[0]["params"] == {"target": "w1:p2", "text": "One explicit prompt"}
+
+
+@pytest.mark.parametrize("mutation", ["named", "explicitFalse", "null", "string", "pending", "malformedPending", "working", "blocked", "unknown"])
+async def test_omitted_managed_readiness_never_bypasses_other_chat_guards(chat, mutation):
+    client, _, agent, requests, _, _, _, _, _ = chat
+    first = (await client.get("/v1/panes/w1:p2/conversation")).json()
+    agent.pop("interactive_ready")
+    agent.pop("launch_pending")
+    if mutation == "named": agent["name"] = "managed-agent"
+    if mutation == "explicitFalse": agent["interactive_ready"] = False
+    if mutation == "null": agent["interactive_ready"] = None
+    if mutation == "string": agent["interactive_ready"] = "true"
+    if mutation == "pending": agent["launch_pending"] = True
+    if mutation == "malformedPending": agent["launch_pending"] = "false"
+    if mutation in {"working", "blocked", "unknown"}: agent["agent_status"] = mutation
+    page = (await client.get("/v1/panes/w1:p2/conversation")).json()
+    assert not page["canSend"] and page["canSendReason"]
+    result = await client.post("/v1/panes/w1:p2/messages", json={"binding": first["binding"], "text": "Do not send"})
+    assert result.status_code == 409
+    assert not any(r["method"] == "agent.prompt" for r in requests)
 
 
 async def test_message_is_literal_multiline_exactly_one_agent_prompt(chat):
