@@ -25,7 +25,7 @@ Requires Android 8.0+ (API 26), a running Herdr session on Linux or macOS, and T
   <img src="docs/screenshots/chat.png" width="240" alt="Native Codex conversation with selectable Markdown and code">
   <img src="docs/screenshots/pairing.png" width="240" alt="Herdr Pocket host review before confirming QR pairing">
   <img src="docs/screenshots/dashboard.png" width="240" alt="Herdr Pocket workspace dashboard from the live device test">
-  <img src="docs/screenshots/terminal.png" width="240" alt="Native Herdr terminal displaying a command executed from the Android app">
+  <img src="docs/screenshots/terminal-fit-0.6.png" width="240" alt="Native terminal fitted to the phone width with synthetic test output">
 </p>
 
 ## Install and pair

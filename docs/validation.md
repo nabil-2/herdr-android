@@ -11,11 +11,13 @@ Validated on 9 October 2026. This release adds terminal tabs and new Codex chats
 | Bridge offline | 467 passed | Scoped tab/agent creation, shell readiness, fresh receipts, timestamp provenance, official helper compatibility, existing authentication/pairing/input/host management |
 | Actual Codex 0.162 | 7 passed | Legacy/paginated histories, 54 duplicate messages across midnight, append/rollback, persisted times, and fresh reader continuity; no model calls |
 | Actual Herdr 0.9.3 | 5 passed | Owned shell, unnamed/renamed working synthetic agents, new managed Codex launch and first message, canonical ID-only SessionStart reporting |
-| Android 13 device | Final run pending | Chat, creation, uncertainty inspection, terminal fit/scroll/input and retained real TLS regressions |
+| Android 13 device | 82 passed | Chat, creation, uncertainty inspection, terminal fit/scroll/input and retained real TLS regressions |
 | Frozen Linux package | Passed | Authenticated API, clean Codex history, single-use pairing/revocation, frozen QR helpers and bundled licenses |
-| Linux/macOS CI packages | Pending | Linux x86_64, macOS arm64 and macOS x86_64 packages and smoke checks |
+| Linux/macOS CI packages | Passed | Linux x86_64, macOS arm64 and macOS x86_64 packages and smoke checks |
 | Installed 005 companion | Passed | Checksummed 0.5.1→0.6.0 update; expected capabilities; all companion configuration/device files and Codex config byte-identical |
-| Normal Android update | Pending | Files/PackageInstaller update from 0.5.1 with stable signing identity and retained app data |
+| Normal Android update | Passed | Files/PackageInstaller update from 0.5.1 with stable signing identity and retained app data |
+
+These are **693 distinct automated passing cases**, plus package, installed-host, artifact and delivery checks. The 79 ordinary device cases passed unchanged in 136.96 seconds; the three isolated live Android cases passed in 13.10 seconds with QR decode/pairing and real shell control. One earlier full run crashed during Compose 1.12.1 Activity destruction; the unchanged five-case terminal class and full suite then passed. Read-only review found no preceding app/network exception or app-owned modifier lifecycle call; no speculative production workaround was added. The focused seven terminal-reading cases also passed, including both outer columns with font scale 1.8.
 
 The offline run skips 12 opt-in real-runtime cases, which passed separately. A combined real-runtime run reported 40 passes, including 28 helper cases already counted offline. Tests use owned UUID Herdr sessions, temporary Codex homes, synthetic conversations and fake interactive agents; no existing user agent received test input and no user conversation was read for testing.
 
@@ -43,6 +45,12 @@ Vertical swipes can read local scrollback; **Live** returns to the current viewp
 
 Herdr recent output remains bounded to 1,000 lines and 64 KiB. The actual observer probe showed fullscreen output can expose only the current viewport, so the UI explains that limit and offers program paging rather than claiming unlimited scrollback.
 
+<p>
+  <img src="screenshots/terminal-fit-0.6.png" width="240" alt="Synthetic 80-column terminal fitted inside the phone viewport">
+  <img src="screenshots/terminal-history-0.6.png" width="240" alt="Wrapped synthetic output history with search and copy controls">
+  <img src="screenshots/terminal-program-scroll-0.6.png" width="240" alt="Explicit program scrolling with a Read toggle">
+</p>
+
 The terminal dependency's Kotlin sources are pinned and vendored solely to expose its existing ScrollController/accessibility component; the four-ABI native libraries remain byte-identical to 0.5.1. See [vendor notes](../third_party/termlib/README.md). AGP's BidirectionalText lint detector hung walking this dependency's Kotlin comments. Only that detector is disabled in the dependency module; mandatory strict UTF-8/bidirectional-control scanning covers its Kotlin/XML inputs on build and lint. Other app/dependency checks remain enabled.
 
 ## Environment and artifact
@@ -57,6 +65,10 @@ APK SHA-256:
 ```text
 98923777d8c82fe0b53fb57a65236ddb24d041e51c9c41af31384e4619a6c373
 ```
+
+Production source is `4a5f49726cad4e9ae10939126118d1634941d037`. [Host package CI](https://github.com/nabil-2/herdr-android/actions/runs/37969199195) passed all three platforms. [Android/bridge CI](https://github.com/nabil-2/herdr-android/actions/runs/37969199201) also passed. The normal API 33 Files/PackageInstaller update confirmed **App installed**, retained an app-private synthetic marker, installed the exact APK hash above, and launched successfully. Later documentation/screenshots only record these results.
+
+Private APK delivery was verified through Tailscale HTTPS with normal CA/hostname checks: HTTP 200, APK MIME, all 31,590,475 bytes and the exact SHA-256. This avoids an unauthenticated private-GitHub download returning HTML instead of an APK. The 005 companion exposes its new capabilities and keeps all configuration/device files byte-identical; the recognized helper backup matches the pinned original.
 
 The signing certificate is unchanged (`ad045612a56a05953afb2162ac0b277a8a579dd8e70269caa18db37c26125c9c`). Release assets and platform license bundles are covered by SHA256SUMS. Phone profiles and host credentials do not need to be recreated.
 
