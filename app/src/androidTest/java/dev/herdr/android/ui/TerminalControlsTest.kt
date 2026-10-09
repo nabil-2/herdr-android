@@ -18,7 +18,6 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.compose.ui.semantics.SemanticsProperties
-import androidx.compose.ui.text.AnnotatedString
 import org.connectbot.terminal.Terminal
 import org.connectbot.terminal.TerminalEmulatorFactory
 import org.junit.Assert.assertEquals
@@ -55,7 +54,9 @@ class TerminalControlsTest {
         compose.onNodeWithTag("command-draft").assertTextEquals("Explain this repository")
         compose.onNodeWithTag("send-command").performClick()
         compose.runOnIdle { inputRevision++; sending = false }
-        compose.onNodeWithTag("command-draft").assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
+        compose.onNodeWithTag("command-draft").assert(SemanticsMatcher("The acknowledged command draft is empty") { node ->
+            SemanticsProperties.EditableText in node.config && node.config[SemanticsProperties.EditableText].text.isEmpty()
+        })
     }
 
     @Test

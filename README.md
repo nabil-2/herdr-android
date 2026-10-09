@@ -144,7 +144,8 @@ The Gradle wrapper verifies the distribution checksum. Native Android dependenci
 With an emulator or test phone attached:
 
 ```sh
-./gradlew :app:connectedDebugAndroidTest
+./gradlew :app:connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.notClass=dev.herdr.android.LiveBridgeDeviceTest
 ```
 
 For host checks, install the [source environment](bridge/README.md#install-from-source), then run:

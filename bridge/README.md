@@ -176,4 +176,4 @@ adb reverse --remove tcp:18765
 
 The device test decodes the host QR image with the same native decoder, pastes the invitation, confirms pairing, opens a real pane, and verifies submitted shell input. Emulator image decoding does not test a physical camera. Restart the fixture for a fresh invitation before rerunning the one-use pairing test.
 
-The fixed fixture token is a public test value for this temporary loopback service. Never use it for a real profile or expose the fixture through Tailscale Serve. Ordinary tests skip live cases without the required arguments. Use `--herdr-bin /path/to/herdr` if CLI discovery fails.
+The fixed fixture token is a public test value for this temporary loopback service. Never use it for a real profile or expose the fixture through Tailscale Serve. When running ordinary device checks without a fixture, exclude the live class with `-Pandroid.testInstrumentationRunnerArguments.notClass=dev.herdr.android.LiveBridgeDeviceTest`. The current Gradle device driver can report JUnit assumption skips as failures; the live class requires the fixture arguments above. Use `--herdr-bin /path/to/herdr` if CLI discovery fails.
