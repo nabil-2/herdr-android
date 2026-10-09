@@ -23,12 +23,15 @@ Setup prints a five-minute, one-use QR invitation. The phone reviews its host na
 ```sh
 ~/.local/bin/herdr-pocket pair --session dev
 ~/.local/bin/herdr-pocket pair --plain --session dev
+~/.local/bin/herdr-pocket pair --qr-file ~/herdr-pocket-pairing.png --session dev
 ~/.local/bin/herdr-pocket status --session dev
 ~/.local/bin/herdr-pocket devices --session dev
 ~/.local/bin/herdr-pocket revoke-device DEVICE_ID --session dev
 ```
 
 `pair --plain` prints the complete QR JSON for the app's paste alternative. Treat an unused invitation as a temporary access credential. A separate credential is issued for each successful pairing. `devices` lists metadata and IDs, never tokens; `revoke-device` rejects that phone's future requests and closes its active terminal stream. Other phones and the owner credential remain valid. Deleting a profile on a phone does not revoke its host-side credential.
+
+`pair --qr-file PATH` also saves the invitation as an owner-only PNG. Open it on your computer or transfer it to your phone and choose **Choose QR screenshot** in the app. `setup --qr-file PATH` exports its initial invitation too. Combining `pair --plain --qr-file PATH` keeps JSON-only stdout. Export directories must be owned by you and must not allow other users to write; existing directory permissions are preserved. The PNG expires with its invitation after five minutes.
 
 Omit `--session` when only one instance is configured. Run `setup --session NAME` for additional running Herdr sessions. Re-running setup for the same socket retains the instance's owner credential and device registry. `--socket /absolute/path/herdr.sock`, `--herdr-bin /path/to/herdr`, and `--config-dir /private/config/root` provide explicit setup overrides.
 

@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
@@ -89,5 +90,74 @@ class PairingOnboardingTest {
         compose.onNodeWithTag("review-pairing").performClick()
         compose.onNodeWithContentDescription("Cancel pairing").performClick()
         compose.runOnIdle { assertEquals(1, cancelled); assertEquals(0, submissions) }
+    }
+
+    @Test
+    fun screenshotRequiresServerReviewAndConfirmationWithoutCameraPermission() {
+        val submitted = mutableListOf<String>()
+        var cameraRequests = 0
+        compose.setContent {
+            HerdrTheme {
+                PairingScreen(
+                    PairingEntryMode.IMAGE, false, false, false, null,
+                    { cameraRequests++ }, { submitted += it }, {}, {},
+                    imageChooser = { it(PairingImageResult.Code(payload)) },
+                )
+            }
+        }
+        compose.onNodeWithText("Connect to Dust").assertIsDisplayed()
+        compose.onNodeWithTag("pairing-host").assertIsDisplayed()
+        compose.runOnIdle { assertEquals(0, cameraRequests); assertTrue(submitted.isEmpty()) }
+        compose.onNodeWithTag("confirm-pairing").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(listOf(payload), submitted); assertEquals(0, cameraRequests) }
+    }
+
+    @Test
+    fun cancelledAndInvalidScreenshotsKeepPairingUnsentAndAllowAnotherChoice() {
+        var cameraRequests = 0
+        var submissions = 0
+        var selection: ((PairingImageResult) -> Unit)? = null
+        compose.setContent {
+            HerdrTheme {
+                PairingScreen(
+                    PairingEntryMode.SCAN, false, true, false, null,
+                    { cameraRequests++ }, { submissions++ }, {}, {},
+                    imageChooser = { selection = it },
+                )
+            }
+        }
+        compose.onNodeWithTag("choose-pairing-image").performScrollTo().performClick()
+        compose.onNodeWithTag("choose-pairing-image").assertIsNotEnabled()
+        compose.runOnIdle { selection!!(PairingImageResult.Cancelled) }
+        compose.onNodeWithTag("choose-pairing-image").assertIsEnabled().performClick()
+        compose.runOnIdle { selection!!(PairingImageResult.Code("https://example.com/not-a-pairing-code")) }
+        compose.onNodeWithText("This is not a valid Herdr pairing QR code. Generate a new code on your server.").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("confirm-pairing").assertDoesNotExist()
+        compose.onNodeWithTag("choose-pairing-image").performScrollTo().performClick()
+        compose.runOnIdle { selection!!(PairingImageResult.Error("No QR code was found.")) }
+        compose.onNodeWithText("No QR code was found.").performScrollTo().assertIsDisplayed()
+        compose.runOnIdle { assertEquals(0, cameraRequests); assertEquals(0, submissions) }
+    }
+
+    @Test
+    fun expiredScreenshotShowsWarningBeforeConfirmationAndCanBeReplaced() {
+        var choices = 0
+        var submissions = 0
+        compose.setContent {
+            HerdrTheme {
+                PairingScreen(
+                    PairingEntryMode.IMAGE, false, false, false, null,
+                    {}, { submissions++ }, {}, {},
+                    imageChooser = { callback ->
+                        choices++
+                        callback(PairingImageResult.Code(if (choices == 1) payload.replace("9223372036854775807", "1") else payload))
+                    },
+                )
+            }
+        }
+        compose.onNodeWithText("This code may have expired. If pairing fails, request a fresh code on your computer.").assertIsDisplayed()
+        compose.onNodeWithText("Use a new code").performScrollTo().performClick()
+        compose.onNodeWithText("This code may have expired. If pairing fails, request a fresh code on your computer.").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(2, choices); assertEquals(0, submissions) }
     }
 }

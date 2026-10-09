@@ -30,11 +30,13 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -50,7 +52,7 @@ import dev.herdr.android.data.PairingException
 import dev.herdr.android.data.PairingInvitation
 import dev.herdr.android.data.PairingPayload
 
-internal enum class PairingEntryMode { SCAN, PASTE }
+internal enum class PairingEntryMode { SCAN, PASTE, IMAGE }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -64,6 +66,7 @@ internal fun PairingScreen(
     onPair: (String) -> Unit,
     onClearError: () -> Unit,
     onClose: () -> Unit,
+    imageChooser: (((PairingImageResult) -> Unit) -> Unit)? = null,
 ) {
     // Invitations and their one-use secrets are intentionally never saved to a Bundle.
     var payload by remember { mutableStateOf<String?>(null) }
@@ -71,7 +74,10 @@ internal fun PairingScreen(
     var localError by remember { mutableStateOf<String?>(null) }
     var showPaste by remember { mutableStateOf(initialMode == PairingEntryMode.PASTE) }
     var scanMode by remember { mutableStateOf(initialMode == PairingEntryMode.SCAN) }
+    var entryMode by remember { mutableStateOf(initialMode) }
     var cameraSession by remember { mutableIntStateOf(0) }
+    var readingImage by remember { mutableStateOf(false) }
+    var initialImageLaunched by rememberSaveable { mutableStateOf(false) }
     val review: (String) -> String? = { raw ->
         try {
             val parsed = PairingPayload.parse(raw)
@@ -91,8 +97,35 @@ internal fun PairingScreen(
         localError = null
         onClearError()
         scanMode = true
+        entryMode = PairingEntryMode.SCAN
         cameraSession++
         onRequestCamera()
+    }
+    val imageResult: (PairingImageResult) -> Unit = { result ->
+        readingImage = false
+        when (result) {
+            is PairingImageResult.Code -> localError = review(result.value)
+            is PairingImageResult.Error -> localError = result.message
+            PairingImageResult.Cancelled -> Unit
+        }
+    }
+    val systemImagePicker = rememberPairingImagePicker(onReading = { readingImage = true }, onResult = imageResult)
+    val chooseImage: () -> Unit = {
+        invitation = null
+        payload = null
+        showPaste = false
+        scanMode = false
+        entryMode = PairingEntryMode.IMAGE
+        localError = null
+        onClearError()
+        readingImage = true
+        if (imageChooser == null) systemImagePicker() else imageChooser(imageResult)
+    }
+    LaunchedEffect(Unit) {
+        if (initialMode == PairingEntryMode.IMAGE && !initialImageLaunched) {
+            initialImageLaunched = true
+            chooseImage()
+        }
     }
     val useNewCode: () -> Unit = {
         invitation = null
@@ -100,7 +133,8 @@ internal fun PairingScreen(
         localError = null
         onClearError()
         cameraSession++
-        if (!scanMode) showPaste = true
+        if (entryMode == PairingEntryMode.IMAGE) chooseImage()
+        else if (entryMode == PairingEntryMode.PASTE) { scanMode = false; showPaste = true }
     }
     BackHandler(onBack = onClose)
     Scaffold(
@@ -145,8 +179,8 @@ internal fun PairingScreen(
                 OutlinedButton(onClick = useNewCode, enabled = !pairing, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Use a new code") }
                 TextButton(onClick = onClose, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Cancel") }
             } else {
-                Text("Your computer, paired in a scan.", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-                Text("Open the pairing code on your server, then point your camera at it. Connect both devices to the same Tailscale network first.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Pair your computer.", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+                Text("Open the pairing code on your server. Scan it, choose a screenshot, or paste the code. Connect both devices to the same Tailscale network first.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Box(
                     Modifier.fillMaxWidth().aspectRatio(1f).clip(MaterialTheme.shapes.large).background(Color.Black)
                         .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.large),
@@ -163,9 +197,10 @@ internal fun PairingScreen(
                         Box(Modifier.fillMaxSize().padding(48.dp).border(2.dp, Mint, MaterialTheme.shapes.medium))
                     } else {
                         Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                            SymbolIcon(Symbol.QR, modifier = Modifier.size(56.dp))
+                            if (readingImage) CircularProgressIndicator(Modifier.size(40.dp))
+                            else SymbolIcon(Symbol.QR, modifier = Modifier.size(56.dp))
                             Text(
-                                if (!scanMode) "Paste a pairing code to continue" else if (cameraDenied) "Camera access is off" else if (!cameraGranted) "Camera permission needed" else "Ready for a fresh code",
+                                if (readingImage) "Reading QR screenshot…" else if (!scanMode) "Choose a screenshot, scan, or paste a code" else if (cameraDenied) "Camera access is off" else if (!cameraGranted) "Camera permission needed" else "Ready for a fresh code",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
@@ -173,12 +208,13 @@ internal fun PairingScreen(
                 }
                 if (localError != null) ErrorNotice(localError!!, { localError = null; cameraSession++ })
                 if (error != null) ErrorNotice(error, onClearError)
-                if (cameraDenied && scanMode) Text("Allow camera access to scan, or paste the code without using your camera.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (!scanMode || !cameraGranted || localError != null) Button(onClick = startScan, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                if (cameraDenied && scanMode) Text("Allow camera access to scan, or choose a screenshot or paste the code.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (!scanMode || !cameraGranted || localError != null) Button(onClick = startScan, enabled = !readingImage, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
                     Text(if (localError != null) "Scan again" else "Scan pairing code")
                 }
-                OutlinedButton(onClick = { showPaste = true; onClearError() }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("paste-pairing-code")) { Text("Paste pairing code") }
-                Text("The camera reads the code on this device. No photos are saved or uploaded.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                OutlinedButton(onClick = chooseImage, enabled = !readingImage, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("choose-pairing-image")) { Text("Choose QR screenshot") }
+                OutlinedButton(onClick = { showPaste = true; entryMode = PairingEntryMode.PASTE; onClearError() }, enabled = !readingImage, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("paste-pairing-code")) { Text("Paste pairing code") }
+                Text("Codes are read on this device. No images are saved or uploaded.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }

@@ -39,19 +39,22 @@ def main() -> None:
     parser.add_argument("--registry-file", type=Path, help="Owner-only paired-device registry")
     parser.add_argument("--service-config", type=Path, help="Managed service setup.json (used internally)")
     parser.add_argument("--plain", action="store_true", help="Print pairing JSON instead of a QR code")
-    parser.add_argument("--version", action="version", version="Herdr Pocket 0.3.0")
+    parser.add_argument("--qr-file", type=Path, help="Save the pairing QR as an owner-only PNG (setup or pair; works with --plain)")
+    parser.add_argument("--version", action="version", version="Herdr Pocket 0.3.1")
     args = parser.parse_args()
+    if args.qr_file is not None and args.command not in {"setup", "pair"}:
+        parser.error("--qr-file is available with setup or pair")
     try:
         if args.command in {"setup", "pair", "devices", "revoke-device", "status"}:
             from .host_setup import SetupError, configured_host, setup, show_pairing, wait_healthy
             root = args.config_dir.expanduser() if args.config_dir else None
             if args.command == "setup":
                 setup(session=args.session, socket_path=args.socket, herdr_bin=args.herdr_bin, config_root=root,
-                      codex_bin=args.codex_bin, codex_home=args.codex_home)
+                      codex_bin=args.codex_bin, codex_home=args.codex_home, plain=args.plain, qr_file=args.qr_file)
                 return
             config = configured_host(root, args.session)
             if args.command == "pair":
-                show_pairing(config, plain=args.plain)
+                show_pairing(config, plain=args.plain, qr_file=args.qr_file)
             elif args.command == "status":
                 wait_healthy(config, timeout=3)
                 print(f"Ready: {config['name']}\nSession: {config['session']}\nAddress: {config['url']}")

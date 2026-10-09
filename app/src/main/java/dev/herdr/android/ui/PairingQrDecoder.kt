@@ -2,7 +2,9 @@ package dev.herdr.android.ui
 
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
+import com.google.zxing.LuminanceSource
 import com.google.zxing.PlanarYUVLuminanceSource
+import com.google.zxing.RGBLuminanceSource
 import com.google.zxing.ReaderException
 import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.QRCodeReader
@@ -24,6 +26,40 @@ internal fun copyLuminance(buffer: ByteBuffer, width: Int, height: Int, rowStrid
 /** Offline QR-only decoding. No image or decoded text leaves this process. */
 internal fun decodePairingQr(luminance: ByteArray, width: Int, height: Int): String? {
     val source = PlanarYUVLuminanceSource(luminance, width, height, 0, 0, width, height, false)
+    return decodeQrSource(source)
+}
+
+/** Screenshots may have any orientation and surrounding UI that obscures QR detection. */
+internal fun decodePairingQrPixels(pixels: IntArray, width: Int, height: Int): String? {
+    require(width in 1..2048 && height in 1..2048 && pixels.size == width * height)
+    var source: LuminanceSource = RGBLuminanceSource(width, height, pixels)
+    repeat(4) { orientation ->
+        decodeScreenshotSource(source)?.let { return it }
+        if (orientation < 3) source = rotateScreenshotSource(source)
+    }
+    return null
+}
+
+private fun decodeScreenshotSource(source: LuminanceSource): String? {
+    decodeQrSource(source)?.let { return it }
+    val cropWidth = (source.width * 3 / 4).coerceAtLeast(1)
+    val cropHeight = (source.height * 3 / 4).coerceAtLeast(1)
+    for (top in listOf(0, source.height - cropHeight)) for (left in listOf(0, source.width - cropWidth)) {
+        decodeQrSource(source.crop(left, top, cropWidth, cropHeight))?.let { return it }
+    }
+    return null
+}
+
+private fun rotateScreenshotSource(source: LuminanceSource): LuminanceSource {
+    val original = source.matrix
+    val rotated = ByteArray(original.size)
+    for (row in 0 until source.height) for (column in 0 until source.width) {
+        rotated[(source.width - column - 1) * source.height + row] = original[row * source.width + column]
+    }
+    return PlanarYUVLuminanceSource(rotated, source.height, source.width, 0, 0, source.height, source.width, false)
+}
+
+private fun decodeQrSource(source: LuminanceSource): String? {
     val reader = QRCodeReader()
     val hints = mapOf(DecodeHintType.TRY_HARDER to true, DecodeHintType.CHARACTER_SET to "UTF-8")
     return try {

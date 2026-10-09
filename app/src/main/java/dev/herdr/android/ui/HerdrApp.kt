@@ -57,6 +57,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -113,6 +114,12 @@ fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalR
         pairingMode = PairingEntryMode.PASTE
         showPairing = true
     }
+    val openImage: () -> Unit = {
+        viewModel.clearError()
+        pairingStartRevision = state.pairingSuccessRevision
+        pairingMode = PairingEntryMode.IMAGE
+        showPairing = true
+    }
     LaunchedEffect(state.pairingSuccessRevision, showPairing) {
         if (showPairing && state.pairingSuccessRevision > pairingStartRevision) {
             showPairing = false
@@ -149,6 +156,7 @@ fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalR
                 onAdd = { viewModel.clearError(); editingProfileId = null; showAddServer = true },
                 onScan = openScan,
                 onPaste = openPaste,
+                onImage = openImage,
                 onEdit = { viewModel.clearError(); editingProfileId = it.id; showAddServer = true },
                 onConnect = {
                     if (it != state.activeProfileId || state.connection != ConnectionState.CONNECTED) onConnect(it)
@@ -223,6 +231,7 @@ private fun ServersScreen(
     onAdd: () -> Unit,
     onScan: () -> Unit,
     onPaste: () -> Unit,
+    onImage: () -> Unit,
     onEdit: (ServerProfile) -> Unit,
     onConnect: (String) -> Unit,
     onDelete: (String) -> Unit,
@@ -261,6 +270,7 @@ private fun ServersScreen(
                     Text("Your agents. Anywhere.", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
                     Text("Pair your computer with a scan. Join the same Tailscale network on your phone first.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     if (state.profiles.isNotEmpty()) TextButton(onClick = onPaste) { Text("Paste pairing code") }
+                    if (state.profiles.isNotEmpty()) TextButton(onClick = onImage) { Text("Choose QR screenshot") }
                 }
             }
             if (state.error != null) item { ErrorNotice(state.error, onDismissError) }
@@ -271,6 +281,7 @@ private fun ServersScreen(
                         Text("Pair your computer", style = MaterialTheme.typography.titleMedium)
                         Text("Open a pairing code from Herdr Pocket on your server. Scan it here, review the computer, and connect.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Button(onClick = onScan, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Scan pairing code") }
+                        OutlinedButton(onClick = onImage, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("choose-pairing-image")) { Text("Choose QR screenshot") }
                         OutlinedButton(onClick = onPaste, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Paste pairing code") }
                         TextButton(onClick = onAdd, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Advanced: manual server setup") }
                     }

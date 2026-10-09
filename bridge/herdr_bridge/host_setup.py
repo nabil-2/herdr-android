@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -57,8 +58,16 @@ def private_directory(path: Path) -> None:
     path.chmod(0o700)
 
 
-def write_private(path: Path, content: bytes) -> None:
-    private_directory(path.parent)
+def write_private(path: Path, content: bytes, *, preserve_directory_permissions: bool = False) -> None:
+    if preserve_directory_permissions:
+        # An explicitly chosen export directory need not be a private setup
+        # directory. Keep its permissions, while the exported file stays 0600.
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        info = path.parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise SetupError("Export directory must be owned by you, must not be a symbolic link, and must not allow others to write.")
+    else:
+        private_directory(path.parent)
     if path.exists() or path.is_symlink():
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
@@ -399,7 +408,8 @@ def wait_healthy(config: dict, timeout: float = 20) -> None:
 
 
 def setup(*, session: str | None = None, socket_path: Path | None = None, herdr_bin: str | None = None,
-          config_root: Path | None = None, codex_bin: str | None = None, codex_home: Path | None = None) -> None:
+          config_root: Path | None = None, codex_bin: str | None = None, codex_home: Path | None = None,
+          plain: bool = False, qr_file: Path | None = None) -> None:
     executable = find_herdr(herdr_bin)
     name, selected_socket = select_session(executable, session, socket_path)
     tailscale, dns_name = tailscale_state()
@@ -442,7 +452,7 @@ def setup(*, session: str | None = None, socket_path: Path | None = None, herdr_
     print("Configuring private Tailscale access. Follow any one-time HTTPS consent shown below.")
     run([tailscale, "serve", "--bg", f"--https={https_port}", proxy], visible=True, timeout=120)
     print("\nThe companion is running in the background.")
-    show_pairing(config)
+    show_pairing(config, plain=plain, qr_file=qr_file)
 
 
 def configured_host(config_root: Path | None = None, session: str | None = None) -> dict:
@@ -453,18 +463,32 @@ def configured_host(config_root: Path | None = None, session: str | None = None)
     return choose(configs, "session", "configured Herdr Pocket hosts; run setup first")
 
 
-def show_pairing(config: dict, *, plain: bool = False) -> dict:
+def show_pairing(config: dict, *, plain: bool = False, qr_file: Path | None = None) -> dict:
     wait_healthy(config, timeout=3)
     challenge = PairingStore(Path(config["registryFile"])).begin_pairing(config["name"])
     payload = {"type": "herdr-pocket-pair", "version": 1, "url": config["url"], "name": config["name"], **challenge}
     encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+    qr = None
+    if qr_file is not None or not plain:
+        import segno
+        qr = segno.make(encoded, error="M", micro=False)
+    if qr_file is not None:
+        destination = qr_file.expanduser().absolute()
+        if any(ord(char) < 32 for char in str(destination)):
+            raise SetupError("Choose a QR image path without control characters.")
+        image = io.BytesIO()
+        qr.save(image, kind="png", scale=8, border=4)
+        write_private(destination, image.getvalue(), preserve_directory_permissions=True)
+        # Keep --plain stdout suitable for piping into existing consumers.
+        print(f"Pairing QR image saved to {destination}. It can pair one phone and expires in 5 minutes.",
+              file=sys.stderr if plain else sys.stdout)
     if plain:
         print(encoded)
     else:
-        import segno
         print("\nOpen Herdr Pocket on your phone and tap Scan pairing code.\n")
-        segno.make(encoded, error="M", micro=False).terminal(compact=True, border=4)
+        qr.terminal(compact=True, border=4)
         print("This code can pair one phone and expires in 5 minutes.")
         print("To pair another phone later: herdr-pocket pair")
         print("Use 'herdr-pocket pair --plain' if you need to paste the pairing code instead.")
+        print("Use 'herdr-pocket pair --qr-file pairing.png' to open the code as an image or import it from your phone's gallery.")
     return payload

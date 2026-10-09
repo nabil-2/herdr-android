@@ -4,7 +4,9 @@ import json
 import os
 import platform
 import shutil
+import struct
 import subprocess
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,7 +14,7 @@ import pytest
 
 from herdr_bridge import host_setup as setup
 from herdr_bridge.config import initialize_token, read_token
-from herdr_bridge.pairing import PairingStore
+from herdr_bridge.pairing import PairingError, PairingStore
 
 
 def config_for(root: Path) -> dict:
@@ -137,6 +139,116 @@ def test_pairing_prints_one_use_challenge_but_never_owner_token(tmp_path, monkey
     assert device["serverName"] == "Test host"
 
 
+def png_pixels(path: Path) -> tuple[int, int, list[list[int]]]:
+    """Read Segno's lossless grayscale PNG without introducing image dependencies."""
+    image = path.read_bytes()
+    assert image.startswith(b"\x89PNG\r\n\x1a\n")
+    position, compressed = 8, []
+    while position < len(image):
+        length = struct.unpack("!I", image[position:position + 4])[0]
+        kind = image[position + 4:position + 8]
+        content = image[position + 8:position + 8 + length]
+        crc = struct.unpack("!I", image[position + 8 + length:position + 12 + length])[0]
+        assert crc == zlib.crc32(kind + content)
+        if kind == b"IHDR":
+            width, height, depth, color, compression, filtering, interlace = struct.unpack("!IIBBBBB", content)
+            assert (depth, color, compression, filtering, interlace) == (1, 0, 0, 0, 0)
+        elif kind == b"IDAT":
+            compressed.append(content)
+        position += 12 + length
+    stride = (width + 7) // 8
+    raw = zlib.decompress(b"".join(compressed))
+    assert len(raw) == height * (stride + 1)
+    previous = bytes(stride)
+    pixels = []
+    for index in range(height):
+        start = index * (stride + 1)
+        filtering = raw[start]
+        assert filtering in {0, 2}  # Segno emits unfiltered or prior-row differences.
+        row = raw[start + 1:start + stride + 1]
+        if filtering == 2:
+            row = bytes((current + prior) & 255 for current, prior in zip(row, previous))
+        previous = row
+        pixels.append([1 - ((row[x // 8] >> (7 - x % 8)) & 1) for x in range(width)])
+    return width, height, pixels
+
+
+def test_pairing_png_exports_exact_plain_payload_and_keeps_directory_permissions(tmp_path, monkeypatch, capsys):
+    import segno
+    config = config_for(tmp_path / "config")
+    owner_token = initialize_token(Path(config["tokenFile"]))
+    directory = tmp_path / "Pictures"
+    directory.mkdir(mode=0o755)
+    directory.chmod(0o755)
+    path = directory / "pairing.png"
+    path.write_bytes(b"old image")
+    path.chmod(0o644)
+    monkeypatch.setattr(setup, "wait_healthy", lambda *args, **kwargs: None)
+    payload = setup.show_pairing(config, plain=True, qr_file=path)
+    printed = capsys.readouterr()
+    assert json.loads(printed.out) == payload
+    assert "expires in 5 minutes" in printed.err
+    assert owner_token not in printed.out + printed.err
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert directory.stat().st_mode & 0o777 == 0o755
+    assert {item.name for item in directory.iterdir()} == {"pairing.png"}
+    canonical = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+    qr = segno.make(canonical, error="M", micro=False)
+    width, height, pixels = png_pixels(path)
+    expected = [list(row) for row in qr.matrix_iter(scale=8, border=4)]
+    assert width == height == len(expected)
+    assert pixels == expected  # Every quiet-zone and QR pixel encodes the same invitation.
+    registry = PairingStore(Path(config["registryFile"]))
+    registry.exchange(payload["code"], "Gallery phone")
+    with pytest.raises(PairingError, match="invalid or expired"):
+        registry.exchange(payload["code"], "Second phone")
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "hardlink", "directory", "parent_symlink", "shared_parent", "different_owner"])
+def test_pairing_png_refuses_unsafe_destinations(tmp_path, monkeypatch, unsafe):
+    config = config_for(tmp_path / "config")
+    monkeypatch.setattr(setup, "wait_healthy", lambda *args, **kwargs: None)
+    destination = tmp_path / "images" / "pairing.png"
+    destination.parent.mkdir(mode=0o700)
+    original = tmp_path / "untouched"
+    original.write_bytes(b"original")
+    if unsafe == "symlink":
+        destination.symlink_to(original)
+    elif unsafe == "hardlink":
+        os.link(original, destination)
+    elif unsafe == "directory":
+        destination.mkdir()
+    elif unsafe == "parent_symlink":
+        destination.parent.rmdir()
+        destination.parent.symlink_to(tmp_path, target_is_directory=True)
+    elif unsafe == "shared_parent":
+        destination.parent.chmod(0o777)
+    else:
+        destination.write_bytes(b"different owner")
+        old_lstat = Path.lstat
+        def nonowned_lstat(path):
+            info = old_lstat(path)
+            if path == destination:
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=os.getuid() + 1, st_nlink=1)
+            return info
+        monkeypatch.setattr(Path, "lstat", nonowned_lstat)
+    with pytest.raises(setup.SetupError, match="unsafe setup file|Export directory"):
+        setup.show_pairing(config, plain=True, qr_file=destination)
+    assert original.read_bytes() == b"original"
+
+
+def test_pairing_png_keeps_normal_terminal_qr_output(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(setup, "wait_healthy", lambda *args, **kwargs: None)
+    image = tmp_path / "images" / "pairing.png"
+    setup.show_pairing(config_for(tmp_path / "config"), qr_file=image)
+    printed = capsys.readouterr()
+    assert "Scan pairing code" in printed.out
+    assert "Pairing QR image saved" in printed.out
+    assert "expires in 5 minutes" in printed.out
+    assert printed.err == ""
+    assert image.stat().st_mode & 0o777 == 0o600
+
+
 def test_setup_reads_selected_session_and_installs_only_its_companion(tmp_path, monkeypatch, capsys):
     calls = []
     selected_socket = tmp_path / "named-herdr.sock"
@@ -147,7 +259,7 @@ def test_setup_reads_selected_session_and_installs_only_its_companion(tmp_path, 
     monkeypatch.setattr(setup, "free_port", lambda: 8768)
     monkeypatch.setattr(setup, "command_prefix", lambda: ["/installed/herdr-pocket"])
     monkeypatch.setattr(setup, "wait_healthy", lambda *args, **kwargs: None)
-    monkeypatch.setattr(setup, "show_pairing", lambda value: calls.append(("pair", value)))
+    monkeypatch.setattr(setup, "show_pairing", lambda value, **kwargs: calls.append(("pair", value)))
     monkeypatch.setattr(setup, "start_service", lambda *args: calls.append(("service", args)))
     def fake_run(args, **kwargs):
         calls.append(("command", args))

@@ -7,6 +7,7 @@ The app uses Kotlin, Jetpack Compose, and ConnectBot's native libvterm terminal 
 ## What works
 
 - Scan or paste a pairing invitation, review the host, and explicitly confirm pairing. Each phone receives its own revocable credential, encrypted locally with Android Keystore and excluded from backups.
+- Choose a QR screenshot from the phone's gallery. The system photo picker needs no camera or storage permission; images decode locally and are never uploaded.
 - Save multiple server profiles and switch between them.
 - Browse workspaces, tabs, agent states, and shell panes, with agents needing input grouped together. Status refreshes while the app is in the foreground.
 - Open supported Codex panes in native chat: user messages and agent replies, selectable Markdown and code, older conversation history, and a multiline reply box. Commands, tool results, reasoning, and injected instructions stay out of the conversation.
@@ -56,6 +57,14 @@ If scanning is inconvenient, run the following on the host and paste the complet
 ```sh
 ~/.local/bin/herdr-pocket pair --plain
 ```
+
+To use a screenshot or downloaded image instead, export a fresh pairing QR:
+
+```sh
+~/.local/bin/herdr-pocket pair --qr-file ~/herdr-pocket-pairing.png
+```
+
+Open that PNG on your computer or transfer it to your phone, then tap **Choose QR screenshot** in Herdr Pocket. Review the server and tap **Pair & connect**. You can also use `herdr-pocket pair` to display the QR directly in a terminal. QR images contain a one-use invitation and expire after five minutes; generate a fresh image when needed.
 
 Each code expires after five minutes and pairs one phone. It is exchanged for a separate device credential; you never need to copy the host's permanent owner token. If a code expires or has already been used, generate a new one. After connecting, choose a workspace, tab, and pane. Supported Codex sessions open as chat; shell panes and other agents open as terminals.
 

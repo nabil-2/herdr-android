@@ -6,7 +6,7 @@ All `/v1` HTTP requests and WebSocket handshakes require `Authorization: Bearer 
 
 ## Pairing invitation and device credentials
 
-Managed host setup runs one companion per selected Herdr socket and exposes its loopback listener through private Tailscale Serve. The host CLI creates a QR invitation locally, using Segno, and prints it as a QR code or complete JSON with `herdr-pocket pair --plain`. The payload is a flat JSON object with exactly these fields:
+Managed host setup runs one companion per selected Herdr socket and exposes its loopback listener through private Tailscale Serve. The host CLI creates a QR invitation locally, using Segno, and prints it as a QR code or complete JSON with `herdr-pocket pair --plain`. `pair --qr-file PATH` and `setup --qr-file PATH` also export the same invitation to an owner-only PNG, preserving the chosen directory's permissions. It retains the five-minute lifetime and one-use behavior. The payload is a flat JSON object with exactly these fields:
 
 ```json
 {"type":"herdr-pocket-pair","version":1,"url":"https://host.tailnet.ts.net:8443/","name":"host / dev","code":"<one-use-code>","expiresAt":1791542400}
@@ -113,6 +113,8 @@ Submission calls Herdr's public `agent.prompt` exactly once with explicit pane t
 Conversation reads and sends use the existing owner/device bearer policy and selected-session scope. Revoked devices cannot make further chat requests. No extra filesystem or arbitrary-thread browsing endpoint is exposed. Field allowlisting excludes internal metadata; message prose is still the user's authenticated conversation and is not automatically scrubbed for secrets.
 
 Persist server profiles locally, with device/advanced manual tokens encrypted by Android Keystore; disable app backup. QR scanning uses a native CameraX preview and offline ZXing decoder. Request camera permission only when scanning is chosen; offer complete-JSON paste when scanning is unavailable or permission is denied. Do not save or upload camera images. Invitation payloads and pending pairing requests remain in memory, outside saved-instance state, logs, and generated string representations. Require explicit host review and confirmation. Cancel an in-flight pairing request when dismissed or when the app leaves the foreground.
+
+**Choose QR screenshot** opens Android's system photo picker, with its document-picker fallback. It requests neither camera nor broad media/storage access. Only the selected image is read locally; no URI grant, image, or invitation is persisted or uploaded. Input is bounded to 20 MiB encoded and 32,768 pixels per original dimension, then downsampled to at most 2,048 pixels per decoded dimension. RGB decoding handles rotated screenshots, inverted codes, and surrounding interface content. Cancellation returns to pairing without a connection; unreadable, invalid, or expired codes show actionable messages. A decoded invitation enters the same host-review and explicit-confirmation flow as scanning and paste.
 
 On Android 17/API 37 and later, request `android.permission.ACCESS_LOCAL_NETWORK` when the user chooses to connect or pair. Do not start HTTP requests or observers before it is granted. If it is denied or later revoked, stop network work and show an actionable permission error. The app uses the user's existing Tailscale connection; it does not manage the VPN or receive Tailscale credentials.
 
