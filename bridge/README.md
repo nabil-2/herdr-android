@@ -1,6 +1,6 @@
 # Herdr Pocket host companion
 
-This companion runs as the same Unix user as Herdr. It provides authenticated HTTP commands and read-only ANSI terminal streams for the native Android app. It uses Herdr's existing public API; no Herdr fork is required.
+This companion runs as the same Unix user as Herdr. It provides authenticated commands, read-only Codex conversation history, and ANSI terminal streams for the native Android app. It uses Herdr's existing public API; no Herdr fork is required.
 
 For normal installation, use the self-contained release installer and QR pairing described in the [repository README](../README.md#install-and-pair). Python and Git are unnecessary for that path. This document covers managed service details, source development, and advanced manual configuration. The current integration targets Herdr 0.9.3 on Linux/macOS.
 
@@ -31,6 +31,10 @@ Setup prints a five-minute, one-use QR invitation. The phone reviews its host na
 `pair --plain` prints the complete QR JSON for the app's paste alternative. Treat an unused invitation as a temporary access credential. A separate credential is issued for each successful pairing. `devices` lists metadata and IDs, never tokens; `revoke-device` rejects that phone's future requests and closes its active terminal stream. Other phones and the owner credential remain valid. Deleting a profile on a phone does not revoke its host-side credential.
 
 Omit `--session` when only one instance is configured. Run `setup --session NAME` for additional running Herdr sessions. Re-running setup for the same socket retains the instance's owner credential and device registry. `--socket /absolute/path/herdr.sock`, `--herdr-bin /path/to/herdr`, and `--config-dir /private/config/root` provide explicit setup overrides.
+
+Setup automatically discovers the optional Codex CLI, its `CODEX_HOME` (default `~/.codex`), and the executable search path needed by user-installed runtimes. These are retained in owner-only service configuration. Advanced overrides are `--codex-bin /absolute/path/codex` and `--codex-home /absolute/path/home`; direct `serve` accepts them too. Codex is not bundled or required for terminal-only hosts. The tested version is Codex 0.162.0.
+
+The bridge starts a local stdio Codex app-server only when reading a supported pane's saved conversation. Its RPC allowlist permits initialization and `thread/read` only. It cannot create, resume, or control a model turn; replies use Herdr's `agent.prompt` in the original pane. The reader may update Codex's local metadata databases. Paginated history needs the matching Codex home and its projected history database, not just copied JSONL files. Missing history or session attribution uses the terminal fallback.
 
 The packaged companion's full bundled license texts are available with `~/.local/bin/herdr-pocket --licenses` and in the release's `LICENSES.txt`.
 

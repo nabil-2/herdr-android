@@ -63,7 +63,7 @@ import org.connectbot.terminal.TerminalEmulatorFactory
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun TerminalScreen(state: HerdrUiState, viewModel: HerdrViewModel, onBack: () -> Unit, onRetry: (String) -> Unit) {
+internal fun TerminalScreen(state: HerdrUiState, viewModel: HerdrViewModel, onBack: () -> Unit, onRetry: (String) -> Unit, returnToChat: Boolean = false, fallbackReason: String? = null) {
     val paneId = state.paneId ?: return
     val pane = state.snapshot?.panes?.firstOrNull { it.id == paneId }
     val workspace = state.snapshot?.workspaces?.firstOrNull { it.id == pane?.workspaceId }
@@ -109,13 +109,17 @@ internal fun TerminalScreen(state: HerdrUiState, viewModel: HerdrViewModel, onBa
                         Text(listOfNotNull(workspace?.label, tab?.label).joinToString(" / "), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 },
-                navigationIcon = { androidx.compose.material3.IconButton(onClick = onBack) { SymbolIcon(Symbol.BACK, "Back to workspaces") } },
-                actions = { if (pane != null) Box(Modifier.padding(end = 12.dp)) { StatusPill(pane.status) } },
+                navigationIcon = { androidx.compose.material3.IconButton(onClick = onBack) { SymbolIcon(Symbol.BACK, if (returnToChat) "Back to conversation" else "Back to workspaces") } },
+                actions = {
+                    if (returnToChat) TextButton(onClick = onBack, modifier = Modifier.heightIn(min = 48.dp).testTag("return-to-chat")) { Text("Chat") }
+                    else if (pane != null) Box(Modifier.padding(end = 12.dp)) { StatusPill(pane.status) }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = CanvasColor),
             )
         },
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding()) {
+            if (fallbackReason != null && !returnToChat) Text(fallbackReason, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             Row(Modifier.fillMaxWidth().background(CanvasColor).padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 val connectionColor = if (state.terminal.connected) Mint else Amber
                 Box(Modifier.size(6.dp).background(connectionColor, CircleShape))

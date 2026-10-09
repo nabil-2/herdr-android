@@ -164,6 +164,26 @@ def test_setup_reads_selected_session_and_installs_only_its_companion(tmp_path, 
     commands = [args for kind, args in calls if kind == "command"]
     assert commands[-1] == ["tailscale", "serve", "--bg", "--https=8444", "http://127.0.0.1:8768"]
     assert all("reset" not in args and "stop" not in args and "pane" not in args for args in commands)
+    # Upgrade the same instance: retain paired phones and custom Codex settings.
+    custom_codex = tmp_path / "custom-codex"
+    custom_codex.write_text("#!/bin/sh\nexit 0\n")
+    custom_codex.chmod(0o700)
+    custom_home = str(tmp_path / "custom-home")
+    value.update(codexBin=str(custom_codex), codexHome=custom_home, codexPath="/usr/bin:/bin")
+    setup.write_private(path, json.dumps(value).encode())
+    owner = read_token(Path(value["tokenFile"]))
+    registry = PairingStore(Path(value["registryFile"]))
+    invitation = registry.begin_pairing("Existing host")
+    device = registry.exchange(invitation["code"], "Existing phone")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    setup.setup(config_root=tmp_path / "pocket")
+    upgraded = setup.read_config(path)
+    assert upgraded["codexBin"] == str(custom_codex)
+    assert upgraded["codexHome"] == custom_home
+    assert upgraded["codexPath"] == "/usr/bin:/bin"
+    assert upgraded["port"] == value["port"] and upgraded["httpsPort"] == value["httpsPort"]
+    assert read_token(Path(upgraded["tokenFile"])) == owner
+    assert registry.authorized(device["token"])
 
 
 def test_missing_tailscale_fails_before_installing_services(monkeypatch):
@@ -220,6 +240,41 @@ def test_explicit_herdr_name_is_resolved_in_path_before_current_directory(tmp_pa
     monkeypatch.setenv("PATH", str(directory))
     assert setup.find_herdr("herdr") == str(executable)
     assert setup.find_herdr(str(executable)) == str(executable)
+
+
+def test_codex_discovery_keeps_runtime_path_and_custom_home_for_background_service(tmp_path, monkeypatch):
+    directory = tmp_path / "node runtime/bin"
+    directory.mkdir(parents=True)
+    executable = directory / "codex"
+    executable.write_text("#!/usr/bin/env node\n")
+    executable.chmod(0o700)
+    home = tmp_path / "custom codex"
+    monkeypatch.setenv("PATH", str(directory) + os.pathsep + "." + os.pathsep + "/usr/bin")
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    result = setup.codex_settings()
+    assert result == {"codexBin": str(executable), "codexHome": str(home),
+                      "codexPath": str(directory) + os.pathsep + "/usr/bin"}
+    path = tmp_path / "setup.json"
+    setup.write_private(path, json.dumps(config_for(tmp_path) | result).encode())
+    assert setup.read_config(path)["codexPath"] == result["codexPath"]
+
+
+def test_missing_codex_does_not_require_it_for_shell_hosts(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(setup.Path, "home", classmethod(lambda cls: tmp_path))
+    assert setup.codex_settings() == {}
+    with pytest.raises(setup.SetupError, match="specified Codex"):
+        setup.codex_settings("missing-codex")
+
+
+def test_codex_service_configuration_rejects_relative_or_injected_paths(tmp_path):
+    path = tmp_path / "setup.json"
+    for change in [{"codexBin": "codex"}, {"codexHome": "relative"}, {"codexBin": "/bin/codex\n"},
+                   {"codexPath": "/bin:."}, {"codexPath": "/bin::/usr/bin"}, {"codexPath": "/bin\n/usr/bin"},
+                   {"codexPath": True}, {"codexHome": []}]:
+        setup.write_private(path, json.dumps(config_for(tmp_path) | change).encode())
+        with pytest.raises(setup.SetupError):
+            setup.read_config(path)
 
 
 @pytest.mark.parametrize("failure", ["timeout", "denied"])

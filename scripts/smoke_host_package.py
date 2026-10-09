@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import signal
 import socket
 import socketserver
@@ -46,11 +47,16 @@ SNAPSHOT = {
     "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "cwd": "/mock/project", "agent_status": "idle"}],
     "agents": [], "layouts": [],
 }
+CHAT_THREAD = "00000000-0000-4000-8000-000000000003"
 
 
 @contextmanager
-def mock_daemon(path: Path):
+def mock_daemon(path: Path, *, chat: bool = False):
     methods: list[str] = []
+    snapshot = json.loads(json.dumps(SNAPSHOT))
+    if chat:
+        snapshot["panes"][0].update(agent="codex", terminal_id="term_package_smoke",
+            agent_session={"source": "herdr:codex", "agent": "codex", "kind": "id", "value": CHAT_THREAD})
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
@@ -64,7 +70,9 @@ def mock_daemon(path: Path):
                 methods.append(method)
                 response = {"id": request["id"]}
                 if method == "session.snapshot" and request.get("params") == {}:
-                    response["result"] = {"type": "session_snapshot", "snapshot": SNAPSHOT}
+                    response["result"] = {"type": "session_snapshot", "snapshot": snapshot}
+                elif chat and method == "agent.get" and request.get("params") == {"target": "w1:p1"}:
+                    response["result"] = {"type": "agent", "agent": snapshot["panes"][0] | {"interactive_ready": True}}
                 else:
                     response["error"] = {"code": "unknown_method"}
                 self.wfile.write(json.dumps(response).encode() + b"\n")
@@ -155,6 +163,39 @@ def write_private(path: Path, contents: bytes) -> None:
         file.write(contents)
 
 
+def mock_codex(root: Path) -> tuple[Path, Path]:
+    """Real child process exercises frozen spawning/framing without any model call."""
+    home = root / "codex-home"
+    home.mkdir(mode=0o700)
+    source = root / "mock-codex.py"
+    source.write_text('''import json,os,sys
+from pathlib import Path
+home=Path(os.environ["CODEX_HOME"])
+for line in sys.stdin:
+    request=json.loads(line)
+    method=request.get("method")
+    with (home / "methods.jsonl").open("a") as log:
+        log.write(json.dumps(method)+"\\n")
+    if method=="initialized":
+        continue
+    if method=="initialize":
+        result={"userAgent":"package-smoke"}
+    elif method=="thread/read":
+        result={"thread":{"id":request["params"]["threadId"],"turns":[{"id":"turn-1","items":[
+            {"type":"userMessage","id":"user-1","content":[{"type":"text","text":"A clean chat"}]},
+            {"type":"commandExecution","id":"tool-1","command":"HIDDEN_TOOL_COMMAND","aggregatedOutput":"HIDDEN_TOOL_OUTPUT"},
+            {"type":"agentMessage","id":"reply-1","text":"**Ready from the packaged reader.**","phase":"final_answer"}
+        ]}]}}
+    else:
+        raise RuntimeError("Reader attempted an ownership operation")
+    print(json.dumps({"id":request["id"],"result":result}),flush=True)
+''')
+    executable = root / "mock-codex"
+    executable.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " " + shlex.quote(str(source)) + ' "$@"\n')
+    executable.chmod(0o700)
+    return executable, home
+
+
 def exercise(binary: Path) -> None:
     check("Herdr Pocket " in command(binary, "--version"), "The packaged binary has an unexpected version output")
     licenses = command(binary, "--licenses").lower()
@@ -171,22 +212,24 @@ def exercise(binary: Path) -> None:
         port = unused_port()
         config_root = root / "config"
         config_file = config_root / "instances/abcdef012345/setup.json"
+        codex_bin, codex_home = mock_codex(root)
         config = {
             "format": 1, "instance": "abcdef012345", "session": "default", "name": "Package smoke",
             "socket": str(daemon_socket), "herdrBin": str(binary),
             "tokenFile": str(token_file), "registryFile": str(registry_file),
             "host": "127.0.0.1", "port": port, "httpsPort": 8443, "url": f"http://127.0.0.1:{port}/",
+            "codexBin": str(codex_bin), "codexHome": str(codex_home), "codexPath": os.defpath,
         }
         write_private(config_file, json.dumps(config).encode())
         log_file = root / "companion.log"
-        with mock_daemon(daemon_socket) as methods, log_file.open("wb") as log:
+        with mock_daemon(daemon_socket, chat=True) as methods, log_file.open("wb") as log:
             process = subprocess.Popen([
-                str(binary), "serve", "--socket", str(daemon_socket), "--token-file", str(token_file),
-                "--registry-file", str(registry_file), "--port", str(port),
+                str(binary), "serve", "--service-config", str(config_file),
             ], stdout=log, stderr=log, start_new_session=True)
             try:
                 health = wait_ready(process, port, owner_token)
                 check(health.get("herdrVersion") == "0.9.3", "The packaged bridge did not normalize the mock daemon version")
+                check("codex-chat" in health.get("capabilities", []), "The packaged Codex reader was not discovered")
                 status, _ = http_json(port, "/v1/health")
                 check(status == 401, "Anonymous health access was not rejected")
 
@@ -202,6 +245,17 @@ def exercise(binary: Path) -> None:
                 status, snapshot = http_json(port, "/v1/snapshot", token=device_token)
                 check(status == 200 and snapshot["workspaces"][0]["id"] == "w1" and snapshot["panes"][0]["id"] == "w1:p1",
                       "A paired phone could not read the normalized snapshot")
+                check(snapshot["panes"][0].get("conversation", {}).get("available") is True,
+                      "The packaged snapshot omitted a supported chat pane")
+                status, conversation = http_json(port, "/v1/panes/w1:p1/conversation", token=device_token)
+                check(status == 200 and [m["text"] for m in conversation["messages"]] ==
+                      ["A clean chat", "**Ready from the packaged reader.**"],
+                      "The packaged reader did not produce clean conversation messages")
+                check(conversation.get("canSend") is True and "HIDDEN_TOOL" not in json.dumps(conversation),
+                      "The packaged chat exposed tools or rejected an omitted false launch flag")
+                reader_methods = [json.loads(line) for line in (codex_home / "methods.jsonl").read_text().splitlines()]
+                check(reader_methods == ["initialize", "initialized", "thread/read"],
+                      "The packaged reader attempted additional Codex operations")
                 status, _ = http_json(port, "/v1/pair", body={"code": invitation["code"], "deviceName": "Replay test phone"})
                 check(status == 401, "A used invitation could pair a second phone")
 
@@ -210,6 +264,8 @@ def exercise(binary: Path) -> None:
                 command(binary, "revoke-device", device_id, "--config-dir", str(config_root))
                 status, _ = http_json(port, "/v1/snapshot", token=device_token)
                 check(status == 401 and not store.authorized(device_token), "Revoked device credentials still authorized requests")
+                status, _ = http_json(port, "/v1/panes/w1:p1/conversation", token=device_token)
+                check(status == 401, "Revoked device credentials still authorized chat history")
 
                 plain = command(binary, "pair", "--plain", "--config-dir", str(config_root))
                 qr = json.loads(plain)
@@ -227,7 +283,7 @@ def exercise(binary: Path) -> None:
                 check("Scan pairing code" in terminal_qr and any(char in terminal_qr for char in "▀▄█"),
                       "The frozen helper did not render a terminal QR code")
                 check(all(secret not in terminal_qr for secret in seen_secrets), "Terminal QR output exposed existing plaintext credentials")
-                check(methods and set(methods) == {"session.snapshot"}, "The smoke test attempted to mutate a Herdr session")
+                check(methods and set(methods) == {"session.snapshot", "agent.get"}, "The smoke test attempted to mutate a Herdr session")
                 check(stat.S_IMODE(token_file.stat().st_mode) == 0o600 and stat.S_IMODE(registry_file.stat().st_mode) == 0o600,
                       "The smoke test's credential files are not owner-only")
                 registry_text = registry_file.read_text()
@@ -255,7 +311,7 @@ def main() -> int:
         message = str(error) if isinstance(error, SmokeFailure) else f"Unexpected {type(error).__name__}"
         print("Packaged host smoke test failed: " + message, file=sys.stderr)
         return 1
-    print("Packaged host smoke passed: authenticated API, single-use pairing, revocation, frozen QR helpers, and bundled licenses.")
+    print("Packaged host smoke passed: authenticated API, clean Codex chat, single-use pairing, revocation, frozen QR helpers, and bundled licenses.")
     return 0
 
 

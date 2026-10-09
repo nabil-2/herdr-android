@@ -7,12 +7,18 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.herdr.android.data.BridgeException
 import dev.herdr.android.data.ConnectionState
+import dev.herdr.android.data.ChatContent
+import dev.herdr.android.data.ChatDraftStore
+import dev.herdr.android.data.ChatState
+import dev.herdr.android.data.ConversationProtocol
 import dev.herdr.android.data.HerdrClient
 import dev.herdr.android.data.HerdrUiState
 import dev.herdr.android.data.ProfileStore
 import dev.herdr.android.data.PairingClient
 import dev.herdr.android.data.PairingException
 import dev.herdr.android.data.PairingPayload
+import dev.herdr.android.data.Pane
+import dev.herdr.android.data.PaneMode
 import dev.herdr.android.data.Snapshot
 import dev.herdr.android.data.TerminalContent
 import dev.herdr.android.data.TerminalEndedException
@@ -36,6 +42,7 @@ import java.util.UUID
 
 class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     private val profileStore = ProfileStore(application)
+    private val chatDrafts = ChatDraftStore()
     private val mutableState = MutableStateFlow(HerdrUiState())
     val state: StateFlow<HerdrUiState> = mutableState.asStateFlow()
     // An observer is opened only after its screen collects frames. This guarantees the
@@ -47,6 +54,9 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     private var terminalSession = 0L
     private var refreshGeneration = 0L
     private var foreground = false
+    private var paneVisible = true
+    private var chatSession = 0L
+    private var chatWriteSequence = 0L
     private var connectJob: Job? = null
     private var refreshJob: Job? = null
     private var autoRefreshJob: Job? = null
@@ -55,6 +65,9 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     private var createJob: Job? = null
     private var pairingJob: Job? = null
     private var pairingClient: PairingClient? = null
+    private var chatJob: Job? = null
+    private var olderMessagesJob: Job? = null
+    private var chatInputJob: Job? = null
 
     init {
         reloadProfiles()
@@ -81,6 +94,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         try {
             profileStore.remove(id)
             if (state.value.activeProfileId == id) disconnect()
+            chatDrafts.removeProfile(id)
             reloadProfiles()
         } catch (_: Exception) { showError("Could not remove this profile.") }
     }
@@ -163,13 +177,15 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
                 if (generation != currentGeneration) return@launch
                 newClient = HerdrClient(credentials)
                 client = newClient
-                newClient.health() // Every profile authenticates before reading any state.
+                val health = newClient.health() // Every profile authenticates before reading any state.
                 val snapshot = newClient.snapshot()
                 if (generation != currentGeneration) return@launch
+                mutableState.update { it.copy(capabilities = health.capabilities) }
                 updateSnapshot(snapshot)
                 mutableState.update { it.copy(connection = ConnectionState.CONNECTED, error = null) }
                 startAutoRefresh()
                 restartObservation()
+                restartChatPolling()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -228,33 +244,173 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     fun selectWorkspace(id: String) {
         val snapshot = state.value.snapshot ?: return
         if (snapshot.workspaces.none { it.id == id }) return
+        stopChatWork()
         mutableState.update {
-            it.copy(workspaceId = id, tabId = snapshot.tabs.firstOrNull { tab -> tab.workspaceId == id }?.id, paneId = null)
+            it.copy(workspaceId = id, tabId = snapshot.tabs.firstOrNull { tab -> tab.workspaceId == id }?.id, paneId = null, chat = ChatContent())
         }
         restartObservation()
     }
 
     fun selectTab(id: String) {
         val tab = state.value.snapshot?.tabs?.firstOrNull { it.id == id } ?: return
-        mutableState.update { it.copy(workspaceId = tab.workspaceId, tabId = tab.id, paneId = null) }
+        stopChatWork()
+        mutableState.update { it.copy(workspaceId = tab.workspaceId, tabId = tab.id, paneId = null, chat = ChatContent()) }
         restartObservation()
     }
 
     fun selectPane(id: String?) {
         if (id == null) {
-            mutableState.update { it.copy(paneId = null) }
+            stopChatWork()
+            mutableState.update { it.copy(paneId = null, chat = ChatContent()) }
         } else {
             if (state.value.pairing) {
                 cancelPairing()
                 showError("Pairing was canceled. Generate a new code before trying again.")
             }
             val pane = state.value.snapshot?.panes?.firstOrNull { it.id == id } ?: return
-            mutableState.update { it.copy(workspaceId = pane.workspaceId, tabId = pane.tabId, paneId = pane.id) }
+            if (state.value.paneId != id) {
+                stopChatWork()
+                mutableState.update {
+                    it.copy(workspaceId = pane.workspaceId, tabId = pane.tabId, paneId = pane.id,
+                        paneMode = if (supportsChat(pane)) PaneMode.CHAT else PaneMode.TERMINAL, chat = ChatContent())
+                }
+            }
         }
         restartObservation()
+        restartChatPolling()
     }
 
     fun leaveTerminal() = selectPane(null)
+    fun leavePane() = selectPane(null)
+
+    fun showTerminal() {
+        if (state.value.paneId == null) return
+        stopChatWork()
+        mutableState.update { it.copy(paneMode = PaneMode.TERMINAL) }
+        restartObservation()
+    }
+
+    fun showChat() {
+        if (state.value.paneId == null) return
+        mutableState.update { it.copy(paneMode = PaneMode.CHAT) }
+        restartObservation()
+        restartChatPolling()
+    }
+
+    fun setPaneVisible(value: Boolean) {
+        if (paneVisible == value) return
+        paneVisible = value
+        if (!value) stopChatWork()
+        restartObservation()
+        if (value) restartChatPolling()
+    }
+
+    fun setChatDraft(text: String) {
+        if (state.value.paneId == null || state.value.chat.bindingId == null) return
+        if (text.toByteArray(Charsets.UTF_8).size > ChatDraftStore.MAX_DRAFT_BYTES) {
+            mutableState.update { it.copy(chat = it.chat.copy(error = "This draft is too large. Chat messages can contain up to 32 KiB of text.")) }
+            return
+        }
+        mutableState.update { it.copy(chat = it.chat.copy(draft = text)) }
+        rememberCurrentChat()
+    }
+
+    fun refreshChat() = restartChatPolling()
+
+    fun acknowledgeChatDelivery() {
+        mutableState.update { it.copy(chat = it.chat.copy(deliveryUncertain = false, error = null)) }
+        rememberCurrentChat()
+    }
+
+    fun sendChat() {
+        val current = state.value
+        val paneId = current.paneId ?: return
+        val binding = current.chat.bindingId ?: return
+        val currentClient = client ?: return
+        if (!ensureNetworkPermission()) return
+        if (!foreground || !paneVisible || current.paneMode != PaneMode.CHAT ||
+            current.connection != ConnectionState.CONNECTED || current.chat.sending || current.chat.deliveryUncertain || !current.chat.canSend
+        ) return
+        val text = current.chat.draft
+        if (text.isBlank()) return
+        try { ConversationProtocol.input(binding, text) }
+        catch (error: IllegalArgumentException) {
+            mutableState.update { it.copy(chat = it.chat.copy(error = error.message ?: "Check the message before sending.")) }
+            return
+        }
+        val currentGeneration = generation
+        val writeSequence = ++chatWriteSequence
+        mutableState.update { it.copy(chat = it.chat.copy(sending = true, error = null)) }
+        // A snapshot can clear the selection before cancellation handles the write.
+        // Record possible delivery while the original profile/pane/binding is known.
+        rememberCurrentChat()
+        chatInputJob = viewModelScope.launch {
+            try {
+                val warning = currentClient.sendMessage(paneId, binding, text)
+                if (chatTargetMatches(currentGeneration, paneId, binding) && chatWriteSequence == writeSequence) {
+                    mutableState.update { it.copy(chat = ChatState.acknowledged(it.chat, binding, text, warning)) }
+                    rememberCurrentChat()
+                    restartChatPolling()
+                }
+            } catch (cancelled: CancellationException) {
+                if (chatTargetMatches(currentGeneration, paneId, binding) && chatWriteSequence == writeSequence) mutableState.update {
+                    it.copy(chat = it.chat.copy(deliveryUncertain = true, error = "Message delivery was not confirmed. Check the conversation before sending again."))
+                }
+                throw cancelled
+            } catch (error: Exception) {
+                if (chatTargetMatches(currentGeneration, paneId, binding) && chatWriteSequence == writeSequence) mutableState.update {
+                    val uncertain = error !is BridgeException || error.statusCode !in listOf(400, 401, 403, 404, 409, 413, 422)
+                    it.copy(chat = it.chat.copy(canSend = false, deliveryUncertain = uncertain,
+                        error = "${readableError(error)} Message was not retried${if (uncertain) "; check the conversation before sending again" else ""}."))
+                }
+            } finally {
+                if (chatTargetMatches(currentGeneration, paneId, binding) && chatWriteSequence == writeSequence) {
+                    mutableState.update { it.copy(chat = it.chat.copy(sending = false)) }
+                    rememberCurrentChat()
+                }
+            }
+        }
+    }
+
+    fun loadOlderMessages() {
+        val current = state.value
+        val paneId = current.paneId ?: return
+        val binding = current.chat.bindingId ?: return
+        val revision = current.chat.revision ?: return
+        var cursor = current.chat.olderCursor ?: return
+        val currentClient = client ?: return
+        if (!ensureNetworkPermission()) return
+        if (!foreground || !paneVisible || current.paneMode != PaneMode.CHAT || current.chat.loadingOlder) return
+        val currentGeneration = generation
+        val session = chatSession
+        mutableState.update { it.copy(chat = it.chat.copy(loadingOlder = true, error = null)) }
+        olderMessagesJob = viewModelScope.launch {
+            try {
+                // A new revision rebases the server's cursor. Skip already loaded overlap
+                // while retaining stable message IDs and the UI's existing scroll anchor.
+                repeat(20) {
+                    val page = currentClient.conversation(paneId, cursor = cursor)
+                    if (!chatTargetMatches(currentGeneration, paneId, binding) || chatSession != session) return@launch
+                    if (state.value.chat.revision != revision) throw IllegalArgumentException("The conversation changed. Load older messages again.")
+                    val knownIds = state.value.chat.messages.map { message -> message.id }.toSet()
+                    val containsOlder = page.messages.any { message -> message.id !in knownIds }
+                    mutableState.update { it.copy(chat = ChatState.older(it.chat, page)) }
+                    val next = page.olderCursor
+                    if (containsOlder || next == null || next == cursor) return@launch
+                    cursor = next
+                    mutableState.update { it.copy(chat = it.chat.copy(loadingOlder = true)) }
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (chatTargetMatches(currentGeneration, paneId, binding) && chatSession == session) {
+                    mutableState.update { it.copy(chat = it.chat.copy(error = readableError(error))) }
+                    if (error is BridgeException && error.statusCode == 409) restartChatPolling(resetRevision = true)
+                }
+            } finally {
+                if (chatTargetMatches(currentGeneration, paneId, binding) && chatSession == session) mutableState.update { it.copy(chat = it.chat.copy(loadingOlder = false)) }
+            }
+        }
+    }
 
     fun sendText(text: String, enter: Boolean = true) = sendInput(text, if (enter) listOf("enter") else emptyList())
     fun sendKeys(vararg keys: String) = sendInput(null, keys.toList())
@@ -264,7 +420,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         val paneId = currentState.paneId ?: return
         val currentClient = client ?: return
         if (!ensureNetworkPermission()) return
-        if (currentState.connection != ConnectionState.CONNECTED || currentState.sending) return
+        if (currentState.connection != ConnectionState.CONNECTED || currentState.sending || currentState.paneMode != PaneMode.TERMINAL) return
         if (currentState.snapshot?.panes?.none { it.id == paneId } != false) {
             showError("The selected pane is no longer available. Refresh before sending.")
             return
@@ -324,14 +480,17 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             autoRefreshJob?.cancel()
             refreshJob?.cancel()
+            stopChatWork()
         }
         restartObservation()
+        if (value) restartChatPolling()
     }
 
     fun clearError() = mutableState.update { it.copy(error = null) }
 
     private fun updateSnapshot(snapshot: Snapshot) {
         val previousPaneId = state.value.paneId
+        val previousAvailability = state.value.snapshot?.panes?.firstOrNull { it.id == previousPaneId }?.conversation
         mutableState.update { old ->
             val workspaceId = old.workspaceId?.takeIf { id -> snapshot.workspaces.any { it.id == id } }
                 ?: snapshot.workspaces.firstOrNull()?.id
@@ -340,7 +499,14 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
             val paneId = old.paneId?.takeIf { id -> snapshot.panes.any { it.id == id && it.tabId == tabId } }
             old.copy(snapshot = snapshot, workspaceId = workspaceId, tabId = tabId, paneId = paneId)
         }
-        if (state.value.paneId != previousPaneId) restartObservation()
+        if (state.value.paneId != previousPaneId) {
+            stopChatWork()
+            mutableState.update { it.copy(chat = ChatContent()) }
+            restartObservation()
+            restartChatPolling()
+        } else if (snapshot.panes.firstOrNull { it.id == previousPaneId }?.conversation != previousAvailability) {
+            restartChatPolling()
+        }
     }
 
     private fun startAutoRefresh() {
@@ -362,7 +528,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         val paneId = state.value.paneId ?: return
         val currentClient = client ?: return
         if (!ensureNetworkPermission()) return
-        if (!foreground || state.value.connection != ConnectionState.CONNECTED || mutableTerminalFrames.subscriptionCount.value == 0) return
+        if (!foreground || !paneVisible || state.value.paneMode != PaneMode.TERMINAL || state.value.connection != ConnectionState.CONNECTED || mutableTerminalFrames.subscriptionCount.value == 0) return
         val currentGeneration = generation
         terminalJob = viewModelScope.launch {
             var attempts = 0
@@ -399,9 +565,104 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun supportsChat(pane: Pane): Boolean = ChatState.supportsPaneChat(pane, state.value.capabilities)
+
+    private fun chatTargetMatches(currentGeneration: Long, paneId: String, binding: String): Boolean =
+        generation == currentGeneration && state.value.paneId == paneId && state.value.chat.bindingId == binding
+
+    private fun stopChatWork() {
+        chatSession++
+        chatWriteSequence++
+        val pendingWrite = chatInputJob?.isActive == true
+        listOf(chatJob, olderMessagesJob, chatInputJob).forEach { it?.cancel() }
+        chatJob = null
+        olderMessagesJob = null
+        chatInputJob = null
+        mutableState.update {
+            it.copy(chat = it.chat.copy(loading = false, refreshing = false, loadingOlder = false, sending = false, canSend = false,
+                deliveryUncertain = pendingWrite || it.chat.deliveryUncertain,
+                error = if (pendingWrite) "Message delivery was not confirmed. Check the conversation before sending again." else it.chat.error))
+        }
+        rememberCurrentChat()
+    }
+
+    private fun rememberCurrentChat() {
+        val current = state.value
+        val profileId = current.activeProfileId ?: return
+        val paneId = current.paneId ?: return
+        chatDrafts.remember(profileId, paneId, current.chat)
+    }
+
+    private fun restartChatPolling(resetRevision: Boolean = false) {
+        chatJob?.cancel()
+        olderMessagesJob?.cancel()
+        chatJob = null
+        olderMessagesJob = null
+        val session = ++chatSession
+        mutableState.update {
+            it.copy(chat = it.chat.copy(loading = false, refreshing = false, loadingOlder = false,
+                revision = if (resetRevision) null else it.chat.revision, canSend = false))
+        }
+        val current = state.value
+        val paneId = current.paneId ?: return
+        if (current.paneMode != PaneMode.CHAT) return
+        val pane = current.snapshot?.panes?.firstOrNull { it.id == paneId } ?: return
+        if (!supportsChat(pane)) {
+            val reason = when {
+                "codex-chat" !in current.capabilities -> "This host companion does not support native Codex chat. Use Terminal or update the companion."
+                pane.conversation?.provider != "codex" -> "Native chat is available for confirmed Codex conversations. Use Terminal for this pane."
+                else -> pane.conversation.reason ?: "This Codex conversation is unavailable. Use Terminal to inspect it."
+            }
+            mutableState.update { it.copy(chat = it.chat.copy(error = reason, canSend = false)) }
+            return
+        }
+        val currentClient = client ?: return
+        if (!foreground || !paneVisible || current.connection != ConnectionState.CONNECTED || !ensureNetworkPermission()) return
+        val currentGeneration = generation
+        chatJob = viewModelScope.launch {
+            var failures = 0
+            while (foreground && paneVisible && chatSession == session && generation == currentGeneration) {
+                try {
+                    if (!ensureNetworkPermission()) return@launch
+                    mutableState.update { it.copy(chat = it.chat.copy(loading = it.chat.bindingId == null, refreshing = true)) }
+                    var page = currentClient.conversation(paneId, revision = state.value.chat.revision)
+                    if (chatSession != session || generation != currentGeneration || state.value.paneId != paneId) return@launch
+                    if (ChatState.requiresFullPage(state.value.chat, page)) {
+                        page = currentClient.conversation(paneId)
+                    }
+                    if (chatSession != session || generation != currentGeneration || state.value.paneId != paneId) return@launch
+                    val previousBinding = state.value.chat.bindingId
+                    if (previousBinding != page.binding) rememberCurrentChat()
+                    mutableState.update {
+                        val updated = ChatState.latest(it.chat, page)
+                        val restored = if (previousBinding != page.binding && it.activeProfileId != null) {
+                            chatDrafts.restore(it.activeProfileId, paneId, updated)
+                        } else updated
+                        it.copy(chat = restored)
+                    }
+                    if (previousBinding != null && previousBinding != page.binding) {
+                        chatWriteSequence++
+                        chatInputJob?.cancel()
+                        chatInputJob = null
+                    }
+                    failures = 0
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    if (chatSession != session || generation != currentGeneration || state.value.paneId != paneId) return@launch
+                    mutableState.update { it.copy(chat = it.chat.copy(loading = false, refreshing = false, canSend = false,
+                        error = if (it.chat.deliveryUncertain) it.chat.error else readableError(error))) }
+                    if (error is BridgeException && error.statusCode in listOf(401, 403, 404)) return@launch
+                    failures++
+                }
+                delay(if (failures == 0) 1_000 else CHAT_READ_RETRY_DELAYS[(failures - 1).coerceAtMost(CHAT_READ_RETRY_DELAYS.lastIndex)])
+            }
+        }
+    }
+
     private fun releaseConnection() {
         generation++
         terminalSession++
+        stopChatWork()
         listOf(connectJob, refreshJob, autoRefreshJob, terminalJob, inputJob, createJob, pairingJob).forEach { it?.cancel() }
         connectJob = null
         refreshJob = null
@@ -436,5 +697,6 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         const val LOCAL_NETWORK_PERMISSION = "android.permission.ACCESS_LOCAL_NETWORK"
         const val MAX_OBSERVER_ATTEMPTS = 4
         val OBSERVER_RETRY_DELAYS = longArrayOf(1_000, 2_000, 4_000)
+        val CHAT_READ_RETRY_DELAYS = longArrayOf(1_000, 2_000, 4_000, 8_000)
     }
 }

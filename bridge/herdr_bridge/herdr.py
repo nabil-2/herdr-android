@@ -57,7 +57,7 @@ class HerdrClient:
                 if not isinstance(response, dict) or response.get("id") != request_id:
                     raise BridgeError(503, "Herdr returned an incompatible response; check state before retrying any input")
                 if "error" in response:
-                    raise upstream_error(response["error"])
+                    raise upstream_error(response["error"], prompt=method == "agent.prompt")
                 result = response.get("result")
                 if not isinstance(result, dict):
                     raise BridgeError(503, "Herdr returned an incompatible response; check state before retrying any input")
@@ -80,6 +80,20 @@ class HerdrClient:
         if not isinstance(snapshot, dict):
             raise BridgeError(503, "Herdr returned an incompatible snapshot")
         return normalize_snapshot(snapshot)
+
+    async def agent(self, pane_id: str) -> dict:
+        validate_pane_id(pane_id)
+        result = await self.call("agent.get", {"target": pane_id})
+        agent = result.get("agent")
+        if not isinstance(agent, dict) or agent.get("pane_id") != pane_id:
+            raise BridgeError(503, "Herdr returned incompatible agent metadata; use Terminal")
+        return agent
+
+    async def prompt(self, pane_id: str, text: str) -> None:
+        validate_pane_id(pane_id)
+        result = await self.call("agent.prompt", {"target": pane_id, "text": text})
+        if result.get("type") != "agent_prompted":
+            raise BridgeError(503, "Herdr could not confirm the message; inspect Terminal before retrying")
 
     async def send_input(self, pane_id: str, text: str, keys: list[str]) -> None:
         validate_pane_id(pane_id)
@@ -121,7 +135,7 @@ class HerdrClient:
             raise BridgeError(503, "Herdr terminal observer could not start; check the installed CLI") from exc
 
 
-def upstream_error(error: object) -> BridgeError:
+def upstream_error(error: object, *, prompt: bool = False) -> BridgeError:
     # Upstream error text may contain user input: expose only controlled messages.
     code = error.get("code", "") if isinstance(error, dict) else ""
     if code in {"pane_not_found", "workspace_not_found", "tab_not_found", "target_not_found", "agent_not_found", "pane_not_running", "pane_input_disabled"}:
@@ -130,6 +144,14 @@ def upstream_error(error: object) -> BridgeError:
         return BridgeError(400, "Herdr rejected the input or working directory; check the values")
     if code in {"unknown_method", "method_not_found", "unsupported_method"}:
         return BridgeError(503, "Herdr does not support this operation; install a compatible version")
+    if prompt:
+        if code in {"agent_blocked", "agent_not_ready", "ambiguous_agent_target"}:
+            return BridgeError(409, "The selected agent cannot accept a prompt; inspect Terminal before sending")
+        if code == "empty_agent_prompt":
+            return BridgeError(400, "Enter a nonempty agent message")
+        # Queue/PTY failures can occur after part of the prompt reached the agent.
+        # A conflict would incorrectly tell the phone that delivery was rejected.
+        return BridgeError(503, "Message delivery was not confirmed; inspect the conversation or Terminal before sending again")
     return BridgeError(409, "Herdr rejected the operation; refresh the workspace before retrying")
 
 
@@ -145,6 +167,12 @@ def normalize_snapshot(snapshot: dict) -> dict:
                 "agent": pane.get("display_agent") or pane.get("agent"),
                 "status": status if status in {"idle", "working", "blocked", "done", "unknown"} else "unknown",
             })
+            if pane.get("agent") == "codex":
+                available = canonical_codex_session(pane) is not None
+                panes[-1]["conversation"] = {
+                    "provider": "codex", "available": available,
+                    "reason": None if available else "Codex has not reported a saved session; use Terminal",
+                }
         workspaces = []
         for workspace in snapshot["workspaces"]:
             candidates = [pane for pane in panes if pane["workspaceId"] == workspace["workspace_id"]]
@@ -154,6 +182,22 @@ def normalize_snapshot(snapshot: dict) -> dict:
         return {"herdrVersion": snapshot["version"], "workspaces": workspaces, "tabs": tabs, "panes": panes}
     except (KeyError, TypeError, AttributeError) as exc:
         raise BridgeError(503, "Herdr returned an incompatible snapshot") from exc
+
+
+def canonical_codex_session(agent: dict) -> str | None:
+    """Use only the official integration's explicit native ID, never cwd/title."""
+    session = agent.get("agent_session")
+    if agent.get("agent") != "codex" or not isinstance(session, dict):
+        return None
+    if (session.get("source"), session.get("agent"), session.get("kind")) != ("herdr:codex", "codex", "id"):
+        return None
+    value = session.get("value")
+    if not isinstance(value, str) or len(value) != 36:
+        return None
+    try:
+        return value if str(uuid.UUID(value)) == value else None
+    except ValueError:
+        return None
 
 
 def validate_terminal_frame(line: bytes) -> str:

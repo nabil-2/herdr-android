@@ -98,6 +98,16 @@ def read_config(path: Path) -> dict:
             raise ValueError("listen")
         if not all(Path(value[key]).is_absolute() for key in ("socket", "herdrBin", "tokenFile", "registryFile")):
             raise ValueError("path")
+        for field in ("codexBin", "codexHome"):
+            candidate = value.get(field)
+            if candidate is not None and (not isinstance(candidate, str) or not candidate or len(candidate) > 4096
+                                          or any(ord(c) < 32 for c in candidate) or not Path(candidate).is_absolute()):
+                raise ValueError("codex path")
+        search_path = value.get("codexPath")
+        if search_path is not None and (not isinstance(search_path, str) or len(search_path) > 8192
+                                        or any(ord(c) < 32 for c in search_path)
+                                        or any(not Path(part).is_absolute() for part in search_path.split(os.pathsep))):
+            raise ValueError("codex search path")
         validate_url(value["url"])
         return value
     except (OSError, UnicodeError, ValueError, KeyError) as error:
@@ -132,6 +142,28 @@ def find_herdr(explicit: str | None = None) -> str:
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise SetupError("Install Herdr first: https://herdr.dev/docs/install/")
     return str(executable)
+
+
+def codex_settings(explicit: str | None = None, home: Path | None = None) -> dict:
+    """Discover the optional chat reader without starting Codex or requiring it."""
+    search = os.environ.get("PATH", os.defpath)
+    # Services often have a smaller PATH than the shell that installed Codex.
+    # Keep only absolute entries: a background service must not execute from its cwd.
+    search = os.pathsep.join(part for part in search.split(os.pathsep)
+                             if part and Path(part).is_absolute() and not any(ord(c) < 32 for c in part))
+    candidate = explicit or shutil.which("codex", path=search) or str(Path.home() / ".local/bin/codex")
+    candidate = str(Path(candidate).expanduser())
+    executable = Path(shutil.which(candidate, path=search) or candidate).absolute()
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        if explicit:
+            raise SetupError("The specified Codex executable is unavailable. Check --codex-bin.")
+        return {}
+    selected_home = (home or Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))).expanduser().absolute()
+    if any(ord(c) < 32 for c in str(executable) + str(selected_home)) or max(len(str(executable)), len(str(selected_home))) > 4096:
+        raise SetupError("Codex paths must be absolute paths without control characters.")
+    if len(search) > 8192:
+        raise SetupError("The executable search path is too long for background setup.")
+    return {"codexBin": str(executable), "codexHome": str(selected_home), "codexPath": search or os.defpath}
 
 
 def choose(items: list[dict], field: str, description: str) -> dict:
@@ -367,7 +399,7 @@ def wait_healthy(config: dict, timeout: float = 20) -> None:
 
 
 def setup(*, session: str | None = None, socket_path: Path | None = None, herdr_bin: str | None = None,
-          config_root: Path | None = None) -> None:
+          config_root: Path | None = None, codex_bin: str | None = None, codex_home: Path | None = None) -> None:
     executable = find_herdr(herdr_bin)
     name, selected_socket = select_session(executable, session, socket_path)
     tailscale, dns_name = tailscale_state()
@@ -376,6 +408,19 @@ def setup(*, session: str | None = None, socket_path: Path | None = None, herdr_
     private_directory(root)
     config_path = root / "setup.json"
     previous = read_config(config_path) if config_path.exists() else None
+    chat = codex_settings(codex_bin, codex_home)
+    if previous:
+        # Preserve an advanced custom home when upgrading from an installed companion.
+        if codex_home is None and "CODEX_HOME" not in os.environ and previous.get("codexHome"):
+            chat["codexHome"] = previous["codexHome"]
+        if codex_bin is None and previous.get("codexBin"):
+            prior_executable = Path(previous["codexBin"])
+            if prior_executable.is_file() and os.access(prior_executable, os.X_OK):
+                chat["codexBin"] = previous["codexBin"]
+                if previous.get("codexPath"):
+                    chat["codexPath"] = previous["codexPath"]
+        if not chat.get("codexBin") and previous.get("codexBin"):
+            chat.update({key: previous[key] for key in ("codexBin", "codexHome", "codexPath") if key in previous})
     port = previous["port"] if previous else free_port()
     proxy = f"http://127.0.0.1:{port}"
     try:
@@ -389,6 +434,7 @@ def setup(*, session: str | None = None, socket_path: Path | None = None, herdr_
               "tokenFile": str(token_path.absolute()), "registryFile": str((root / "devices.json").absolute()),
               "host": "127.0.0.1", "port": port, "httpsPort": https_port,
               "url": f"https://{dns_name}:{https_port}/", "name": (socket.gethostname() + (" / " + name if name != "default" else ""))[:100]}
+    config.update(chat)
     write_private(config_path, (json.dumps(config) + "\n").encode())
     print(f"Preparing phone access to Herdr session {name}…")
     start_service(command_prefix(), config_path.absolute(), instance)

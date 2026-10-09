@@ -8,6 +8,8 @@ Herdr Pocket is licensed under Apache License 2.0. Herdr and Tailscale are separ
 | libvterm (embedded by ConnectBot Terminal) | [libvterm](https://www.leonerd.org.uk/code/libvterm/) | MIT |
 | AndroidX, Jetpack Compose, CameraX | [AndroidX](https://github.com/androidx/androidx) | [Apache 2.0](https://github.com/androidx/androidx/blob/androidx-main/LICENSE.txt) |
 | ZXing Core (offline QR decoding) | [zxing/zxing](https://github.com/zxing/zxing) | [Apache 2.0](https://github.com/zxing/zxing/blob/master/LICENSE) |
+| Multiplatform Markdown Renderer | [mikepenz/multiplatform-markdown-renderer](https://github.com/mikepenz/multiplatform-markdown-renderer) | Apache 2.0, with the included Erik Hellman MarkdownComposer MIT notice |
+| JetBrains Markdown parser | [JetBrains/markdown](https://github.com/JetBrains/markdown) | Apache 2.0 |
 | Kotlin, kotlinx.coroutines, kotlinx.serialization | [JetBrains/Kotlin](https://github.com/JetBrains/kotlin) | Apache 2.0 |
 | OkHttp and Okio | [Square/OkHttp](https://github.com/square/okhttp) | Apache 2.0 |
 | FastAPI | [fastapi/fastapi](https://github.com/fastapi/fastapi) | MIT |

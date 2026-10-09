@@ -17,7 +17,11 @@ data class Pane(
     val cwd: String,
     val agent: String? = null,
     val status: String = "unknown",
+    val conversation: ConversationAvailability? = null,
 )
+
+@Serializable
+data class ConversationAvailability(val provider: String, val available: Boolean, val reason: String? = null)
 
 @Serializable
 data class Snapshot(
@@ -28,7 +32,54 @@ data class Snapshot(
 )
 
 @Serializable
-data class Health(val service: String, val protocol: Int, val herdrVersion: String = "")
+data class Health(
+    val service: String,
+    val protocol: Int,
+    val herdrVersion: String = "",
+    val capabilities: List<String> = emptyList(),
+)
+
+enum class PaneMode { CHAT, TERMINAL }
+
+@Serializable
+data class ChatMessage(val id: String, val role: String, val text: String, val phase: String? = null)
+
+@Serializable
+internal data class ConversationPage(
+    val binding: String,
+    val revision: String,
+    val historyEpoch: String,
+    val messages: List<ChatMessage>,
+    val olderCursor: String? = null,
+    val unchanged: Boolean,
+    val canSend: Boolean,
+    val status: String,
+    val warning: String? = null,
+)
+
+@Serializable
+internal data class ChatInput(val binding: String, val text: String)
+
+data class ChatContent(
+    val bindingId: String? = null,
+    val revision: String? = null,
+    val historyEpoch: String? = null,
+    val messages: List<ChatMessage> = emptyList(),
+    val olderCursor: String? = null,
+    val loading: Boolean = false,
+    val refreshing: Boolean = false,
+    val loadingOlder: Boolean = false,
+    val canSend: Boolean = false,
+    val status: String = "unknown",
+    val warning: String? = null,
+    val error: String? = null,
+    val sending: Boolean = false,
+    val draft: String = "",
+    val ackRevision: Long = 0,
+    val deliveryUncertain: Boolean = false,
+) {
+    override fun toString(): String = "ChatContent(messages=${messages.size}, loading=$loading, sending=$sending)"
+}
 
 /** Public profile metadata deliberately excludes credentials. */
 data class ServerProfile(val id: String, val name: String, val baseUrl: String, val hasToken: Boolean = true)
@@ -69,6 +120,9 @@ data class HerdrUiState(
     val workspaceId: String? = null,
     val tabId: String? = null,
     val paneId: String? = null,
+    val capabilities: List<String> = emptyList(),
+    val paneMode: PaneMode = PaneMode.TERMINAL,
+    val chat: ChatContent = ChatContent(),
     val terminal: TerminalContent = TerminalContent(),
     val error: String? = null,
     val refreshing: Boolean = false,

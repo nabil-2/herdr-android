@@ -9,6 +9,8 @@ The app uses Kotlin, Jetpack Compose, and ConnectBot's native libvterm terminal 
 - Scan or paste a pairing invitation, review the host, and explicitly confirm pairing. Each phone receives its own revocable credential, encrypted locally with Android Keystore and excluded from backups.
 - Save multiple server profiles and switch between them.
 - Browse workspaces, tabs, agent states, and shell panes, with agents needing input grouped together. Status refreshes while the app is in the foreground.
+- Open supported Codex panes in native chat: user messages and agent replies, selectable Markdown and code, older conversation history, and a multiline reply box. Commands, tool results, reasoning, and injected instructions stay out of the conversation.
+- Open the terminal from chat to inspect activity or answer an approval prompt. The desktop keeps control of the same agent session.
 - Watch live ANSI terminal output, including colors, cursor movement, and agent terminal interfaces.
 - Send literal text with optional Enter, or use the Enter, Escape, Tab, arrow and Ctrl+C controls. Typing a draft does not send it. Failed sends retain the draft and are never replayed automatically.
 - Create a workspace on the host, then launch an agent from its shell.
@@ -17,6 +19,7 @@ The app uses Kotlin, Jetpack Compose, and ConnectBot's native libvterm terminal 
 Requires Android 8.0+ (API 26), a running Herdr session on Linux or macOS, and Tailscale installed and signed into the same tailnet on both devices. The host companion runs as the Unix user who owns the Herdr session. The current integration targets Herdr 0.9.3.
 
 <p>
+  <img src="docs/screenshots/chat.png" width="240" alt="Native Codex conversation with selectable Markdown and code">
   <img src="docs/screenshots/pairing.png" width="240" alt="Herdr Pocket host review before confirming QR pairing">
   <img src="docs/screenshots/dashboard.png" width="240" alt="Herdr Pocket workspace dashboard from the live device test">
   <img src="docs/screenshots/terminal.png" width="240" alt="Native Herdr terminal displaying a command executed from the Android app">
@@ -54,7 +57,17 @@ If scanning is inconvenient, run the following on the host and paste the complet
 ~/.local/bin/herdr-pocket pair --plain
 ```
 
-Each code expires after five minutes and pairs one phone. It is exchanged for a separate device credential; you never need to copy the host's permanent owner token. If a code expires or has already been used, generate a new one. After connecting, choose a workspace, tab, and pane to control the same running terminal you use on your desktop.
+Each code expires after five minutes and pairs one phone. It is exchanged for a separate device credential; you never need to copy the host's permanent owner token. If a code expires or has already been used, generate a new one. After connecting, choose a workspace, tab, and pane. Supported Codex sessions open as chat; shell panes and other agents open as terminals.
+
+## Codex chat and upgrades
+
+Install the APK and host installer from the same preview release. To upgrade an existing installation, open the new APK and rerun the matching host installer. Existing phone profiles, device credentials, and the selected host address are preserved; another pairing is unnecessary. Choose the same Herdr session if setup offers a session list.
+
+Chat needs an installed Codex CLI and a session ID reported by Herdr's Codex integration. Setup discovers Codex automatically and saves its executable and home directory for the background service. Codex 0.162.0 is the tested version. An old bridge, missing session ID, unavailable history, or unsupported provider keeps a terminal fallback with an explanation. Existing agents are never restarted by setup. If a session predates Herdr's integration, enable that integration in Herdr before starting a new Codex session.
+
+The phone reads saved conversation messages once per second while chat is visible. This is message refresh, not token-by-token streaming. Codex keeps running in its original pane. Send is enabled when Herdr confirms the agent is ready; a working or blocked agent can be controlled through **Terminal**. Approval menus and interactive questions show a visible attention banner with **Open terminal**. The chat composer never retries a submitted message automatically.
+
+Advanced hosts can select a nonstandard installation with `herdr-pocket setup --codex-bin /absolute/path/to/codex --codex-home /absolute/path/to/codex-home`. The normal setup uses `CODEX_HOME`, or `~/.codex`. The read-only Codex app-server may maintain its local metadata databases; it does not start a new model turn or resume the running thread.
 
 ## Manage phone access
 
@@ -97,6 +110,7 @@ For host checks, install the [source environment](bridge/README.md#install-from-
 ```sh
 bridge/.venv/bin/python -m pytest bridge/tests -q
 HERDR_INTEGRATION=1 bridge/.venv/bin/python -m pytest bridge/tests/test_live_herdr.py -q
+CODEX_INTEGRATION=1 bridge/.venv/bin/python -m pytest bridge/tests/test_live_codex_chat.py -q
 ```
 
 The live integration test creates and cleans up an isolated named Herdr session. It does not send commands to an existing user pane. The [Android device fixture](bridge/README.md#live-android-device-fixture) exercises the app against a real companion and Herdr shell, including host-generated QR decoding and pairing. GitHub Actions builds the APK, runs JVM/lint and host checks, and packages the supported host installers.
@@ -105,7 +119,7 @@ See [protocol](docs/protocol.md) for the app/service interface and [validation](
 
 ## Current limits
 
-Status and terminal observation run while the app is in the foreground; background push notifications are not implemented. Agent prompts and approval menus are controlled through the selected terminal. Remote terminal scrollback and direct SSH connections are not implemented. The host, Tailscale, and Herdr daemon must remain online. Native Windows hosts are not supported because Herdr's terminal observer requires Linux or macOS.
+Status, chat refresh, and terminal observation run while the app is in the foreground; background push notifications are not implemented. Native chat supports Codex text conversations first; other agents, attachments, approval menus, and interactive questions use the selected terminal. Remote terminal scrollback and direct SSH connections are not implemented. The host, Tailscale, and Herdr daemon must remain online. Native Windows hosts are not supported because Herdr's terminal observer requires Linux or macOS.
 
 ## License
 

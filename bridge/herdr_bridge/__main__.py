@@ -30,6 +30,8 @@ def main() -> None:
     parser.add_argument("--token-file", type=Path, default=Path(os.environ.get("HERDR_ANDROID_TOKEN_FILE", default_token_path())))
     parser.add_argument("--socket", type=Path, help="Exact Herdr Unix socket (or HERDR_SOCKET)")
     parser.add_argument("--herdr-bin", help="Installed Herdr CLI executable")
+    parser.add_argument("--codex-bin", help="Installed Codex executable for native chat (automatically discovered)")
+    parser.add_argument("--codex-home", type=Path, help="Codex home for conversation history (or CODEX_HOME)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--session", help="Choose a running/configured named Herdr session")
@@ -37,14 +39,15 @@ def main() -> None:
     parser.add_argument("--registry-file", type=Path, help="Owner-only paired-device registry")
     parser.add_argument("--service-config", type=Path, help="Managed service setup.json (used internally)")
     parser.add_argument("--plain", action="store_true", help="Print pairing JSON instead of a QR code")
-    parser.add_argument("--version", action="version", version="Herdr Pocket 0.2.0")
+    parser.add_argument("--version", action="version", version="Herdr Pocket 0.3.0")
     args = parser.parse_args()
     try:
         if args.command in {"setup", "pair", "devices", "revoke-device", "status"}:
             from .host_setup import SetupError, configured_host, setup, show_pairing, wait_healthy
             root = args.config_dir.expanduser() if args.config_dir else None
             if args.command == "setup":
-                setup(session=args.session, socket_path=args.socket, herdr_bin=args.herdr_bin, config_root=root)
+                setup(session=args.session, socket_path=args.socket, herdr_bin=args.herdr_bin, config_root=root,
+                      codex_bin=args.codex_bin, codex_home=args.codex_home)
                 return
             config = configured_host(root, args.session)
             if args.command == "pair":
@@ -71,16 +74,24 @@ def main() -> None:
         registry_path = args.registry_file.expanduser() if args.registry_file else token_path.parent / "devices.json"
         socket_path = args.socket.expanduser() if args.socket else discover_socket()
         herdr_bin, host, port = args.herdr_bin or "herdr", args.host, args.port
+        from .host_setup import codex_settings
+        chat = codex_settings(args.codex_bin, args.codex_home)
         if args.service_config:
             from .host_setup import read_config
             config = read_config(args.service_config.expanduser())
             token_path, registry_path = Path(config["tokenFile"]), Path(config["registryFile"])
             socket_path, herdr_bin, host, port = Path(config["socket"]), config["herdrBin"], config["host"], config["port"]
+            for field in ("codexBin", "codexHome", "codexPath"):
+                if field in config:
+                    chat[field] = config[field]
         token = read_token(token_path)
         if not 1 <= port <= 65535:
             raise ValueError("Port must be 1–65535")
         client = HerdrClient(socket_path, executable=herdr_bin)
-        uvicorn.run(create_app(client, token, PairingStore(registry_path)), host=host, port=port, access_log=False)
+        uvicorn.run(create_app(client, token, PairingStore(registry_path),
+                               codex_executable=chat.get("codexBin"),
+                               codex_home=Path(chat["codexHome"]) if chat.get("codexHome") else None,
+                               codex_path=chat.get("codexPath")), host=host, port=port, access_log=False)
     except (OSError, ValueError) as exc:
         # Do not print exceptions that could embed submitted credentials.
         if isinstance(exc, FileNotFoundError):

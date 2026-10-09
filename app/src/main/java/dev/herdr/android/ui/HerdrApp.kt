@@ -44,12 +44,14 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -71,6 +73,8 @@ import dev.herdr.android.data.ConnectionState
 import dev.herdr.android.data.HerdrUiState
 import dev.herdr.android.HerdrViewModel
 import dev.herdr.android.data.Pane
+import dev.herdr.android.data.PaneMode
+import dev.herdr.android.data.ChatState
 import dev.herdr.android.data.ServerProfile
 
 @Composable
@@ -116,6 +120,13 @@ fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalR
         }
     }
     val serversVisible = showServers || state.activeProfileId == null
+    var terminalOpenedFromChat by rememberSaveable(state.activeProfileId, state.paneId) { mutableStateOf(false) }
+    val paneVisible = state.paneId != null && !serversVisible && !showPairing
+    val paneStateHolder = rememberSaveableStateHolder()
+    DisposableEffect(viewModel, state.paneId, paneVisible) {
+        viewModel.setPaneVisible(paneVisible)
+        onDispose { viewModel.setPaneVisible(false) }
+    }
     BackHandler(enabled = showServers && state.activeProfileId != null && !showPairing) { showServers = false }
 
     HerdrTheme {
@@ -146,11 +157,30 @@ fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalR
                 onDelete = viewModel::removeProfile,
                 onDismissError = viewModel::clearError,
             )
-            state.paneId != null -> TerminalScreen(
-                state, viewModel,
-                onBack = viewModel::leaveTerminal,
-                onRetry = onTerminalRetry,
-            )
+            state.paneId != null -> paneStateHolder.SaveableStateProvider("pane:${state.activeProfileId}:${state.paneId}:${state.paneMode}") {
+                if (state.paneMode == PaneMode.CHAT) ChatScreen(
+                    state = state,
+                    onBack = viewModel::leavePane,
+                    onTerminal = { terminalOpenedFromChat = true; viewModel.showTerminal() },
+                    onRetry = {
+                        if (state.connection == ConnectionState.CONNECTED) viewModel.refreshChat()
+                        else state.activeProfileId?.let(onConnect)
+                    },
+                    onOlder = viewModel::loadOlderMessages,
+                    onDraftChange = viewModel::setChatDraft,
+                    onSend = viewModel::sendChat,
+                    onAcknowledgeDelivery = viewModel::acknowledgeChatDelivery,
+                ) else TerminalScreen(
+                    state, viewModel,
+                    onBack = {
+                        if (terminalOpenedFromChat) { terminalOpenedFromChat = false; viewModel.showChat() }
+                        else viewModel.leavePane()
+                    },
+                    onRetry = onTerminalRetry,
+                    returnToChat = terminalOpenedFromChat,
+                    fallbackReason = terminalChatReason(state),
+                )
+            }
             else -> DashboardScreen(
                 state = state,
                 onServers = { showServers = true },
@@ -388,11 +418,11 @@ private fun DashboardScreen(
                 }
                 if (needsInput.isNotEmpty()) {
                     item { GroupLabel("Needs your input", "${needsInput.size}", Amber) }
-                    items(needsInput, key = { it.id }) { PaneCard(it, onPane) }
+                    items(needsInput, key = { it.id }) { PaneCard(it, onPane, ChatState.supportsPaneChat(it, state.capabilities)) }
                 }
                 if (otherPanes.isNotEmpty()) {
                     item { GroupLabel("Agents & terminals", "${otherPanes.size}") }
-                    items(otherPanes, key = { it.id }) { PaneCard(it, onPane) }
+                    items(otherPanes, key = { it.id }) { PaneCard(it, onPane, ChatState.supportsPaneChat(it, state.capabilities)) }
                 }
                 if (panes.isEmpty()) item {
                     EmptyPanel("No terminals in this tab", "Open a terminal in Herdr on your computer, or create a new workspace here.")
@@ -418,11 +448,11 @@ private fun GroupLabel(label: String, count: String, color: Color = MaterialThem
 }
 
 @Composable
-private fun PaneCard(pane: Pane, onOpen: (String) -> Unit) {
+private fun PaneCard(pane: Pane, onOpen: (String) -> Unit, chatAvailable: Boolean) {
     OutlinedCard(onClick = { onOpen(pane.id) }, modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
             Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = MaterialTheme.shapes.small, modifier = Modifier.size(44.dp)) {
-                Box(contentAlignment = Alignment.Center) { SymbolIcon(Symbol.TERMINAL) }
+                Box(contentAlignment = Alignment.Center) { SymbolIcon(if (chatAvailable) Symbol.CHAT else Symbol.TERMINAL) }
             }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(pane.title.ifBlank { pane.agent ?: "Terminal" }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -431,9 +461,24 @@ private fun PaneCard(pane: Pane, onOpen: (String) -> Unit) {
                     pane.agent?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1) }
                 }
             }
-            SymbolIcon(Symbol.NEXT, "Open terminal")
+            SymbolIcon(Symbol.NEXT, if (chatAvailable) "Open conversation" else "Open terminal")
         }
     }
+}
+
+internal fun terminalChatReason(state: HerdrUiState): String? {
+    val pane = state.snapshot?.panes?.firstOrNull { it.id == state.paneId } ?: return null
+    val conversation = pane.conversation
+    if (pane.agent.equals("codex", ignoreCase = true) && "codex-chat" !in state.capabilities)
+        return "Update the host companion to use native Codex chat. This session remains available in its terminal."
+    if (conversation?.provider == "codex") {
+        return state.chat.error ?: conversation.reason
+            ?: if (!conversation.available) "This Codex session has no available conversation. Use its terminal." else null
+    }
+    return if (pane.agent.equals("codex", ignoreCase = true))
+        "This server does not offer chat for this Codex session. Use its terminal."
+    else if (pane.agent != null) "Native chat is available for Codex sessions. Use this agent's terminal."
+    else "This pane has a terminal session without a supported Codex conversation."
 }
 
 @Composable

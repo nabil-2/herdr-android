@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 import hmac
 import json
+from pathlib import Path
 from typing import Annotated
 
 import anyio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .herdr import BridgeError, HerdrClient, stop_observer, validate_pane_id, validate_terminal_frame
 from .pairing import PairingError, PairingStore, valid_name
+from .codex import CodexReader, Conversations
 
 MAX_BODY_BYTES = 64 * 1024
 
@@ -142,10 +144,38 @@ class PairRequest(BaseModel):
         return value
 
 
-def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | None = None) -> FastAPI:
+class MessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    binding: str = Field(pattern=r"^[A-Za-z0-9_-]{43}$")
+    text: str = Field(min_length=1, max_length=16384)
+
+    @field_validator("text")
+    @classmethod
+    def literal_message(cls, value: str) -> str:
+        if not value.strip() or len(value.encode("utf-8")) > 32768 or any((ord(c) < 32 and c not in "\n\r\t") or ord(c) == 127 for c in value):
+            raise ValueError("Message must be nonblank literal text within 32 KiB")
+        return value
+
+
+def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | None = None, *,
+               codex_executable: str | None = None, codex_home: Path | None = None,
+               codex_path: str | None = None) -> FastAPI:
     if not 32 <= len(token) <= 4096 or not token.isascii() or any(c.isspace() for c in token):
         raise ValueError("Use a generated bearer token of at least 32 ASCII characters")
-    app = FastAPI(title="Herdr Android Bridge", docs_url=None, redoc_url=None, openapi_url=None)
+    reader = CodexReader(codex_executable, codex_home, codex_path)
+    conversations = Conversations(client, reader)
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            with anyio.CancelScope(shield=True):
+                await reader.close()
+
+    app = FastAPI(title="Herdr Android Bridge", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app.state.codex_reader = reader
+    app.state.conversations = conversations
     app.add_middleware(AuthAndBodyLimit, token=token, pairing_store=pairing_store)
 
     @app.exception_handler(BridgeError)
@@ -169,11 +199,28 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
     @app.get("/v1/health")
     async def health():
         snapshot = await client.snapshot()
-        return {"service": "herdr-android-bridge", "protocol": 1, "herdrVersion": snapshot["herdrVersion"], "pairing": pairing_store is not None}
+        result = {"service": "herdr-android-bridge", "protocol": 1, "herdrVersion": snapshot["herdrVersion"], "pairing": pairing_store is not None}
+        if reader.enabled:
+            result["capabilities"] = ["codex-chat"]
+        return result
 
     @app.get("/v1/snapshot")
     async def snapshot():
-        return await client.snapshot()
+        snapshot = await client.snapshot()
+        if not reader.enabled:
+            for pane in snapshot["panes"]:
+                if "conversation" in pane:
+                    pane["conversation"] = {"provider": "codex", "available": False, "reason": "Codex conversation reader is not configured; use Terminal"}
+        return snapshot
+
+    @app.get("/v1/panes/{pane_id}/conversation")
+    async def conversation(pane_id: str, cursor: Annotated[str | None, Query(max_length=2048)] = None,
+                           revision: Annotated[str | None, Query(max_length=256)] = None):
+        return await conversations.page(pane_id, cursor, revision)
+
+    @app.post("/v1/panes/{pane_id}/messages")
+    async def message(pane_id: str, request: MessageRequest):
+        return await conversations.send(pane_id, request.binding, request.text)
 
     @app.post("/v1/panes/{pane_id}/input")
     async def send_input(pane_id: str, request: InputRequest):

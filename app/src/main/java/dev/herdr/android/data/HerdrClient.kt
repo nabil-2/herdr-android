@@ -58,6 +58,16 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
 
     suspend fun snapshot(): Snapshot = json.decodeFromString(request("GET", listOf("v1", "snapshot")))
 
+    suspend fun conversation(paneId: String, cursor: String? = null, revision: String? = null): ConversationPage {
+        cursor?.let { ConversationProtocol.validateOpaque(it, 2048) }
+        revision?.let { ConversationProtocol.validateOpaque(it, 256) }
+        val query = if (cursor != null) mapOf("cursor" to cursor) else revision?.let { mapOf("revision" to it) }.orEmpty()
+        return ConversationProtocol.decode(request("GET", listOf("v1", "panes", paneId, "conversation"), query = query, maxBytes = 1024L * 1024L))
+    }
+
+    suspend fun sendMessage(paneId: String, binding: String, text: String): String? =
+        ConversationProtocol.acknowledgement(request("POST", listOf("v1", "panes", paneId, "messages"), ConversationProtocol.input(binding, text)))
+
     suspend fun input(paneId: String, text: String?, keys: List<String>) {
         InputValidation.validate(text, keys)
         val body = json.encodeToString(PaneInput(text, keys))
@@ -136,8 +146,15 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
         .header("Authorization", "Bearer ${credentials.token}")
         .header("Accept", "application/json")
 
-    private suspend fun request(method: String, segments: List<String>, body: String? = null): String {
-        val builder = authenticatedRequest(endpoint(segments))
+    private suspend fun request(
+        method: String,
+        segments: List<String>,
+        body: String? = null,
+        query: Map<String, String> = emptyMap(),
+        maxBytes: Long = MAX_HTTP_BYTES,
+    ): String {
+        val url = endpoint(segments).newBuilder().apply { query.forEach { (name, value) -> addQueryParameter(name, value) } }.build()
+        val builder = authenticatedRequest(url)
         if (method == "POST") {
             val delegate = (body ?: "{}").toRequestBody("application/json; charset=utf-8".toMediaType())
             builder.post(object : RequestBody() {
@@ -148,10 +165,10 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
                 override fun writeTo(sink: BufferedSink) = delegate.writeTo(sink)
             })
         }
-        return http.newCall(builder.build()).awaitBody()
+        return http.newCall(builder.build()).awaitBody(maxBytes)
     }
 
-    private suspend fun Call.awaitBody(): String = suspendCancellableCoroutine { continuation ->
+    private suspend fun Call.awaitBody(maxBytes: Long): String = suspendCancellableCoroutine { continuation ->
         continuation.invokeOnCancellation { cancel() }
         enqueue(object : Callback {
             override fun onFailure(call: Call, error: IOException) {
@@ -163,7 +180,7 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
                     response.use {
                         val body = it.body ?: throw IOException("The server returned an empty response.")
                         val source = body.source()
-                        if (source.request(MAX_HTTP_BYTES + 1) && source.buffer.size > MAX_HTTP_BYTES) {
+                        if (source.request(maxBytes + 1) && source.buffer.size > maxBytes) {
                             throw IOException("The server response is too large.")
                         }
                         val text = source.readUtf8()
