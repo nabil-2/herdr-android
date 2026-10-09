@@ -235,6 +235,7 @@ def exercise(binary: Path) -> None:
                 health = wait_ready(process, port, owner_token)
                 check(health.get("herdrVersion") == "0.9.3", "The packaged bridge did not normalize the mock daemon version")
                 check("codex-chat" in health.get("capabilities", []), "The packaged Codex reader was not discovered")
+                check("codex-chat-working-input" in health.get("capabilities", []), "The packaged companion does not advertise working chat updates")
                 check("terminal-input" in health.get("capabilities", []), "The packaged keyboard route was not advertised")
                 check("terminal-history" in health.get("capabilities", []), "The packaged terminal history route was not advertised")
                 status, _ = http_json(port, "/v1/health")

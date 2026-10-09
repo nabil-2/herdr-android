@@ -112,6 +112,50 @@ class NativeChatUiTest {
     }
 
     @Test
+    fun workingConversationAcceptsAnUpdateWhileOtherDeliveryGuardsRemainInPlace() {
+        var chat by mutableStateOf(ChatContent(bindingId = "binding", canSend = true, status = "working"))
+        var sends = 0
+        var capabilities by mutableStateOf(emptyList<String>())
+        compose.setContent {
+            HerdrTheme {
+                ChatScreen(
+                    state = HerdrUiState(connection = ConnectionState.CONNECTED, chat = chat, capabilities = capabilities),
+                    onBack = {}, onTerminal = {}, onRetry = {}, onOlder = {},
+                    onDraftChange = { chat = chat.copy(draft = it) },
+                    onSend = { sends++; chat = chat.copy(sending = true) }, onAcknowledgeDelivery = {},
+                )
+            }
+        }
+        compose.onNodeWithTag("chat-working").assertTextEquals("Working · Send updates this task")
+        compose.onNodeWithTag("send-chat").assertIsNotEnabled()
+        compose.onNodeWithTag("chat-draft").performTextInput("Keep the change small")
+        compose.onNodeWithTag("send-chat").assertIsEnabled().performClick()
+        compose.runOnIdle { assertEquals(1, sends) }
+        compose.onNodeWithTag("send-chat").assertIsNotEnabled()
+        compose.onNodeWithTag("chat-draft").performTextInput(". Keep this follow-up draft")
+        compose.onNodeWithTag("chat-draft").assertTextEquals("Keep the change small. Keep this follow-up draft")
+        compose.runOnIdle { chat = chat.copy(sending = false, deliveryUncertain = true) }
+        compose.onNodeWithTag("send-chat").assertIsNotEnabled()
+        compose.runOnIdle { chat = chat.copy(deliveryUncertain = false, error = "Refresh this conversation.") }
+        compose.onNodeWithTag("send-chat").assertIsNotEnabled()
+        compose.runOnIdle { chat = chat.copy(error = null, loading = true) }
+        compose.onNodeWithTag("send-chat").assertIsNotEnabled()
+        compose.runOnIdle { chat = chat.copy(loading = false, status = "blocked") }
+        compose.onNodeWithTag("send-chat").assertIsNotEnabled()
+        compose.runOnIdle { chat = chat.copy(status = "unknown") }
+        compose.onNodeWithTag("send-chat").assertIsNotEnabled()
+        compose.runOnIdle { chat = chat.copy(status = "working", canSend = false, canSendReason = "This server cannot accept updates while Codex is working.") }
+        compose.onNodeWithTag("send-chat").assertIsNotEnabled()
+        compose.onNodeWithTag("chat-working").assertTextEquals("Working…")
+        compose.onNodeWithTag("chat-send-reason").assertTextEquals("Update the host companion to send while Codex works.")
+        compose.runOnIdle { capabilities = listOf("codex-chat-working-input") }
+        compose.onNodeWithTag("send-chat").assertIsNotEnabled()
+        compose.onNodeWithTag("chat-send-reason").assertTextEquals("This server cannot accept updates while Codex is working.")
+        compose.onNodeWithTag("chat-draft").assertTextEquals("Keep the change small. Keep this follow-up draft")
+        compose.runOnIdle { assertEquals(1, sends) }
+    }
+
+    @Test
     fun transcriptContainsOnlyMessagesAndUserTextStaysLiteral() {
         val chat = ChatContent(bindingId = "binding", messages = listOf(
             ChatMessage("user", "user", "**Literal input**"),

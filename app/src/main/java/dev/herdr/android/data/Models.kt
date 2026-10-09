@@ -87,6 +87,10 @@ data class ChatContent(
     val ackRevision: Long = 0,
     val deliveryUncertain: Boolean = false,
 ) {
+    /** Herdr accepts follow-ups while Codex is working; server readiness stays authoritative. */
+    fun canSubmitMessage(): Boolean = canSend && status in setOf("idle", "done", "working") &&
+        bindingId != null && error == null && !loading && !sending && !deliveryUncertain
+
     override fun toString(): String = "ChatContent(messages=${messages.size}, loading=$loading, sending=$sending)"
 }
 

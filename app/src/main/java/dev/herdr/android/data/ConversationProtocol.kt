@@ -35,7 +35,7 @@ internal object ConversationProtocol {
             require(page.messages.size <= 50 && page.messages.map { it.id }.distinct().size == page.messages.size)
             require(!page.unchanged || page.messages.isEmpty())
             require(page.status in statuses)
-            require(!page.canSend || page.status in setOf("idle", "done"))
+            require(!page.canSend || page.status in setOf("idle", "done", "working"))
             require(page.warning == null || page.warning.length <= 1000)
             require(page.canSendReason == null || page.canSendReason.length <= 1000)
             page.messages.forEach { message ->

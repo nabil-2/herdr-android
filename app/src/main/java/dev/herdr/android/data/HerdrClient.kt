@@ -69,11 +69,11 @@ internal class HerdrClient(
         cursor?.let { ConversationProtocol.validateOpaque(it, 2048) }
         revision?.let { ConversationProtocol.validateOpaque(it, 256) }
         val query = if (cursor != null) mapOf("cursor" to cursor) else revision?.let { mapOf("revision" to it) }.orEmpty()
-        return ConversationProtocol.decode(request("GET", listOf("v1", "panes", paneId, "conversation"), query = query, maxBytes = 1024L * 1024L))
+        return ConversationProtocol.decode(request("GET", listOf("v1", "panes", paneId, "conversation"), query = query, maxBytes = 1024L * 1024L, chatWorkingInput = true))
     }
 
     suspend fun sendMessage(paneId: String, binding: String, text: String): String? =
-        ConversationProtocol.acknowledgement(request("POST", listOf("v1", "panes", paneId, "messages"), ConversationProtocol.input(binding, text)))
+        ConversationProtocol.acknowledgement(request("POST", listOf("v1", "panes", paneId, "messages"), ConversationProtocol.input(binding, text), chatWorkingInput = true))
 
     suspend fun input(paneId: String, text: String?, keys: List<String>) {
         val body = InputValidation.body(text, keys)
@@ -175,9 +175,11 @@ internal class HerdrClient(
         body: String? = null,
         query: Map<String, String> = emptyMap(),
         maxBytes: Long = MAX_HTTP_BYTES,
+        chatWorkingInput: Boolean = false,
     ): String {
         val url = endpoint(segments).newBuilder().apply { query.forEach { (name, value) -> addQueryParameter(name, value) } }.build()
         val builder = authenticatedRequest(url)
+        if (chatWorkingInput) builder.header("X-Herdr-Chat-Working-Input", "1")
         if (method == "POST") {
             val delegate = (body ?: "{}").toRequestBody("application/json; charset=utf-8".toMediaType())
             builder.post(object : RequestBody() {

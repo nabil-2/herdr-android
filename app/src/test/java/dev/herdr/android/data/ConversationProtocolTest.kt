@@ -48,9 +48,22 @@ class ConversationProtocolTest {
             page.replace("\"final_answer\"", "\"tool_output\""),
             page.replace("\"unchanged\":false", "\"unchanged\":\"false\""),
             page.replace("\"canSend\":true", "\"canSend\":\"true\""),
-            page.replace("\"idle\"", "\"working\""),
+            page.replace("\"idle\"", "\"blocked\""),
+            page.replace("\"idle\"", "\"unknown\""),
             page.replace("\"unchanged\":false", "\"unchanged\":true"),
         ).forEach { invalid -> assertThrows(IOException::class.java) { ConversationProtocol.decode(invalid) } }
+    }
+
+    @Test fun `authoritative readiness allows working followups while all delivery guards remain`() {
+        val workingPage = ConversationProtocol.decode(page.replace("\"idle\"", "\"working\""))
+        val working = ChatState.latest(ChatContent(), workingPage)
+        org.junit.Assert.assertTrue(working.canSubmitMessage())
+        listOf(
+            working.copy(canSend = false), working.copy(bindingId = null),
+            working.copy(loading = true), working.copy(sending = true),
+            working.copy(deliveryUncertain = true), working.copy(error = "Check delivery"),
+            working.copy(status = "blocked"), working.copy(status = "unknown"),
+        ).forEach { assertFalse(it.canSubmitMessage()) }
     }
 
     @Test fun `duplicate stable IDs and oversized pages are rejected`() {

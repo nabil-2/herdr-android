@@ -252,17 +252,17 @@ class Conversations:
         return agent, thread_id, binding
 
     @staticmethod
-    def ready(agent: dict) -> bool:
-        return Conversations.send_unavailable_reason(agent) is None
+    def ready(agent: dict, *, allow_working: bool = True) -> bool:
+        return Conversations.send_unavailable_reason(agent, allow_working=allow_working) is None
 
     @staticmethod
-    def send_unavailable_reason(agent: dict) -> str | None:
+    def send_unavailable_reason(agent: dict, *, allow_working: bool = True) -> str | None:
         status = agent.get("agent_status")
-        if status == "working":
-            return "Codex is working. Wait for it to finish before sending another message."
+        if status == "working" and not allow_working:
+            return "Update Herdr Pocket to send while Codex works."
         if status == "blocked":
             return "Codex needs your attention. Open Terminal to answer a question or approve an action."
-        if status not in ("idle", "done"):
+        if status not in ("idle", "done", "working"):
             return "Codex has not reported that it is ready for a message. Check Terminal."
         pending = agent.get("launch_pending", False)
         if pending is True:
@@ -273,9 +273,11 @@ class Conversations:
             return None
         # Herdr 0.9.3 reports interactive_ready only for managed agent.start launches.
         # Manually launched Codex panes omit this false-valued managed-only field.
-        # Their canonical conversation and idle/done status were verified by target();
-        # agent.prompt still checks the live foreground agent before accepting input.
-        if "interactive_ready" not in agent and agent.get("name") is None:
+        # agent.rename only adds a display name; it does not make a launch managed.
+        # Managed Pending/Blocked phases are already rejected by launch_pending.
+        # Their canonical conversation was verified by target(). Herdr's agent.prompt
+        # permits input while working and rechecks the live foreground agent itself.
+        if "interactive_ready" not in agent:
             return None
         return "Codex has not reported interactive readiness. Check Terminal before sending."
 
@@ -307,7 +309,7 @@ class Conversations:
                 break
             self.caches.pop(victim)
 
-    async def page(self, pane_id: str, cursor: str | None = None, revision: str | None = None) -> dict:
+    async def page(self, pane_id: str, cursor: str | None = None, revision: str | None = None, *, allow_working: bool = True) -> dict:
         if not self.reader.enabled:
             raise BridgeError(503, "Codex conversation reader is not configured; use Terminal")
         agent, thread_id, binding = await self.target(pane_id)
@@ -346,7 +348,7 @@ class Conversations:
             end = self._end(cursor, binding, cache.revision, len(cache.messages)) if cursor else len(cache.messages)
             start = max(0, end - PAGE_SIZE)
             unchanged = not cursor and revision == cache.revision
-            send_unavailable_reason = self.send_unavailable_reason(agent)
+            send_unavailable_reason = self.send_unavailable_reason(agent, allow_working=allow_working)
             response = {"binding": binding, "revision": cache.revision, "historyEpoch": cache.history_epoch,
                         "messages": cache.messages[start:end],
                         "olderCursor": self._cursor(binding, cache.revision, start) if start else None,
@@ -365,7 +367,7 @@ class Conversations:
                 response["messages"] = []
             return response
 
-    async def send(self, pane_id: str, binding: str, text: str) -> dict:
+    async def send(self, pane_id: str, binding: str, text: str, *, allow_working: bool = True) -> dict:
         if not self.reader.enabled:
             raise BridgeError(503, "Codex conversation reader is not configured; use Terminal")
         async with self.send_lock:
@@ -375,7 +377,7 @@ class Conversations:
             cache = self.caches.get(binding)
             if cache is None or cache.error is not None:
                 raise BridgeError(409, "Read the saved conversation successfully before sending")
-            send_unavailable_reason = self.send_unavailable_reason(agent)
+            send_unavailable_reason = self.send_unavailable_reason(agent, allow_working=allow_working)
             if send_unavailable_reason is not None:
                 raise BridgeError(409, send_unavailable_reason)
             await self.client.prompt(pane_id, text)

@@ -171,7 +171,7 @@ async def chat(socket_server, codex_stub):
 
 async def test_chat_capability_and_metadata_do_not_disclose_native_session(chat):
     client, _, _, _, _, _, _, _, _ = chat
-    assert (await client.get("/v1/health")).json()["capabilities"] == ["terminal-input", "terminal-history", "codex-chat"]
+    assert (await client.get("/v1/health")).json()["capabilities"] == ["terminal-input", "terminal-history", "codex-chat", "codex-chat-working-input"]
     response = await client.get("/v1/snapshot")
     assert response.json()["panes"][1]["conversation"] == {"provider": "codex", "available": True, "reason": None}
     assert THREAD_ID not in response.text and "term-test-generation" not in response.text
@@ -305,9 +305,10 @@ async def test_unbound_or_noncanonical_panes_never_start_reader(chat, mutation):
     assert "/private" not in response.text
 
 
-@pytest.mark.parametrize("state,ready,pending", [("working", True, False), ("blocked", True, False), ("unknown", True, False), ("idle", False, False), ("idle", True, True)])
-async def test_busy_blocked_or_unready_targets_cannot_receive_chat_messages(chat, state, ready, pending):
+@pytest.mark.parametrize("state,ready,pending", [("blocked", True, False), ("unknown", True, False), ("idle", False, False), ("idle", True, True), ("working", False, False), ("working", True, True)])
+async def test_blocked_or_unready_targets_cannot_receive_chat_messages(chat, state, ready, pending):
     client, _, agent, requests, _, _, _, _, _ = chat
+    client.headers["X-Herdr-Chat-Working-Input"] = "1"
     page = (await client.get("/v1/panes/w1:p2/conversation")).json()
     agent.update(agent_status=state, interactive_ready=ready, launch_pending=pending)
     response = await client.post("/v1/panes/w1:p2/messages", json={"binding": page["binding"], "text": "Do not send"})
@@ -318,12 +319,15 @@ async def test_busy_blocked_or_unready_targets_cannot_receive_chat_messages(chat
     assert isinstance(unavailable_page["canSendReason"], str) and unavailable_page["canSendReason"]
 
 
-@pytest.mark.parametrize("status", ["idle", "done"])
-async def test_manually_launched_codex_omits_managed_flags_and_can_receive_chat_messages(chat, status):
+@pytest.mark.parametrize("status", ["idle", "done", "working"])
+@pytest.mark.parametrize("named", [False, True], ids=["unnamed", "manually-renamed"])
+async def test_manually_launched_codex_omits_managed_flags_and_can_receive_chat_messages(chat, status, named):
     client, _, agent, requests, _, _, _, _, _ = chat
+    client.headers["X-Herdr-Chat-Working-Input"] = "1"
     agent.pop("interactive_ready")
     agent.pop("launch_pending")
     agent["agent_status"] = status
+    if named: agent["name"] = "manually-renamed-agent"
     page = (await client.get("/v1/panes/w1:p2/conversation")).json()
     assert page["canSend"] and page["canSendReason"] is None
     result = await client.post("/v1/panes/w1:p2/messages", json={"binding": page["binding"], "text": "One explicit prompt"})
@@ -333,23 +337,54 @@ async def test_manually_launched_codex_omits_managed_flags_and_can_receive_chat_
     assert prompts[0]["params"] == {"target": "w1:p2", "text": "One explicit prompt"}
 
 
-@pytest.mark.parametrize("mutation", ["named", "explicitFalse", "null", "string", "pending", "malformedPending", "working", "blocked", "unknown"])
+@pytest.mark.parametrize("mutation", ["namedPending", "explicitFalse", "null", "string", "pending", "malformedPending", "blocked", "unknown"])
 async def test_omitted_managed_readiness_never_bypasses_other_chat_guards(chat, mutation):
     client, _, agent, requests, _, _, _, _, _ = chat
     first = (await client.get("/v1/panes/w1:p2/conversation")).json()
     agent.pop("interactive_ready")
     agent.pop("launch_pending")
-    if mutation == "named": agent["name"] = "managed-agent"
+    if mutation == "namedPending": agent.update(name="managed-agent", launch_pending=True)
     if mutation == "explicitFalse": agent["interactive_ready"] = False
     if mutation == "null": agent["interactive_ready"] = None
     if mutation == "string": agent["interactive_ready"] = "true"
     if mutation == "pending": agent["launch_pending"] = True
     if mutation == "malformedPending": agent["launch_pending"] = "false"
-    if mutation in {"working", "blocked", "unknown"}: agent["agent_status"] = mutation
+    if mutation in {"blocked", "unknown"}: agent["agent_status"] = mutation
     page = (await client.get("/v1/panes/w1:p2/conversation")).json()
     assert not page["canSend"] and page["canSendReason"]
     result = await client.post("/v1/panes/w1:p2/messages", json={"binding": first["binding"], "text": "Do not send"})
     assert result.status_code == 409
+    assert not any(r["method"] == "agent.prompt" for r in requests)
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["ready-ordinary-agent", "ready-managed-agent"])
+async def test_working_agent_accepts_one_explicit_prompt_without_waiting_for_idle(chat, named):
+    client, _, agent, requests, _, _, _, _, _ = chat
+    client.headers["X-Herdr-Chat-Working-Input"] = "1"
+    agent["agent_status"] = "working"
+    if named: agent["name"] = "managed-agent"
+    page = (await client.get("/v1/panes/w1:p2/conversation")).json()
+    assert page["canSend"] and page["canSendReason"] is None
+    assert page["status"] == "working"
+    result = await client.post("/v1/panes/w1:p2/messages", json={"binding": page["binding"], "text": "A deliberate follow-up"})
+    assert result.status_code == 200
+    prompts = [r for r in requests if r["method"] == "agent.prompt"]
+    assert len(prompts) == 1
+    assert prompts[0]["params"] == {"target": "w1:p2", "text": "A deliberate follow-up"}
+
+
+@pytest.mark.parametrize("header", [None, "0", "true", "1, 1"])
+async def test_legacy_phone_can_read_working_history_without_claiming_it_can_send(chat, header):
+    client, _, agent, requests, _, _, _, _, _ = chat
+    if header is not None: client.headers["X-Herdr-Chat-Working-Input"] = header
+    agent["agent_status"] = "working"
+    response = await client.get("/v1/panes/w1:p2/conversation")
+    assert response.status_code == 200
+    page = response.json()
+    assert page["status"] == "working" and not page["canSend"]
+    assert page["messages"] and page["canSendReason"] == "Update Herdr Pocket to send while Codex works."
+    rejected = await client.post("/v1/panes/w1:p2/messages", json={"binding": page["binding"], "text": "Do not send"})
+    assert rejected.status_code == 409
     assert not any(r["method"] == "agent.prompt" for r in requests)
 
 

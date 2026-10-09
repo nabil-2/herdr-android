@@ -88,7 +88,9 @@ Install the APK and host installer from the same preview release. To upgrade an 
 
 Chat needs an installed Codex CLI and a session ID reported by Herdr's Codex integration. Setup discovers Codex automatically and saves its executable and home directory for the background service. Codex 0.162.0 is the tested version. An old bridge, missing session ID, unavailable history, or unsupported provider keeps a terminal fallback with an explanation. Existing agents are never restarted by setup. If a session predates Herdr's integration, enable that integration in Herdr before starting a new Codex session.
 
-The phone reads saved conversation messages once per second while chat is visible. This is message refresh, not token-by-token streaming. Codex keeps running in its original pane. Send is enabled when Herdr confirms the agent is ready; a working or blocked agent can be controlled through **Terminal**. Approval menus and interactive questions show a visible attention banner with **Open terminal**. The chat composer never retries a submitted message automatically.
+The phone reads saved conversation messages once per second while chat is visible. This is message refresh, not token-by-token streaming. Codex keeps running in its original pane. With the 0.5.1 app and companion, Send accepts a message while Codex is working and updates the current task using the [Codex CLI’s Enter behavior](https://learn.chatgpt.com/docs/cli/reference#interactive-shortcuts). Herdr still checks the selected agent and its readiness before sending. Approval menus and interactive questions show a visible attention banner with **Open terminal**. Loading, pending delivery, errors, and uncertain delivery keep Send disabled; messages are never retried automatically.
+
+Older phone versions can still read chat on the new companion and send when idle. If the updated phone connects to an older host that cannot accept messages during work, the composer asks you to update the host companion. Existing pairing and history remain compatible.
 
 Advanced hosts can select a nonstandard installation with `herdr-pocket setup --codex-bin /absolute/path/to/codex --codex-home /absolute/path/to/codex-home`. The normal setup uses `CODEX_HOME`, or `~/.codex`. The read-only Codex app-server may maintain its local metadata databases; it does not start a new model turn or resume the running thread.
 
@@ -162,7 +164,7 @@ See [protocol](docs/protocol.md) for the app/service interface and [validation](
 
 ## Chat layout
 
-The conversation uses compact author/time captions, right-aligned user bubbles, plain assistant text, restrained Markdown headings, and a fixed reply composer. Working appears as a quiet static caption. Disabled submission explains readiness; ordinary manually launched Codex sessions can reply when idle. Saved times are labeled as turn start/finish times, and unavailable history dates are omitted.
+The conversation uses compact author/time captions, right-aligned user bubbles, plain assistant text, restrained Markdown headings, and a fixed reply composer. Working appears as a quiet static caption. Disabled submission explains readiness; ordinary manually launched Codex sessions can receive messages when idle or working if the host permits it. Renaming an agent changes its display label and does not change this readiness check. Saved times are labeled as turn start/finish times, and unavailable history dates are omitted.
 
 Layout and behavior follow the [official Android JetChat example](https://github.com/android/compose-samples/blob/main/Jetchat/app/src/main/java/com/example/compose/jetchat/conversation/Conversation.kt), [Material typography guidance](https://m3.material.io/styles/typography/applying-type), and [Android accessibility defaults](https://developer.android.com/develop/ui/compose/accessibility/api-defaults). Copy, navigation, and Send retain accessible touch targets.
 

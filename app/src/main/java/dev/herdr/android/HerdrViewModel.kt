@@ -366,9 +366,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         val currentClient = client ?: return
         if (!ensureNetworkPermission()) return
         if (!foreground || !paneVisible || current.paneMode != PaneMode.CHAT ||
-            current.connection != ConnectionState.CONNECTED || current.chat.loading || current.chat.sending ||
-            current.chat.deliveryUncertain || current.chat.error != null || !current.chat.canSend ||
-            current.chat.status !in setOf("idle", "done")
+            current.connection != ConnectionState.CONNECTED || !current.chat.canSubmitMessage()
         ) return
         val text = current.chat.draft
         if (text.isBlank()) return

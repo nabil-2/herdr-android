@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated
 
 import anyio
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -216,7 +216,7 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
         result = {"service": "herdr-android-bridge", "protocol": 1, "companionVersion": __version__, "herdrVersion": snapshot["herdrVersion"], "pairing": pairing_store is not None}
         result["capabilities"] = ["terminal-input", "terminal-history"]
         if reader.enabled:
-            result["capabilities"].append("codex-chat")
+            result["capabilities"].extend(["codex-chat", "codex-chat-working-input"])
         return result
 
     @app.get("/v1/snapshot")
@@ -229,13 +229,15 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
         return snapshot
 
     @app.get("/v1/panes/{pane_id}/conversation")
-    async def conversation(pane_id: str, cursor: Annotated[str | None, Query(max_length=2048)] = None,
+    async def conversation(pane_id: str, request: Request, cursor: Annotated[str | None, Query(max_length=2048)] = None,
                            revision: Annotated[str | None, Query(max_length=256)] = None):
-        return await conversations.page(pane_id, cursor, revision)
+        return await conversations.page(pane_id, cursor, revision,
+                                        allow_working=request.headers.get("X-Herdr-Chat-Working-Input") == "1")
 
     @app.post("/v1/panes/{pane_id}/messages")
-    async def message(pane_id: str, request: MessageRequest):
-        return await conversations.send(pane_id, request.binding, request.text)
+    async def message(pane_id: str, request: MessageRequest, http_request: Request):
+        return await conversations.send(pane_id, request.binding, request.text,
+                                        allow_working=http_request.headers.get("X-Herdr-Chat-Working-Input") == "1")
 
     @app.post("/v1/panes/{pane_id}/input")
     async def send_input(pane_id: str, request: InputRequest):

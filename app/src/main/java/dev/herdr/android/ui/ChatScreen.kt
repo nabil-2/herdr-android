@@ -121,6 +121,9 @@ internal fun ChatScreen(
     val tab = state.snapshot?.tabs?.firstOrNull { it.id == pane?.tabId }
     val chat = state.chat
     val connected = state.connection == ConnectionState.CONNECTED
+    val cannotSendReason = if (chat.status == "working" && !chat.canSend && "codex-chat-working-input" !in state.capabilities) {
+        "Update the host companion to send while Codex works."
+    } else chat.canSendReason
     BackHandler(onBack = onBack)
     Scaffold(
         containerColor = CanvasColor,
@@ -153,15 +156,15 @@ internal fun ChatScreen(
                 ConversationMessages(chat, onOlder, Modifier.weight(1f).fillMaxWidth())
             }
             if (connected && chat.status == "working") {
-                Text("Working…", Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp).testTag("chat-working"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(if (chat.canSend) "Working · Send updates this task" else "Working…", Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp).testTag("chat-working"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
             }
             ChatComposer(
                 draft = chat.draft,
-                canSend = connected && chat.canSend && chat.status in setOf("idle", "done") && chat.bindingId != null && chat.error == null && !chat.loading && !chat.sending && !chat.deliveryUncertain,
+                canSend = connected && chat.canSubmitMessage(),
                 sending = chat.sending,
                 editable = chat.bindingId != null,
-                disabledReason = chat.canSendReason?.takeIf { connected && !chat.canSend && chat.status !in setOf("working", "blocked") && chat.error == null && !chat.loading && !chat.sending },
+                disabledReason = cannotSendReason?.takeIf { connected && !chat.canSend && chat.status != "blocked" && chat.error == null && !chat.loading && !chat.sending },
                 onDraftChange = onDraftChange,
                 onSend = onSend,
             )
