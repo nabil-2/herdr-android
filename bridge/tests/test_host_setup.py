@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from herdr_bridge import host_setup as setup
+from herdr_bridge import __version__
 from herdr_bridge.config import initialize_token, read_token
 from herdr_bridge.pairing import PairingError, PairingStore
 
@@ -55,7 +56,7 @@ def test_setup_file_cannot_be_shared_or_redirected_to_another_file(tmp_path):
 def test_invalid_service_binding_and_format_are_rejected(tmp_path):
     path = tmp_path / "setup.json"
     value = config_for(tmp_path)
-    for change in [{"host": "0.0.0.0"}, {"port": True}, {"port": 0}, {"socket": "relative"}, {"format": 2}, {"name": "injected\nname"}]:
+    for change in [{"host": "0.0.0.0"}, {"port": True}, {"port": 0}, {"socket": "relative"}, {"format": 2}, {"name": "injected\nname"}, {"hostName": "!other"}, {"hostName": "host\nConditionHost=*"}, {"hostName": 4}]:
         setup.write_private(path, json.dumps(value | change).encode())
         with pytest.raises(setup.SetupError):
             setup.read_config(path)
@@ -85,8 +86,26 @@ def test_service_arguments_are_literal_and_credentials_are_not_in_command(tmp_pa
     assert "--token" not in value
     assert "Restart=on-failure" in value
     assert "WantedBy=default.target" in value
+    assert f"ConditionHost={setup.socket.gethostname()}" in value
     with pytest.raises(setup.SetupError):
         setup.systemd_quote("bad\nargument")
+
+
+def test_shared_home_pairing_identifies_owning_machine_before_reading_credentials(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup.socket, "gethostname", lambda: "other-machine.example")
+    monkeypatch.setattr(setup, "read_token", lambda _: pytest.fail("Wrong-host health must not read a token"))
+    config = config_for(tmp_path) | {"hostName": "pocket-server.example"}
+    with pytest.raises(setup.SetupError, match="companion runs on pocket-server.example") as failure:
+        setup.wait_healthy(config)
+    assert "ssh pocket-server.example" in str(failure.value)
+    assert "setup again" not in str(failure.value)
+
+
+def test_managed_unit_never_uses_host_globs_or_control_characters(tmp_path, monkeypatch):
+    for hostname in ("!other.example", "*.example", "host\nConditionHost=*", "-oProxyCommand=bad"):
+        monkeypatch.setattr(setup.socket, "gethostname", lambda: hostname)
+        with pytest.raises(setup.SetupError, match="unsupported host name"):
+            setup.service_content(["/usr/bin/pocket"], tmp_path / "setup.json")
 
 
 @pytest.mark.skipif(platform.system() != "Linux" or not shutil.which("systemd-analyze"), reason="Requires systemd's unit parser")
@@ -302,6 +321,80 @@ def test_missing_tailscale_fails_before_installing_services(monkeypatch):
     monkeypatch.setattr(setup.shutil, "which", lambda _: None)
     with pytest.raises(setup.SetupError, match="Install and connect Tailscale"):
         setup.tailscale_state()
+
+
+@pytest.fixture
+def local_health_listener():
+    """An owned HTTP listener representing an old daemon on the preserved port."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    health = {"service": "herdr-android-bridge", "protocol": 1, "pairing": True}
+    requests = []
+
+    class Health(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(health).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Health)
+    thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+    thread.start()
+    try:
+        yield health, server.server_port, requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("reported_version", [None, "0.3.0", "untrusted-response-value", 4])
+def test_health_refuses_missing_or_mismatched_running_companion_version(tmp_path, local_health_listener, reported_version):
+    health, port, requests = local_health_listener
+    if reported_version is not None:
+        health["companionVersion"] = reported_version
+    config = config_for(tmp_path)
+    owner = initialize_token(Path(config["tokenFile"]))
+    config["port"] = port
+    with pytest.raises(setup.SetupError, match="Run the matching installer again") as error:
+        setup.wait_healthy(config, timeout=0)
+    assert requests == ["/v1/health"]
+    assert owner not in str(error.value)
+    assert "untrusted-response-value" not in str(error.value)
+
+
+def test_health_accepts_current_companion_without_requiring_new_config_fields(tmp_path, local_health_listener):
+    health, port, requests = local_health_listener
+    health["companionVersion"] = __version__
+    config = config_for(tmp_path)  # Existing format-1 configurations remain valid.
+    initialize_token(Path(config["tokenFile"]))
+    config["port"] = port
+    setup.wait_healthy(config, timeout=0)
+    assert requests == ["/v1/health"]
+
+
+@pytest.mark.parametrize("expected,allow,accepted", [("0.3.1", False, False), ("0.3.1", True, True), ("0.4.0", True, False)])
+def test_missing_version_is_accepted_only_for_explicit_legacy_rollback(tmp_path, local_health_listener, expected, allow, accepted):
+    _, port, _ = local_health_listener
+    config = config_for(tmp_path)
+    initialize_token(Path(config["tokenFile"]))
+    config["port"] = port
+    if accepted:
+        setup.wait_healthy(config, timeout=0, expected_version=expected, allow_legacy_version=allow)
+    else:
+        with pytest.raises(setup.SetupError, match="does not match"):
+            setup.wait_healthy(config, timeout=0, expected_version=expected, allow_legacy_version=allow)
+
+
+def test_companion_version_matches_the_declared_package_version():
+    import tomllib
+    project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+    assert __version__ == project["project"]["version"]
 
 
 def test_health_does_not_follow_redirects_or_leak_bearer(tmp_path, monkeypatch):

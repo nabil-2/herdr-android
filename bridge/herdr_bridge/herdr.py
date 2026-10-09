@@ -114,6 +114,36 @@ class HerdrClient:
             raise BridgeError(503, "Herdr could not confirm workspace creation; refresh before retrying")
         return workspace["workspace_id"]
 
+    async def send_terminal_input(self, pane_id: str, text: str) -> None:
+        validate_pane_id(pane_id)
+        # Herdr's send_input brackets text in paste mode. Direct keyboard input
+        # must use this distinct public operation so control keys retain meaning.
+        result = await self.call("pane.send_text", {"pane_id": pane_id, "text": text})
+        if result.get("type") != "ok":
+            raise BridgeError(503, "Input delivery was not confirmed; inspect the terminal before sending again")
+
+    async def terminal_history(self, pane_id: str) -> dict:
+        validate_pane_id(pane_id)
+        result = await self.call("pane.read", {"pane_id": pane_id, "source": "recent_unwrapped",
+                                              "format": "text", "lines": 1000, "strip_ansi": True, "intent": "interactive"})
+        read = result.get("read")
+        if (result.get("type") != "pane_read" or not isinstance(read, dict) or read.get("pane_id") != pane_id
+                or read.get("source") != "recent_unwrapped" or read.get("format") != "text"
+                or not isinstance(read.get("text"), str) or type(read.get("truncated")) is not bool):
+            raise BridgeError(503, "Herdr returned incompatible terminal history; refresh before trying again")
+        text = read["text"]
+        truncated = read["truncated"]
+        lines = text.splitlines(keepends=True)
+        if len(lines) > 1000:
+            text, truncated = "".join(lines[-1000:]), True
+        try:
+            encoded = text.encode("utf-8")
+        except UnicodeError as exc:
+            raise BridgeError(503, "Herdr returned invalid terminal history text") from exc
+        if len(encoded) > 65536:
+            text, truncated = encoded[-65536:].decode("utf-8", errors="ignore"), True
+        return {"paneId": pane_id, "text": text, "truncated": truncated}
+
     async def observe(self, pane_id: str, cols: int, rows: int) -> asyncio.subprocess.Process:
         validate_pane_id(pane_id)
         # Check the selected target before spawning and always inherit this exact socket.
@@ -144,6 +174,8 @@ def upstream_error(error: object, *, prompt: bool = False) -> BridgeError:
         return BridgeError(400, "Herdr rejected the input or working directory; check the values")
     if code in {"unknown_method", "method_not_found", "unsupported_method"}:
         return BridgeError(503, "Herdr does not support this operation; install a compatible version")
+    if code == "pane_send_failed":
+        return BridgeError(503, "Input delivery was not confirmed; inspect the terminal before sending again")
     if prompt:
         if code in {"agent_blocked", "agent_not_ready", "ambiguous_agent_target"}:
             return BridgeError(409, "The selected agent cannot accept a prompt; inspect Terminal before sending")

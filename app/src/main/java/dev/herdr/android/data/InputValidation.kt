@@ -1,7 +1,17 @@
 package dev.herdr.android.data
 
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+
 /** Keep local validation in step with the bridge's InputRequest and body limit. */
 internal object InputValidation {
+    private val json = Json { explicitNulls = false }
+
+    fun body(text: String?, keys: List<String>): String {
+        validate(text, keys)
+        return json.encodeToString(PaneInput(text, keys)).also(::validateBody)
+    }
+
     fun validate(text: String?, keys: List<String>) {
         require(!text.isNullOrEmpty() || keys.isNotEmpty()) { "Enter a command or select a key." }
         if (text != null) {

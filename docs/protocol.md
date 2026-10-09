@@ -39,18 +39,22 @@ The host stores the registry as an owner-only regular JSON file, normally `~/.co
 ## HTTP endpoints
 
 - `POST /v1/pair`: the one-use exchange above. Pairing returns `503` if a directly embedded service was created without a pairing registry.
-- `GET /v1/health`: `{ "service": "herdr-android-bridge", "protocol": 1, "herdrVersion": "0.9.3", "pairing": true }`. The Boolean indicates whether a pairing registry is configured. This reads a live Herdr snapshot and returns `503` if the daemon is unavailable; it is not merely a check that the HTTP process is running.
+- `GET /v1/health`: `{ "service": "herdr-android-bridge", "protocol": 1, "herdrVersion": "0.9.3", "companionVersion": "0.4.0", "pairing": true, "capabilities": ["terminal-input", "terminal-history"] }`. The Boolean indicates whether a pairing registry is configured. A configured Codex reader additionally advertises `codex-chat`. This reads a live Herdr snapshot and returns `503` if the daemon is unavailable; it is not merely a check that the HTTP process is running.
 - `GET /v1/snapshot`: `{ "herdrVersion": "0.9.3", "workspaces": [...], "tabs": [...], "panes": [...] }`.
 - A workspace is `{ "id": "w1", "label": "project", "cwd": "/path/to/project" }`. Herdr's workspace object has no directory field, so the bridge derives this from a pane in its active tab, falling back to another pane in the workspace. Unknown directories are empty strings.
 - A tab is `{ "id": "w1:t1", "workspaceId": "w1", "label": "main" }`.
 - A pane is `{ "id": "w1:p1", "workspaceId": "w1", "tabId": "w1:t1", "title": "Claude Code", "cwd": "/path/to/project", "agent": "claude", "status": "working" }`. `agent` may be null; status is `idle`, `working`, `blocked`, `done`, or `unknown`. Pane directories prefer Herdr's `foreground_cwd`, then `cwd`, then an empty string.
 - `POST /v1/panes/{paneId}/input`: `{ "text": "hello", "keys": ["enter"] }`; text and keys are optional individually, but at least one must be nonempty. Sends literal input to the explicitly selected pane, using Herdr's atomic input API. Returns `{ "ok": true }`. Do not silently retry writes.
+- `POST /v1/panes/{paneId}/terminal-input`: exactly `{ "text": "typed characters" }`, returning `{ "ok": true }`. Direct keyboard input uses Herdr's public `pane.send_text` on that explicit pane. Unlike reviewed paste, it sends literal control characters without bracketed-paste wrapping. Requires `terminal-input` capability.
+- `GET /v1/panes/{paneId}/scrollback`: `{ "paneId": "w1:p1", "text": "recent output\n", "truncated": false }`. Reads real recent output through the fixed public `pane.read` request below. Requires `terminal-history` capability.
 - `POST /v1/workspaces`: `{ "cwd": "/path/to/project", "label": "project" }`; returns `201` and `{ "id": "w2" }`. Creates a workspace with a shell using Herdr's public API and `focus: false`. Users can launch any agent from its terminal.
 - Errors are non-2xx JSON `{ "detail": "Readable explanation" }`. `401` means a rejected token or pairing code, `400` means an invalid target/key/directory or terminal geometry, `422` means an invalid request body, `413` means the body is too large, `408` means the body upload timed out, `503` means Herdr is unavailable, an incompatible response, unavailable pairing storage, or unconfirmed prompt delivery after dispatch, and `409` indicates a missing or conflicting target or another rejected operation. Errors do not echo credentials, submitted text, or raw CLI diagnostics.
 
 ## Command limits and target selection
 
 HTTP request bodies are limited to 65,536 bytes, including JSON encoding, and must finish arriving within 10 seconds. Input text is limited to 16,384 Unicode code points and 32,768 UTF-8 bytes, with no NUL characters. A command accepts at most 32 keys, each 1–32 ASCII characters with no whitespace. Herdr validates the complete logical key list before writing any text or keys. The Android toolbar uses `enter`, `esc`, `tab`, `up`, `down`, `left`, `right`, and `ctrl+c`, verified against Herdr 0.9.3.
+
+Direct `terminal-input` has the same text/body bounds, accepts only a nonempty text string, and permits NUL and other terminal controls, including Ctrl+Space. It accepts no keys, arbitrary methods, or parameters. It dispatches `pane.send_text` exactly once and requires an `ok` acknowledgment. Failed acknowledgment or transport failure returns controlled `503`; delivery is uncertain and the user must inspect the terminal before continuing.
 
 Workspace directories must contain 1–4,096 characters, contain no NUL, and begin with `/` or `~/`, or equal `~`. Labels must contain 1–128 characters, include non-whitespace text, and contain no characters below U+0020. Request bodies reject unknown fields and incorrect JSON types.
 
@@ -82,11 +86,33 @@ Before upgrading, invalid tokens, unavailable Herdr, invalid geometry, and stale
 
 Observers do not own input or resize the desktop terminal. Disconnecting cancels and reaps the observation process without terminating the pane, including when the ASGI endpoint is cancelled during shutdown. Each observer receives a two-second termination grace period before a kill/reap fallback.
 
+## Recent output history
+
+History makes one read-only `pane.read` call with explicit `pane_id`, `source: "recent_unwrapped"`, `format: "text"`, `lines: 1000`, `strip_ansi: true`, and `intent: "interactive"`. The client cannot choose a method, source, format, path, or focused-pane fallback. The bridge requires matching pane/source/format in the result and a Boolean truncation flag. Returned text retains at most the latest 1,000 lines and 65,536 UTF-8 bytes without cutting a Unicode character; further bounding sets `truncated: true`. Invalid responses return controlled errors without exposing their contents.
+
+Android validates the envelope, exact pane ID, Unicode, and both bounds. Output history is independently loaded wrapped text with selection, literal search, previous/next match, refresh, and explicit copy. It reads once when opened or resumed, never polls, and clears text/search when closed or backgrounded. Pane/profile/session changes cancel or reject stale reads. This bounded Herdr history is separate from the observer viewport.
+
+## Snapshot and connection errors
+
+Before rendering lists, Android requires nonblank, unique IDs in each workspace/tab/pane collection and valid workspace/tab references. A malformed or inconsistent snapshot produces a controlled connection error instead of an uncaught Compose list-key failure. JSON is limited to 2 MiB and 64 levels of nesting. Snapshot parsing runs off the main UI thread. Old health responses without capabilities remain compatible.
+
+If an uncaught app error occurs, Android still terminates the process normally. A best-effort private diagnostic records only app version, Android SDK, exception/cause class names, and at most 20 sanitized stack frames, bounded to 8 KiB. Exception messages, request URLs, invitation codes, tokens, and user input are excluded. A valid previous record offers explicit Copy/Delete on the server screen; nothing is uploaded automatically. This helps investigate device-specific crashes that cannot be reproduced with synthetic server responses.
+
+## Native terminal interaction
+
+Direct typing uses an Android input connection rather than the emulator's reply callback. IME composition stays local until committed; Enter/navigation flush text before the logical key, while Escape and Ctrl+C discard unfinished composition. Known navigation/modifier keys use `/input` so Herdr encodes the running terminal's actual keyboard mode. Observer frames describe rendered cells and do not expose every remote PTY mode. Clipboard and IME paste require review: a confirmed single line is inserted without Enter through `/input`, preserving Herdr's bracketed-paste handling; multiline text opens Compose. Control-bearing paste is rejected. Emulator-generated device-status replies and clipboard sequences never become remote input.
+
+The native input FIFO holds at most 128 requests and 128 KiB including in-flight input, coalescing adjacent raw text up to 4 KiB. Each request captures profile generation, pane, terminal session, and observer attempt. Stale UI callbacks/input connections cannot enqueue to a new target. Switching panes/profiles, backgrounding, or losing the observer discards pending input; uncertain delivery pauses typing until the user reviews it and chooses Resume typing. Writes are never replayed. Direct keystrokes and special keys do not clear a Compose draft; only confirmed Compose submission advances its acknowledgment.
+
+Pinch zoom, panning, Fit width, themes, and focus mode affect the phone viewport without resizing the desktop terminal. Selection has Copy/Cancel controls inside the phone viewport. Appearance is saved locally. Snippets are saved only by explicit user action and inserted into Compose for review. Optional command history holds at most 20 acknowledged Compose commands in memory, preserving exact text up to 8,192 characters; longer commands are omitted, never truncated for reuse. Live keystrokes are not recorded as command history. Compose drafts stay in memory outside saved-instance state.
+
+An older companion without `terminal-input` retains Compose/logical-key controls. Without `terminal-history`, Output history is disabled. Host upgrades enable these features without changing the protocol version or existing device credentials. Managed setup records the owning hostname and places a matching `ConditionHost` in Linux user units so another machine sharing the same home cannot start that unit or silently replace its setup. Pairing commands must run on that owning host.
+
 ## Android behavior
 
 ### Native saved Codex conversation
 
-A configured Codex reader adds `"capabilities":["codex-chat"]` to health. Older or unconfigured bridges omit this field. Codex panes can expose optional `conversation: {"provider":"codex","available":true,"reason":null}` metadata in the snapshot. An unavailable descriptor includes a controlled reason. Availability means the pane has a recognized saved-session reference and the bridge has resolved a reader executable; the conversation request can still fail if the history or configured Codex home is unavailable.
+A configured Codex reader adds `codex-chat` to health capabilities. Older bridges can omit the capabilities field. Codex panes can expose optional `conversation: {"provider":"codex","available":true,"reason":null}` metadata in the snapshot. An unavailable descriptor includes a controlled reason. Availability means the pane has a recognized saved-session reference and the bridge has resolved a reader executable; the conversation request can still fail if the history or configured Codex home is unavailable.
 
 The bridge accepts only Herdr's official canonical reference: pane `agent:"codex"`, `agent_session.source:"herdr:codex"`, `agent_session.agent:"codex"`, `kind:"id"`, and a canonical UUID value. It never finds a conversation by directory, display title, or most recent file. Missing references fall back to Terminal. The Android client supplies pane IDs and opaque binding/cursor values, never native thread IDs, Codex home paths, or transcript paths. Native references remain internal to the bridge.
 
@@ -120,4 +146,4 @@ On Android 17/API 37 and later, request `android.permission.ACCESS_LOCAL_NETWORK
 
 HTTPS is required except loopback and numeric Tailscale addresses (100.64.0.0/10 and fd7a:115c:a1e0::/48) explicitly identified as private development connections. Bearer-authenticated commands and observers never fall back to unauthenticated requests. Refresh snapshots after reconnecting and while the dashboard is open. Reconnect terminal observers with bounded backoff; display connection state and errors. Cancel observers when their screen leaves the foreground. Never replay a command on reconnect.
 
-Current scope: QR/manual server connection settings, workspace and tab navigation, agent status, native saved Codex chat with older history and explicit message submission, native ANSI terminal rendering, a command composer with explicit send, and a special-key toolbar. There is no WebView or PWA wrapper. Background push notifications and SSH key authentication are future work.
+Current scope: QR/manual server connection settings, workspace and tab navigation, agent status, native saved Codex chat with older history and explicit message submission, native ANSI terminal rendering, direct native typing, reviewed Compose/paste, extra keys, themes/zoom/focus, reusable snippets, bounded Output history, pane switching, and session search. There is no WebView or PWA wrapper. Background push notifications and SSH key authentication are future work.

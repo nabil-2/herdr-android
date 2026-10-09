@@ -104,7 +104,7 @@ class ConversationClientTest {
 
     @Test fun `older companions omit native chat capabilities and stay compatible`() = runBlocking {
         server.enqueue(MockResponse().setBody("""{"service":"herdr-android-bridge","protocol":1}"""))
-        server.enqueue(MockResponse().setBody("""{"workspaces":[],"tabs":[],"panes":[{"id":"w1:p1","workspaceId":"w1","tabId":"w1:t1","title":"Codex","cwd":"/project","agent":"codex"}]}"""))
+        server.enqueue(MockResponse().setBody("""{"workspaces":[{"id":"w1","label":"Project","cwd":"/project"}],"tabs":[{"id":"w1:t1","workspaceId":"w1","label":"Main"}],"panes":[{"id":"w1:p1","workspaceId":"w1","tabId":"w1:t1","title":"Codex","cwd":"/project","agent":"codex"}]}"""))
         assertEquals(emptyList<String>(), client.health().capabilities)
         assertNull(client.snapshot().panes.single().conversation)
     }

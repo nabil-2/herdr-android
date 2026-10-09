@@ -3,11 +3,12 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from herdr_bridge import __version__
 from herdr_bridge.app import create_app
 from .conftest import AUTH, TOKEN
 
 
-@pytest.mark.parametrize("path,method", [("/v1/health", "GET"), ("/v1/snapshot", "GET"), ("/v1/panes/w1:p1/input", "POST"), ("/v1/workspaces", "POST"), ("/v1/unknown", "GET")])
+@pytest.mark.parametrize("path,method", [("/v1/health", "GET"), ("/v1/snapshot", "GET"), ("/v1/panes/w1:p1/input", "POST"), ("/v1/panes/w1:p1/terminal-input", "POST"), ("/v1/panes/w1:p1/scrollback", "GET"), ("/v1/workspaces", "POST"), ("/v1/unknown", "GET")])
 async def test_every_v1_http_request_requires_token(socket_server, path, method):
     backend, requests, _, _ = socket_server
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(backend, TOKEN)), base_url="http://localhost") as client:
@@ -29,7 +30,7 @@ async def test_snapshot_and_health_normalize_real_schema(socket_server):
         assert snapshot["tabs"][1] == {"id": "w1:t2", "workspaceId": "w1", "label": "Agent"}
         assert snapshot["panes"][1] == {"id": "w1:p2", "workspaceId": "w1", "tabId": "w1:t2", "title": "Claude Code", "cwd": "/repo/subdir", "agent": "claude", "status": "blocked"}
         health = await client.get("/v1/health")
-        assert health.json() == {"service": "herdr-android-bridge", "protocol": 1, "herdrVersion": "0.9.3", "pairing": False}
+        assert health.json() == {"service": "herdr-android-bridge", "protocol": 1, "companionVersion": __version__, "herdrVersion": "0.9.3", "pairing": False, "capabilities": ["terminal-input", "terminal-history"]}
 
 
 async def test_text_and_keys_are_sent_atomically_to_explicit_target(socket_server):

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import plistlib
+import re
 import shutil
 import socket
 import stat
@@ -21,6 +22,7 @@ import time
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+from . import __version__
 from .config import default_token_path, initialize_token, read_token
 from .herdr import HerdrClient
 from .pairing import PairingStore
@@ -29,6 +31,7 @@ from .runtime import external_environment
 MANAGED = "Managed by Herdr Pocket"
 SERVICE_PREFIX = "dev.herdr.pocket."
 MAC_TAILSCALE_APP = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+HOST_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}\Z")
 
 
 class SetupError(Exception):
@@ -105,6 +108,8 @@ def read_config(path: Path) -> dict:
                 raise ValueError("field")
         if value.get("host") != "127.0.0.1" or type(value.get("port")) is not int or not 1 <= value["port"] <= 65535:
             raise ValueError("listen")
+        if "hostName" in value and (not isinstance(value["hostName"], str) or not HOST_NAME.fullmatch(value["hostName"])):
+            raise ValueError("host name")
         if not all(Path(value[key]).is_absolute() for key in ("socket", "herdrBin", "tokenFile", "registryFile")):
             raise ValueError("path")
         for field in ("codexBin", "codexHome"):
@@ -337,7 +342,10 @@ def systemd_quote(argument: str, *, executable: bool = False) -> str:
 def service_content(prefix: list[str], config_path: Path) -> str:
     arguments = prefix + ["serve", "--service-config", str(config_path)]
     command = " ".join(systemd_quote(value, executable=index == 0) for index, value in enumerate(arguments))
-    return f"# {MANAGED}\n[Unit]\nDescription=Herdr Pocket companion\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={command}\nRestart=on-failure\nRestartSec=3\nUMask=0077\n\n[Install]\nWantedBy=default.target\n"
+    hostname = socket.gethostname()
+    if not HOST_NAME.fullmatch(hostname):
+        raise SetupError("This machine has an unsupported host name.")
+    return f"# {MANAGED}\n[Unit]\nDescription=Herdr Pocket companion\nConditionHost={hostname}\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={command}\nRestart=on-failure\nRestartSec=3\nUMask=0077\n\n[Install]\nWantedBy=default.target\n"
 
 
 def start_service(prefix: list[str], config_path: Path, instance: str) -> str:
@@ -390,19 +398,36 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def wait_healthy(config: dict, timeout: float = 20) -> None:
+def ensure_current_host(config: dict) -> None:
+    hostname = config.get("hostName")
+    if hostname and hostname != socket.gethostname():
+        raise SetupError(f"This companion runs on {hostname}, while this terminal is on {socket.gethostname()}. "
+                         f"Run the command on {hostname}; for example: ssh {hostname} '~/.local/bin/herdr-pocket pair'")
+
+
+def wait_healthy(config: dict, timeout: float = 20, *, expected_version: str = __version__, allow_legacy_version: bool = False) -> None:
+    ensure_current_host(config)
     request = Request(f"http://127.0.0.1:{config['port']}/v1/health", headers={"Authorization": "Bearer " + read_token(Path(config["tokenFile"]))})
     opener = build_opener(ProxyHandler({}), NoRedirect())
     deadline = time.monotonic() + timeout
+    version_mismatch = False
     while True:
         try:
             with opener.open(request, timeout=2) as response:
                 health = json.loads(response.read(16385))
             if health.get("service") == "herdr-android-bridge" and health.get("protocol") == 1 and health.get("pairing") is True:
-                return
+                # Explicit rollback to a known pre-0.4 binary may use its older
+                # health schema; setup/status must always require a version.
+                legacy = allow_legacy_version and tuple(map(int, expected_version.split(".")[:2])) < (0, 4)
+                if health.get("companionVersion") == expected_version or (legacy and "companionVersion" not in health):
+                    return
+                version_mismatch = True
         except Exception:
             pass
         if time.monotonic() >= deadline:
+            if version_mismatch:
+                raise SetupError(f"The running companion does not match Herdr Pocket {expected_version}. "
+                                 "Run the matching installer again and check the companion service for an older process using its port.")
             raise SetupError("The companion did not become ready. Check Herdr and the background service, then run setup again.")
         time.sleep(0.2)
 
@@ -418,6 +443,10 @@ def setup(*, session: str | None = None, socket_path: Path | None = None, herdr_
     private_directory(root)
     config_path = root / "setup.json"
     previous = read_config(config_path) if config_path.exists() else None
+    if previous:
+        # Shared home directories can contain another machine's local service.
+        # Never overwrite its credentials, service unit, or tailnet address.
+        ensure_current_host(previous)
     chat = codex_settings(codex_bin, codex_home)
     if previous:
         # Preserve an advanced custom home when upgrading from an installed companion.
@@ -442,17 +471,21 @@ def setup(*, session: str | None = None, socket_path: Path | None = None, herdr_
     initialize_token(token_path)  # The owner token is never printed by setup.
     config = {"format": 1, "instance": instance, "session": name, "socket": str(selected_socket), "herdrBin": executable,
               "tokenFile": str(token_path.absolute()), "registryFile": str((root / "devices.json").absolute()),
-              "host": "127.0.0.1", "port": port, "httpsPort": https_port,
+              "host": "127.0.0.1", "hostName": socket.gethostname(), "port": port, "httpsPort": https_port,
               "url": f"https://{dns_name}:{https_port}/", "name": (socket.gethostname() + (" / " + name if name != "default" else ""))[:100]}
     config.update(chat)
-    write_private(config_path, (json.dumps(config) + "\n").encode())
     print(f"Preparing phone access to Herdr session {name}…")
-    start_service(command_prefix(), config_path.absolute(), instance)
-    wait_healthy(config)
-    print("Configuring private Tailscale access. Follow any one-time HTTPS consent shown below.")
-    run([tailscale, "serve", "--bg", f"--https={https_port}", proxy], visible=True, timeout=120)
-    print("\nThe companion is running in the background.")
-    show_pairing(config, plain=plain, qr_file=qr_file)
+    # Stop all readers of the common frozen archive before atomically replacing
+    # it. Old one-file processes can otherwise lazily read the new archive.
+    from .host_manage import installer_upgrade
+    with installer_upgrade(config_root):
+        write_private(config_path, (json.dumps(config) + "\n").encode())
+        start_service(command_prefix(), config_path.absolute(), instance)
+        wait_healthy(config)
+        print("Configuring private Tailscale access. Follow any one-time HTTPS consent shown below.")
+        run([tailscale, "serve", "--bg", f"--https={https_port}", proxy], visible=True, timeout=120)
+        print("\nThe companion is running in the background.")
+        show_pairing(config, plain=plain, qr_file=qr_file)
 
 
 def configured_host(config_root: Path | None = None, session: str | None = None) -> dict:

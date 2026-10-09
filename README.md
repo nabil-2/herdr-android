@@ -9,11 +9,13 @@ The app uses Kotlin, Jetpack Compose, and ConnectBot's native libvterm terminal 
 - Scan or paste a pairing invitation, review the host, and explicitly confirm pairing. Each phone receives its own revocable credential, encrypted locally with Android Keystore and excluded from backups.
 - Choose a QR screenshot from the phone's gallery. The system photo picker needs no camera or storage permission; images decode locally and are never uploaded.
 - Save multiple server profiles and switch between them.
-- Browse workspaces, tabs, agent states, and shell panes, with agents needing input grouped together. Status refreshes while the app is in the foreground.
+- Browse workspaces, tabs, agent states, and shell panes, with agents needing input grouped together. Find sessions across a server's workspaces by name, agent, or directory. Status refreshes while the app is in the foreground.
 - Open supported Codex panes in native chat: user messages and agent replies, selectable Markdown and code, older conversation history, and a multiline reply box. Commands, tool results, reasoning, and injected instructions stay out of the conversation.
 - Open the terminal from chat to inspect activity or answer an approval prompt. The desktop keeps control of the same agent session.
-- Watch live ANSI terminal output, including colors, cursor movement, and agent terminal interfaces.
-- Send literal text with optional Enter, or use the Enter, Escape, Tab, arrow and Ctrl+C controls. Typing a draft does not send it. Failed sends retain the draft and are never replayed automatically.
+- Use a live native terminal with direct phone or hardware keyboard input, persistent pinch zoom, viewport panning, text selection, font and color settings, and focus mode.
+- Use one-shot Ctrl/Alt modifiers, navigation and function keys, safe paste review, or an optional multiline command composer. Composer drafts and reused snippets wait for explicit Send; failed writes are never replayed automatically.
+- Read real recent terminal output in a wrapped, selectable history viewer with search, match navigation, refresh, and copy. Each snapshot is bounded to 1,000 lines and 64 KiB.
+- Save explicit device-local snippets and optionally remember acknowledged composed commands in session memory. Direct typing is never recorded as command history.
 - Create a workspace on the host, then launch an agent from its shell.
 - Reconnect terminal observation after a temporary connection loss without taking the desktop's terminal controller or resizing its panes.
 
@@ -68,6 +70,18 @@ Open that PNG on your computer or transfer it to your phone, then tap **Choose Q
 
 Each code expires after five minutes and pairs one phone. It is exchanged for a separate device credential; you never need to copy the host's permanent owner token. If a code expires or has already been used, generate a new one. After connecting, choose a workspace, tab, and pane. Supported Codex sessions open as chat; shell panes and other agents open as terminals.
 
+## Terminal sessions
+
+The 0.4 preview adds direct typing and recent output history. Upgrade both the phone APK and host installer to use them; older hosts retain the command composer and special keys. You can keep your existing paired profile.
+
+Tap the terminal or **Keyboard** to type directly into the selected session. Enter submits to the running shell or agent immediately. The compact key row provides Escape, Tab, arrows, Enter, and one-shot **Ctrl** and **Alt** modifiers; **More** opens navigation, function keys, and common shortcuts. A hardware keyboard uses the same input path. Tap the session title to switch panes without changing the desktop's selected pane.
+
+Pinch to change the local font size, drag to see columns or rows outside the phone's viewport, and hold to select output. In the **⋮** tools menu, **Appearance** offers font sizes, four color themes, **Fit all columns**, and viewport reset. **Focus mode** removes the main header. These controls affect the phone's display and preserve the desktop terminal's size.
+
+Use **Compose command** when you want to review or edit a multiline command or agent prompt first. **Enter after send** controls whether Send submits the text. **Paste** previews clipboard text; a single line can be inserted without Enter, while multiline text opens Compose. Saved snippets and recent composed commands are inserted into the draft for review. Snippets persist on this device until deleted. **Remember composed commands** is off by default, stores only acknowledged composer sends in session memory, and clears that history when switched off. Unsent drafts stay in memory while the terminal is open. If delivery becomes uncertain, review the terminal and use **Resume typing**; pending input is discarded and is never retried automatically.
+
+Open **Output history** in the tools menu to read recent output from the actual Herdr pane. It loads up to 1,000 lines and 64 KiB as wrapped text, with selection, **Find in loaded output**, previous/next matches, and **Copy loaded output**. **Refresh** reads a new snapshot; this viewer does not poll. It marks truncated results when older output was omitted, and clears loaded text when closed or backgrounded. The live terminal remains a view of the current remote grid.
+
 ## Codex chat and upgrades
 
 Install the APK and host installer from the same preview release. To upgrade an existing installation, open the new APK and rerun the matching host installer. Existing phone profiles, device credentials, and the selected host address are preserved; another pairing is unnecessary. Choose the same Herdr session if setup offers a session list.
@@ -77,6 +91,25 @@ Chat needs an installed Codex CLI and a session ID reported by Herdr's Codex int
 The phone reads saved conversation messages once per second while chat is visible. This is message refresh, not token-by-token streaming. Codex keeps running in its original pane. Send is enabled when Herdr confirms the agent is ready; a working or blocked agent can be controlled through **Terminal**. Approval menus and interactive questions show a visible attention banner with **Open terminal**. The chat composer never retries a submitted message automatically.
 
 Advanced hosts can select a nonstandard installation with `herdr-pocket setup --codex-bin /absolute/path/to/codex --codex-home /absolute/path/to/codex-home`. The normal setup uses `CODEX_HOME`, or `~/.codex`. The read-only Codex app-server may maintain its local metadata databases; it does not start a new model turn or resume the running thread.
+
+## Update or uninstall the companion
+
+The 0.4 CLI adds:
+
+```sh
+herdr-pocket update
+herdr-pocket uninstall --session default
+```
+
+`update` fetches the latest published release, including previews, verifies its checksum, and upgrades the shared companion binary while preserving configuration and paired phones. It restarts previously running companion services and restores the previous binary if an upgrade fails. It does not update the Android APK. This repository is private, so automatic downloads need the GitHub CLI signed in with repository access (`gh auth login`). Alternatively, download the platform binary and `SHA256SUMS` into the same directory and run:
+
+```sh
+herdr-pocket update --from-file ./herdr-pocket-linux-x86_64
+```
+
+Use the matching macOS binary name on macOS. Uninstall stops and removes the selected managed service and its verified Tailscale Serve route. It keeps private settings and paired credentials for reinstallation. Add `--purge` to remove that selected instance's settings and device registry too. Herdr and the Tailscale daemon keep running. Shared binaries are retained when another instance still uses them.
+
+To start an installed companion again, run `herdr-pocket setup` with Herdr and Tailscale running. Use `--session NAME` when selecting among sessions. On machines sharing a home directory, run these commands on the machine that owns the instance; setup records that hostname and guards its Linux service accordingly.
 
 ## Manage phone access
 
@@ -128,7 +161,7 @@ See [protocol](docs/protocol.md) for the app/service interface and [validation](
 
 ## Current limits
 
-Status, chat refresh, and terminal observation run while the app is in the foreground; background push notifications are not implemented. Native chat supports Codex text conversations first; other agents, attachments, approval menus, and interactive questions use the selected terminal. Remote terminal scrollback and direct SSH connections are not implemented. The host, Tailscale, and Herdr daemon must remain online. Native Windows hosts are not supported because Herdr's terminal observer requires Linux or macOS.
+Status, chat refresh, and terminal observation run while the app is in the foreground; background push notifications are not implemented. Native chat supports Codex text conversations first; other agents, attachments, approval menus, and interactive questions use the selected terminal. Output history is a bounded recent snapshot, with no paging into older terminal output. Direct SSH connections are not implemented. The host, Tailscale, and Herdr daemon must remain online. Native Windows hosts are not supported because Herdr's terminal observer requires Linux or macOS.
 
 ## License
 

@@ -264,6 +264,7 @@ private fun ServersScreen(
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 112.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            item { ConnectionDiagnosticsNotice(Modifier.padding(bottom = 4.dp)) }
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     BrandMark()
@@ -346,9 +347,12 @@ private fun DashboardScreen(
     onRetry: () -> Unit,
 ) {
     val snapshot = state.snapshot
+    var searchOpen by rememberSaveable(state.activeProfileId) { mutableStateOf(false) }
+    var search by rememberSaveable(state.activeProfileId) { mutableStateOf("") }
+    val searching = search.isNotBlank()
     val selectedWorkspace = snapshot?.workspaces?.firstOrNull { it.id == state.workspaceId }
     val tabs = snapshot?.tabs.orEmpty().filter { it.workspaceId == state.workspaceId }
-    val panes = snapshot?.panes.orEmpty().filter { it.workspaceId == state.workspaceId && (state.tabId == null || it.tabId == state.tabId) }
+    val panes = visibleSessions(snapshot, state.workspaceId, state.tabId, search)
     val needsInput = panes.filter { it.status == "blocked" }
     val otherPanes = panes.filter { it.status != "blocked" }
     val server = state.profiles.firstOrNull { it.id == state.activeProfileId }
@@ -366,6 +370,9 @@ private fun DashboardScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = { searchOpen = !searchOpen; if (!searchOpen) search = "" }) {
+                        SymbolIcon(if (searchOpen) Symbol.CLOSE else Symbol.SEARCH, if (searchOpen) "Close session search" else "Find a session")
+                    }
                     IconButton(onClick = onRefresh, enabled = !state.refreshing && state.connection == ConnectionState.CONNECTED) {
                         if (state.refreshing) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else SymbolIcon(Symbol.REFRESH, "Refresh workspaces")
                     }
@@ -385,6 +392,18 @@ private fun DashboardScreen(
             contentPadding = PaddingValues(bottom = 112.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            if (searchOpen) item {
+                OutlinedTextField(
+                    value = search, onValueChange = { search = it.take(128) },
+                    label = { Text("Find agents and terminals") },
+                    supportingText = { Text("Search all workspaces on this server") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).testTag("session-search"),
+                    trailingIcon = {
+                        if (search.isNotEmpty()) IconButton(onClick = { search = "" }) { SymbolIcon(Symbol.CLOSE, "Clear session search") }
+                    },
+                )
+            }
             if (state.connection == ConnectionState.CONNECTING) item {
                 Column(Modifier.padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -402,7 +421,7 @@ private fun DashboardScreen(
                 }
             }
             if (snapshot?.workspaces?.isNotEmpty() == true) {
-                item {
+                if (!searching) item {
                     LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         items(snapshot.workspaces, key = { it.id }) { workspace ->
                             FilterChip(
@@ -416,11 +435,17 @@ private fun DashboardScreen(
                 }
                 item {
                     Column(Modifier.padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(selectedWorkspace?.label ?: "Select a workspace", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-                        selectedWorkspace?.let { Text(it.cwd, color = MaterialTheme.colorScheme.onSurfaceVariant, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                        Text(if (searching) "Matching sessions" else selectedWorkspace?.label ?: "Select a workspace", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+                        if (!searching) selectedWorkspace?.let { Text(it.cwd, color = MaterialTheme.colorScheme.onSurfaceVariant, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                        Text(
+                            "${panes.size} ${if (panes.size == 1) "session" else "sessions"}" +
+                                panes.count { it.status == "working" }.takeIf { it > 0 }?.let { " · $it working" }.orEmpty() +
+                                needsInput.size.takeIf { it > 0 }?.let { " · $it need input" }.orEmpty(),
+                            style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
-                if (tabs.isNotEmpty()) item {
+                if (!searching && tabs.isNotEmpty()) item {
                     LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         items(tabs, key = { it.id }) { tab ->
                             FilterChip(selected = state.tabId == tab.id, onClick = { onTab(tab.id) }, label = { Text(tab.label) }, modifier = Modifier.heightIn(min = 48.dp))
@@ -429,14 +454,15 @@ private fun DashboardScreen(
                 }
                 if (needsInput.isNotEmpty()) {
                     item { GroupLabel("Needs your input", "${needsInput.size}", Amber) }
-                    items(needsInput, key = { it.id }) { PaneCard(it, onPane, ChatState.supportsPaneChat(it, state.capabilities)) }
+                    items(needsInput, key = { it.id }) { PaneCard(it, onPane, ChatState.supportsPaneChat(it, state.capabilities), if (searching) sessionLocation(snapshot, it) else null) }
                 }
                 if (otherPanes.isNotEmpty()) {
                     item { GroupLabel("Agents & terminals", "${otherPanes.size}") }
-                    items(otherPanes, key = { it.id }) { PaneCard(it, onPane, ChatState.supportsPaneChat(it, state.capabilities)) }
+                    items(otherPanes, key = { it.id }) { PaneCard(it, onPane, ChatState.supportsPaneChat(it, state.capabilities), if (searching) sessionLocation(snapshot, it) else null) }
                 }
                 if (panes.isEmpty()) item {
-                    EmptyPanel("No terminals in this tab", "Open a terminal in Herdr on your computer, or create a new workspace here.")
+                    if (searching) EmptyPanel("No matching sessions", "Try an agent name, terminal title, workspace, or directory.")
+                    else EmptyPanel("No terminals in this tab", "Open a terminal in Herdr on your computer, or create a new workspace here.")
                 }
             } else if (state.connection == ConnectionState.CONNECTED && snapshot != null) item {
                 EmptyPanel("Ready for your first workspace", "Create a workspace to open a shell on your server. Then launch your preferred agent from its terminal.")
@@ -459,7 +485,7 @@ private fun GroupLabel(label: String, count: String, color: Color = MaterialThem
 }
 
 @Composable
-private fun PaneCard(pane: Pane, onOpen: (String) -> Unit, chatAvailable: Boolean) {
+private fun PaneCard(pane: Pane, onOpen: (String) -> Unit, chatAvailable: Boolean, location: String? = null) {
     OutlinedCard(onClick = { onOpen(pane.id) }, modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
             Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = MaterialTheme.shapes.small, modifier = Modifier.size(44.dp)) {
@@ -467,6 +493,7 @@ private fun PaneCard(pane: Pane, onOpen: (String) -> Unit, chatAvailable: Boolea
             }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(pane.title.ifBlank { pane.agent ?: "Terminal" }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (location != null) Text(location, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     StatusPill(pane.status)
                     pane.agent?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1) }
@@ -476,6 +503,11 @@ private fun PaneCard(pane: Pane, onOpen: (String) -> Unit, chatAvailable: Boolea
         }
     }
 }
+
+private fun sessionLocation(snapshot: dev.herdr.android.data.Snapshot, pane: Pane): String = listOfNotNull(
+    snapshot.workspaces.firstOrNull { it.id == pane.workspaceId }?.label,
+    snapshot.tabs.firstOrNull { it.id == pane.tabId }?.label,
+).joinToString(" / ")
 
 internal fun terminalChatReason(state: HerdrUiState): String? {
     val pane = state.snapshot?.panes?.firstOrNull { it.id == state.paneId } ?: return null
@@ -488,8 +520,7 @@ internal fun terminalChatReason(state: HerdrUiState): String? {
     }
     return if (pane.agent.equals("codex", ignoreCase = true))
         "This server does not offer chat for this Codex session. Use its terminal."
-    else if (pane.agent != null) "Native chat is available for Codex sessions. Use this agent's terminal."
-    else "This pane has a terminal session without a supported Codex conversation."
+    else null
 }
 
 @Composable

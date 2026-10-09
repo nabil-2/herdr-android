@@ -41,6 +41,14 @@ The bridge starts a local stdio Codex app-server only when reading a supported p
 
 The packaged companion's full bundled license texts are available with `~/.local/bin/herdr-pocket --licenses` and in the release's `LICENSES.txt`.
 
+## Managed updates and removal
+
+`herdr-pocket update` downloads the latest published platform binary and checksum manifest from the private release repository using an authenticated GitHub CLI. For offline upgrades, use `herdr-pocket update --from-file /path/herdr-pocket-linux-x86_64` with that release's `SHA256SUMS` beside it. The staged binary is checksum-verified before execution. Previously active services are stopped before replacing the frozen archive, restarted afterward, and checked against the expected companion version. Settings and paired credentials stay in place. Source checkouts are updated through Git.
+
+`herdr-pocket uninstall --session NAME` removes only the selected verified managed service and matching root Serve handler. It preserves other Serve paths/ports, Herdr, Tailscale, and other instances. Credentials/settings stay for reinstallation; `--purge` explicitly removes the selected private instance directory. Management refuses shared binaries used by an instance owned by another hostname.
+
+Linux units include `ConditionHost` and setup records `hostName`. Run management and pairing on that machine. Re-run `herdr-pocket setup` to start an installed companion again; Herdr must already be running. The authenticated health response advertises `companionVersion` so an old listener cannot falsely satisfy readiness for a new installer.
+
 ## Install from source
 
 Source development requires Python 3.11 or later, the installed Herdr CLI, a running Herdr session, and Tailscale for managed setup.

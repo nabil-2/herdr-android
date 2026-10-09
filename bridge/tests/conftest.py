@@ -34,6 +34,8 @@ async def socket_server(tmp_path):
     results = {
         "session.snapshot": {"type": "session_snapshot", "snapshot": deepcopy(SNAPSHOT)},
         "pane.send_input": {"type": "ok"},
+        "pane.send_text": {"type": "ok"},
+        "pane.read": {"type": "pane_read", "read": {"pane_id": "w1:p1", "source": "recent_unwrapped", "format": "text", "text": "shell history\n", "truncated": False}},
         "workspace.create": {"type": "workspace_created", "workspace": {"workspace_id": "w2"}},
     }
     options = {"drop": False, "wrong_id": False}

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import uuid
 
 import httpx
@@ -41,7 +42,9 @@ async def test_live_snapshot_input_and_observer_on_isolated_session(tmp_path):
         backend = HerdrClient(socket_path, str(executable))
         app = create_app(backend, TOKEN)
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost", headers=AUTH) as phone:
-            assert (await phone.get("/v1/health")).json()["herdrVersion"] == "0.9.3"
+            health = (await phone.get("/v1/health")).json()
+            assert health["herdrVersion"] == "0.9.3"
+            assert "terminal-input" in health["capabilities"]
             created = await phone.post("/v1/workspaces", json={"cwd": str(tmp_path), "label": "Isolated Android bridge test"})
             assert created.status_code == 201
             snapshot = (await phone.get("/v1/snapshot")).json()
@@ -69,6 +72,25 @@ async def test_live_snapshot_input_and_observer_on_isolated_session(tmp_path):
             assert rejected.status_code == 400
             toolbar = await phone.post(f"/v1/panes/{pane_id}/input", json={"keys": ["ctrl+c", "esc", "tab", "up", "down", "left", "right", "ctrl+c", "enter"]})
             assert toolbar.json() == {"ok": True}
+            # Direct typing must not bracket Ctrl+U or Enter as pasted text. Check
+            # execution in our temporary directory, rather than echoed ANSI text.
+            raw_result = tmp_path / "direct-keyboard-result.txt"
+            abandoned = tmp_path / "abandoned-command-must-not-run.txt"
+            queued_text = await phone.post(f"/v1/panes/{pane_id}/terminal-input", json={"text": f"printf unsafe > {shlex.quote(str(abandoned))}"})
+            assert queued_text.json() == {"ok": True}
+            raw_marker = "RAW_KEYBOARD_" + uuid.uuid4().hex[:8]
+            direct = await phone.post(f"/v1/panes/{pane_id}/terminal-input", json={"text": f"\x15printf '%s' {shlex.quote(raw_marker)} > {shlex.quote(str(raw_result))}\r"})
+            assert direct.json() == {"ok": True}
+            async with asyncio.timeout(8):
+                while not raw_result.exists():
+                    await asyncio.sleep(0.05)
+            assert raw_result.read_text() == raw_marker
+            assert not abandoned.exists()
+            history = await phone.get(f"/v1/panes/{pane_id}/scrollback")
+            assert history.status_code == 200
+            assert history.json()["paneId"] == pane_id
+            assert marker in history.json()["text"]
+            assert len(history.json()["text"].encode("utf-8")) <= 65536
     finally:
         if observer is not None:
             await stop_observer(observer)

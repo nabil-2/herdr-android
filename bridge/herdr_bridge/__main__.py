@@ -10,6 +10,7 @@ import json
 
 import uvicorn
 
+from . import __version__
 from .app import create_app
 from .config import default_token_path, discover_socket, initialize_token, read_token
 from .herdr import HerdrClient
@@ -17,6 +18,18 @@ from .pairing import PairingStore
 
 
 def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "_apply-update":
+        from .host_manage import apply_update
+        from .host_setup import SetupError
+        try:
+            apply_update(Path(sys.argv[2]).expanduser().absolute())
+        except SetupError as error:
+            print(str(error), file=sys.stderr)
+            raise SystemExit(1) from None
+        except (OSError, ValueError):
+            print("The staged update failed. Check the companion service; credentials were preserved.", file=sys.stderr)
+            raise SystemExit(1) from None
+        return
     if sys.argv[1:] == ["--licenses"]:
         if getattr(sys, "frozen", False):
             path = Path(sys._MEIPASS) / "herdr_pocket_licenses/LICENSES.txt"
@@ -25,7 +38,7 @@ def main() -> None:
         print(path.read_text())
         return
     parser = argparse.ArgumentParser(description="Herdr Pocket: setup once, then scan the pairing code on your phone")
-    parser.add_argument("command", choices=["setup", "pair", "devices", "revoke-device", "status", "init-token", "serve"])
+    parser.add_argument("command", choices=["setup", "pair", "devices", "revoke-device", "status", "update", "uninstall", "init-token", "serve"])
     parser.add_argument("device_id", nargs="?", help="Device ID for revoke-device")
     parser.add_argument("--token-file", type=Path, default=Path(os.environ.get("HERDR_ANDROID_TOKEN_FILE", default_token_path())))
     parser.add_argument("--socket", type=Path, help="Exact Herdr Unix socket (or HERDR_SOCKET)")
@@ -40,11 +53,26 @@ def main() -> None:
     parser.add_argument("--service-config", type=Path, help="Managed service setup.json (used internally)")
     parser.add_argument("--plain", action="store_true", help="Print pairing JSON instead of a QR code")
     parser.add_argument("--qr-file", type=Path, help="Save the pairing QR as an owner-only PNG (setup or pair; works with --plain)")
-    parser.add_argument("--version", action="version", version="Herdr Pocket 0.3.1")
+    parser.add_argument("--from-file", type=Path, help="Update from a downloaded platform binary with adjacent SHA256SUMS")
+    parser.add_argument("--purge", action="store_true", help="Remove the selected instance's private configuration and paired phones during uninstall")
+    parser.add_argument("--version", action="version", version=f"Herdr Pocket {__version__}")
     args = parser.parse_args()
     if args.qr_file is not None and args.command not in {"setup", "pair"}:
         parser.error("--qr-file is available with setup or pair")
+    if args.from_file is not None and args.command != "update":
+        parser.error("--from-file is available with update")
+    if args.purge and args.command != "uninstall":
+        parser.error("--purge is available with uninstall")
     try:
+        if args.command in {"update", "uninstall"}:
+            from .host_manage import update, uninstall
+            from .host_setup import configured_host
+            root = args.config_dir.expanduser() if args.config_dir else None
+            if args.command == "update":
+                update(config_root=root, from_file=args.from_file)
+            else:
+                uninstall(configured_host(root, args.session), config_root=root, purge=args.purge)
+            return
         if args.command in {"setup", "pair", "devices", "revoke-device", "status"}:
             from .host_setup import SetupError, configured_host, setup, show_pairing, wait_healthy
             root = args.config_dir.expanduser() if args.config_dir else None
@@ -80,8 +108,9 @@ def main() -> None:
         from .host_setup import codex_settings
         chat = codex_settings(args.codex_bin, args.codex_home)
         if args.service_config:
-            from .host_setup import read_config
+            from .host_setup import ensure_current_host, read_config
             config = read_config(args.service_config.expanduser())
+            ensure_current_host(config)
             token_path, registry_path = Path(config["tokenFile"]), Path(config["registryFile"])
             socket_path, herdr_bin, host, port = Path(config["socket"]), config["herdrBin"], config["host"], config["port"]
             for field in ("codexBin", "codexHome", "codexPath"):

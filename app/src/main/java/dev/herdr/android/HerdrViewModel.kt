@@ -24,6 +24,13 @@ import dev.herdr.android.data.TerminalContent
 import dev.herdr.android.data.TerminalEndedException
 import dev.herdr.android.data.TerminalFrame
 import dev.herdr.android.data.TerminalMessage
+import dev.herdr.android.data.InputValidation
+import dev.herdr.android.data.TerminalInput
+import dev.herdr.android.data.TerminalInputDecoder
+import dev.herdr.android.data.TerminalInputQueue
+import dev.herdr.android.data.TerminalInputQueueFullException
+import dev.herdr.android.data.TerminalInputTarget
+import dev.herdr.android.data.TerminalHistory
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -61,13 +68,43 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     private var refreshJob: Job? = null
     private var autoRefreshJob: Job? = null
     private var terminalJob: Job? = null
-    private var inputJob: Job? = null
     private var createJob: Job? = null
     private var pairingJob: Job? = null
     private var pairingClient: PairingClient? = null
     private var chatJob: Job? = null
     private var olderMessagesJob: Job? = null
     private var chatInputJob: Job? = null
+    private val terminalDecoder = TerminalInputDecoder()
+    // Kept in memory across selection/reconnects so an uncertain old write is not
+    // silently cleared by a new observer. No input text is retained here.
+    private val uncertainTerminalTargets = mutableSetOf<Pair<String, String>>()
+    private val terminalInputs = TerminalInputQueue<TerminalInputTarget>(
+        scope = viewModelScope,
+        send = { target, input ->
+            check(terminalTargetMatches(target)) { "The terminal selection changed before input was sent." }
+            val currentClient = client ?: error("The terminal connection ended.")
+            if (input.raw) currentClient.terminalInput(target.paneId, input.text.orEmpty())
+            else currentClient.input(target.paneId, input.text, input.keys)
+        },
+        onBusy = { target, busy ->
+            if (terminalTargetMatches(target)) mutableState.update { it.copy(sending = busy) }
+        },
+        onAcknowledged = { target, input ->
+            if (terminalTargetMatches(target) && input.acknowledgeDraft) {
+                mutableState.update { it.copy(inputRevision = it.inputRevision + 1) }
+            }
+        },
+        onFailure = { target, error ->
+            terminalDecoder.reset()
+            uncertainTerminalTargets.add(target.profileId to target.paneId)
+            if (terminalTargetMatches(target)) mutableState.update {
+                val reason = if (error is TerminalInputQueueFullException) "Typing stopped because the terminal input queue is full."
+                    else "${readableError(error)} Input delivery was not confirmed."
+                it.copy(sending = false, terminal = it.terminal.copy(canInput = false, inputUncertain = true),
+                    error = "$reason Pending input was discarded and will not be retried. Review the terminal before continuing.")
+            }
+        },
+    )
 
     init {
         reloadProfiles()
@@ -412,36 +449,125 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun sendText(text: String, enter: Boolean = true) = sendInput(text, if (enter) listOf("enter") else emptyList())
-    fun sendKeys(vararg keys: String) = sendInput(null, keys.toList())
+    fun sendText(text: String, enter: Boolean = true): Boolean =
+        sendInput(text, if (enter) listOf("enter") else emptyList(), acknowledgeDraft = text.isNotEmpty())
 
-    private fun sendInput(text: String?, keys: List<String>) {
-        val currentState = state.value
-        val paneId = currentState.paneId ?: return
-        val currentClient = client ?: return
-        if (!ensureNetworkPermission()) return
-        if (currentState.connection != ConnectionState.CONNECTED || currentState.sending || currentState.paneMode != PaneMode.TERMINAL) return
-        if (currentState.snapshot?.panes?.none { it.id == paneId } != false) {
-            showError("The selected pane is no longer available. Refresh before sending.")
-            return
+    fun sendKeys(vararg keys: String): Boolean = sendInput(null, keys.toList())
+
+    /** Capture once per UI render so a delayed old keyboard cannot target a new pane. */
+    internal fun captureTerminalInputScope(profileId: String?, paneId: String, sessionId: Long): TerminalInputTarget? =
+        terminalInputs.target?.takeIf {
+            it.profileId == profileId && it.paneId == paneId && it.sessionId == sessionId && terminalTargetMatches(it)
         }
+
+    internal fun sendTerminalInput(scope: TerminalInputTarget?, bytes: ByteArray): Boolean =
+        currentInputScope(scope) && sendTerminalInput(bytes)
+
+    internal fun sendKeys(scope: TerminalInputTarget?, keys: List<String>): Boolean =
+        currentInputScope(scope) && sendInput(null, keys.toList())
+
+    internal fun sendText(scope: TerminalInputTarget?, text: String, enter: Boolean = true): Boolean =
+        currentInputScope(scope) && sendText(text, enter)
+
+    private fun currentInputScope(scope: TerminalInputTarget?): Boolean =
+        scope != null && scope == terminalInputs.target && terminalTargetMatches(scope)
+
+    /** Accepts only user-generated keyboard/IME input, never emulator replies. */
+    fun sendTerminalInput(bytes: ByteArray): Boolean {
+        val target = inputTarget() ?: return false
+        if ("terminal-input" !in state.value.capabilities) {
+            showError("Update the host companion for direct keyboard input. The command composer and special keys still work.")
+            return false
+        }
+        if (bytes.isEmpty()) return true
+        val decoded = try { terminalDecoder.preview(bytes) }
+        catch (error: IllegalArgumentException) {
+            terminalDecoder.reset()
+            showError(error.message ?: "Check the terminal input.")
+            return false
+        }
+        val inputs = TerminalInputDecoder.chunks(decoded.text)
+        if (inputs.isNotEmpty() && !terminalInputs.offer(target, inputs)) return false
+        terminalDecoder.accept(decoded)
+        return true
+    }
+
+    private fun sendInput(text: String?, keys: List<String>, acknowledgeDraft: Boolean = false): Boolean {
+        val target = inputTarget() ?: return false
+        if (terminalDecoder.hasPending) {
+            showError("Finish the current character before sending a special key or command.")
+            return false
+        }
+        try { InputValidation.body(text, keys) }
+        catch (error: IllegalArgumentException) { showError(error.message ?: "Check the input before sending."); return false }
+        return terminalInputs.offer(target, listOf(TerminalInput(text, keys.toList(), acknowledgeDraft = acknowledgeDraft)))
+    }
+
+    fun acknowledgeTerminalInput() {
+        val target = terminalInputs.target ?: return
+        if (!terminalTargetMatches(target) || !state.value.terminal.connected || !foreground || !paneVisible) return
+        uncertainTerminalTargets.remove(target.profileId to target.paneId)
+        terminalInputs.resume(target)
+        mutableState.update { it.copy(terminal = it.terminal.copy(canInput = true, inputUncertain = false), error = null) }
+    }
+
+    /** The calling sheet owns and cancels this read when its lifecycle ends. */
+    suspend fun readTerminalHistory(): TerminalHistory {
+        check(ensureNetworkPermission()) { "Allow local network access before reading terminal output." }
+        val current = state.value
+        val paneId = current.paneId ?: throw IllegalStateException("Select a terminal before reading recent output.")
+        val profileId = current.activeProfileId ?: throw IllegalStateException("Connect to a server before reading recent output.")
+        val currentClient = client ?: throw IllegalStateException("Connect to a server before reading recent output.")
+        check(foreground && paneVisible && current.paneMode == PaneMode.TERMINAL && current.connection == ConnectionState.CONNECTED) {
+            "Open the terminal before reading recent output."
+        }
+        check("terminal-history" in current.capabilities) { "Update the host companion to read recent terminal output." }
+        check(current.snapshot?.panes?.any { it.id == paneId } == true) { "The selected pane is no longer available. Refresh the server." }
         val currentGeneration = generation
-        mutableState.update { it.copy(sending = true, error = null) }
-        inputJob = viewModelScope.launch {
-            try {
-                currentClient.input(paneId, text, keys)
-                if (generation == currentGeneration && state.value.paneId == paneId && !text.isNullOrEmpty()) {
-                    mutableState.update { it.copy(inputRevision = it.inputRevision + 1) }
-                }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                if (generation == currentGeneration) {
-                    showError("${readableError(error)} Input was not retried; check the terminal before sending again.")
-                }
-            } finally {
-                if (generation == currentGeneration) mutableState.update { it.copy(sending = false) }
-            }
+        val currentSession = terminalSession
+        val history = currentClient.terminalHistory(paneId)
+        if (generation != currentGeneration || terminalSession != currentSession || state.value.activeProfileId != profileId ||
+            state.value.paneId != paneId || !foreground || !paneVisible || state.value.paneMode != PaneMode.TERMINAL ||
+            state.value.connection != ConnectionState.CONNECTED
+        ) throw CancellationException("The selected terminal changed before recent output was received.")
+        return history
+    }
+
+    private fun inputTarget(): TerminalInputTarget? {
+        if (!ensureNetworkPermission()) return null
+        val current = state.value
+        val target = terminalInputs.target
+        if (target == null || !terminalTargetMatches(target) || !foreground || !paneVisible ||
+            current.connection != ConnectionState.CONNECTED || current.paneMode != PaneMode.TERMINAL ||
+            !current.terminal.connected || !current.terminal.canInput || current.terminal.inputUncertain
+        ) {
+            if (!current.terminal.inputUncertain) showError("Wait for the live terminal connection before typing.")
+            return null
+        }
+        if (current.snapshot?.panes?.none { it.id == target.paneId } != false) {
+            showError("The selected pane is no longer available. Refresh before sending.")
+            return null
+        }
+        return target
+    }
+
+    private fun terminalTargetMatches(target: TerminalInputTarget): Boolean =
+        generation == target.generation && terminalSession == target.sessionId &&
+            state.value.activeProfileId == target.profileId && state.value.paneId == target.paneId &&
+            state.value.paneMode == PaneMode.TERMINAL
+
+    private fun stopTerminalInput() {
+        val target = terminalInputs.target
+        val discarded = terminalInputs.clear()
+        val partialCharacter = terminalDecoder.reset()
+        if (target != null && discarded.inFlight) uncertainTerminalTargets.add(target.profileId to target.paneId)
+        mutableState.update {
+            val identity = it.activeProfileId?.let { profile -> it.paneId?.let { pane -> profile to pane } }
+            it.copy(sending = false, terminal = it.terminal.copy(canInput = false,
+                inputUncertain = identity != null && identity in uncertainTerminalTargets), error = if (discarded.any || partialCharacter) {
+                    "Terminal input was interrupted. Pending input was discarded and will not be retried." +
+                        if (discarded.inFlight) " Check the terminal before continuing." else ""
+                } else it.error)
         }
     }
 
@@ -521,10 +647,14 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun restartObservation() {
+        stopTerminalInput()
         terminalJob?.cancel()
         terminalJob = null
         val sessionId = ++terminalSession
-        mutableState.update { it.copy(terminal = TerminalContent(revision = sessionId)) }
+        mutableState.update {
+            val identity = it.activeProfileId?.let { profile -> it.paneId?.let { pane -> profile to pane } }
+            it.copy(terminal = TerminalContent(revision = sessionId, inputUncertain = identity != null && identity in uncertainTerminalTargets))
+        }
         val paneId = state.value.paneId ?: return
         val currentClient = client ?: return
         if (!ensureNetworkPermission()) return
@@ -534,13 +664,18 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
             var attempts = 0
             while (attempts < MAX_OBSERVER_ATTEMPTS) {
                 if (generation != currentGeneration || terminalSession != sessionId) return@launch
+                val profileId = state.value.activeProfileId ?: return@launch
+                val inputTarget = TerminalInputTarget(profileId, currentGeneration, paneId, sessionId, attempts)
                 mutableState.update { it.copy(terminal = it.terminal.copy(connecting = true, connected = false)) }
                 try {
                     currentClient.observe(paneId, 80, 30).collect { message ->
                         if (generation != currentGeneration || terminalSession != sessionId) return@collect
                         if (message is TerminalMessage.Frame) {
+                            terminalInputs.activate(inputTarget)
                             mutableState.update {
-                                it.copy(terminal = it.terminal.copy(cols = message.cols, rows = message.rows, connected = true, connecting = false))
+                                val uncertain = (inputTarget.profileId to inputTarget.paneId) in uncertainTerminalTargets
+                                it.copy(terminal = it.terminal.copy(cols = message.cols, rows = message.rows, connected = true, connecting = false,
+                                    canInput = !uncertain, inputUncertain = uncertain))
                             }
                             mutableTerminalFrames.emit(TerminalFrame(message.ansi, message.cols, message.rows, message.full, sessionId, paneId))
                         }
@@ -550,6 +685,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
                     throw cancelled
                 } catch (error: Exception) {
                     if (generation != currentGeneration || terminalSession != sessionId) return@launch
+                    stopTerminalInput()
                     attempts++
                     val retry = attempts < MAX_OBSERVER_ATTEMPTS && error !is TerminalEndedException &&
                         !(error is BridgeException && error.statusCode in listOf(401, 403, 404, 409))
@@ -660,15 +796,15 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun releaseConnection() {
+        stopTerminalInput()
         generation++
         terminalSession++
         stopChatWork()
-        listOf(connectJob, refreshJob, autoRefreshJob, terminalJob, inputJob, createJob, pairingJob).forEach { it?.cancel() }
+        listOf(connectJob, refreshJob, autoRefreshJob, terminalJob, createJob, pairingJob).forEach { it?.cancel() }
         connectJob = null
         refreshJob = null
         autoRefreshJob = null
         terminalJob = null
-        inputJob = null
         createJob = null
         pairingJob = null
         pairingClient?.close()

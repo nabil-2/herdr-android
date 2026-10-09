@@ -15,6 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from . import __version__
 from .herdr import BridgeError, HerdrClient, stop_observer, validate_pane_id, validate_terminal_frame
 from .pairing import PairingError, PairingStore, valid_name
 from .codex import CodexReader, Conversations
@@ -109,6 +110,19 @@ class InputRequest(BaseModel):
         return self
 
 
+class TerminalInputRequest(BaseModel):
+    """Raw keyboard UTF-8, including control keys; never bracketed as pasted text."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    text: str = Field(min_length=1, max_length=16384)
+
+    @field_validator("text")
+    @classmethod
+    def bounded_keyboard_text(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 32768:
+            raise ValueError("Terminal input must fit within 32 KiB of UTF-8")
+        return value
+
+
 class WorkspaceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     cwd: str = Field(min_length=1, max_length=4096)
@@ -199,9 +213,10 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
     @app.get("/v1/health")
     async def health():
         snapshot = await client.snapshot()
-        result = {"service": "herdr-android-bridge", "protocol": 1, "herdrVersion": snapshot["herdrVersion"], "pairing": pairing_store is not None}
+        result = {"service": "herdr-android-bridge", "protocol": 1, "companionVersion": __version__, "herdrVersion": snapshot["herdrVersion"], "pairing": pairing_store is not None}
+        result["capabilities"] = ["terminal-input", "terminal-history"]
         if reader.enabled:
-            result["capabilities"] = ["codex-chat"]
+            result["capabilities"].append("codex-chat")
         return result
 
     @app.get("/v1/snapshot")
@@ -226,6 +241,15 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
     async def send_input(pane_id: str, request: InputRequest):
         await client.send_input(pane_id, request.text, request.keys)
         return {"ok": True}
+
+    @app.post("/v1/panes/{pane_id}/terminal-input")
+    async def terminal_input(pane_id: str, request: TerminalInputRequest):
+        await client.send_terminal_input(pane_id, request.text)
+        return {"ok": True}
+
+    @app.get("/v1/panes/{pane_id}/scrollback")
+    async def terminal_history(pane_id: str):
+        return await client.terminal_history(pane_id)
 
     @app.post("/v1/workspaces", status_code=201)
     async def create_workspace(request: WorkspaceRequest):

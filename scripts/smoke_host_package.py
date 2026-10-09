@@ -29,6 +29,7 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "bridge"))
 from herdr_bridge.pairing import PairingStore  # noqa: E402
+from herdr_bridge import __version__  # noqa: E402
 
 
 class SmokeFailure(Exception):
@@ -73,6 +74,10 @@ def mock_daemon(path: Path, *, chat: bool = False):
                     response["result"] = {"type": "session_snapshot", "snapshot": snapshot}
                 elif chat and method == "agent.get" and request.get("params") == {"target": "w1:p1"}:
                     response["result"] = {"type": "agent", "agent": snapshot["panes"][0] | {"interactive_ready": True}}
+                elif method == "pane.send_text" and request.get("params") == {"pane_id": "w1:p1", "text": "mock keyboard\u0003\r"}:
+                    response["result"] = {"type": "ok"}
+                elif method == "pane.read" and request.get("params") == {"pane_id": "w1:p1", "source": "recent_unwrapped", "format": "text", "lines": 1000, "strip_ansi": True, "intent": "interactive"}:
+                    response["result"] = {"type": "pane_read", "read": {"pane_id": "w1:p1", "source": "recent_unwrapped", "format": "text", "text": "Packaged terminal history\n", "truncated": False}}
                 else:
                     response["error"] = {"code": "unknown_method"}
                 self.wfile.write(json.dumps(response).encode() + b"\n")
@@ -127,7 +132,7 @@ def wait_ready(process: subprocess.Popen, port: int, token: str) -> dict:
         check(process.poll() is None, "The packaged companion exited before becoming ready")
         try:
             status, health = http_json(port, "/v1/health", token=token)
-            if status == 200 and health.get("service") == "herdr-android-bridge" and health.get("protocol") == 1 and health.get("pairing") is True:
+            if status == 200 and health.get("service") == "herdr-android-bridge" and health.get("protocol") == 1 and health.get("pairing") is True and health.get("companionVersion") == __version__:
                 return health
         except (OSError, ValueError, http.client.HTTPException):
             pass
@@ -230,6 +235,8 @@ def exercise(binary: Path) -> None:
                 health = wait_ready(process, port, owner_token)
                 check(health.get("herdrVersion") == "0.9.3", "The packaged bridge did not normalize the mock daemon version")
                 check("codex-chat" in health.get("capabilities", []), "The packaged Codex reader was not discovered")
+                check("terminal-input" in health.get("capabilities", []), "The packaged keyboard route was not advertised")
+                check("terminal-history" in health.get("capabilities", []), "The packaged terminal history route was not advertised")
                 status, _ = http_json(port, "/v1/health")
                 check(status == 401, "Anonymous health access was not rejected")
 
@@ -247,6 +254,11 @@ def exercise(binary: Path) -> None:
                       "A paired phone could not read the normalized snapshot")
                 check(snapshot["panes"][0].get("conversation", {}).get("available") is True,
                       "The packaged snapshot omitted a supported chat pane")
+                status, keyboard = http_json(port, "/v1/panes/w1:p1/terminal-input", token=device_token, body={"text": "mock keyboard\u0003\r"})
+                check(status == 200 and keyboard == {"ok": True}, "The packaged keyboard route changed controls or its explicit target")
+                status, output = http_json(port, "/v1/panes/w1:p1/scrollback", token=device_token)
+                check(status == 200 and output == {"paneId": "w1:p1", "text": "Packaged terminal history\n", "truncated": False},
+                      "The packaged terminal history route changed text or its target")
                 status, conversation = http_json(port, "/v1/panes/w1:p1/conversation", token=device_token)
                 check(status == 200 and [m["text"] for m in conversation["messages"]] ==
                       ["A clean chat", "**Ready from the packaged reader.**"],
@@ -283,7 +295,8 @@ def exercise(binary: Path) -> None:
                 check("Scan pairing code" in terminal_qr and any(char in terminal_qr for char in "▀▄█"),
                       "The frozen helper did not render a terminal QR code")
                 check(all(secret not in terminal_qr for secret in seen_secrets), "Terminal QR output exposed existing plaintext credentials")
-                check(methods and set(methods) == {"session.snapshot", "agent.get"}, "The smoke test attempted to mutate a Herdr session")
+                check(methods and set(methods) == {"session.snapshot", "agent.get", "pane.send_text", "pane.read"} and methods.count("pane.send_text") == 1 and methods.count("pane.read") == 1,
+                      "The smoke test dispatched unexpected operations to its synthetic daemon")
                 check(stat.S_IMODE(token_file.stat().st_mode) == 0o600 and stat.S_IMODE(registry_file.stat().st_mode) == 0o600,
                       "The smoke test's credential files are not owner-only")
                 registry_text = registry_file.read_text()

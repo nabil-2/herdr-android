@@ -88,6 +88,11 @@ data class ServerProfile(val id: String, val name: String, val baseUrl: String, 
 internal data class PaneInput(val text: String? = null, val keys: List<String> = emptyList())
 
 @Serializable
+internal data class RawTerminalInput(val text: String) {
+    override fun toString(): String = "RawTerminalInput(redacted)"
+}
+
+@Serializable
 internal data class WorkspaceInput(val cwd: String, val label: String)
 
 @Serializable
@@ -101,7 +106,13 @@ data class TerminalContent(
     val connected: Boolean = false,
     val connecting: Boolean = false,
     val revision: Long = 0,
+    val canInput: Boolean = false,
+    val inputUncertain: Boolean = false,
 )
+
+data class TerminalHistory(val paneId: String, val text: String, val truncated: Boolean) {
+    override fun toString(): String = "TerminalHistory(truncated=$truncated, redacted)"
+}
 
 data class TerminalFrame(
     val ansi: ByteArray,

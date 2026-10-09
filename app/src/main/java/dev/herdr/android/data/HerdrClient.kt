@@ -1,6 +1,8 @@
 package dev.herdr.android.data
 
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -56,7 +58,9 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
         return health
     }
 
-    suspend fun snapshot(): Snapshot = json.decodeFromString(request("GET", listOf("v1", "snapshot")))
+    suspend fun snapshot(): Snapshot = withContext(Dispatchers.Default) {
+        SnapshotProtocol.decode(request("GET", listOf("v1", "snapshot")))
+    }
 
     suspend fun conversation(paneId: String, cursor: String? = null, revision: String? = null): ConversationPage {
         cursor?.let { ConversationProtocol.validateOpaque(it, 2048) }
@@ -69,10 +73,27 @@ internal class HerdrClient(private val credentials: ServerCredentials) {
         ConversationProtocol.acknowledgement(request("POST", listOf("v1", "panes", paneId, "messages"), ConversationProtocol.input(binding, text)))
 
     suspend fun input(paneId: String, text: String?, keys: List<String>) {
-        InputValidation.validate(text, keys)
-        val body = json.encodeToString(PaneInput(text, keys))
-        InputValidation.validateBody(body)
+        val body = InputValidation.body(text, keys)
         val response = request("POST", listOf("v1", "panes", paneId, "input"), body)
+        requireInputAcknowledgement(response)
+    }
+
+    /** Literal terminal bytes decoded as strict UTF-8, including controls. */
+    suspend fun terminalInput(paneId: String, text: String) {
+        require(text.isNotEmpty()) { "Terminal input must not be empty." }
+        require(text.codePointCount(0, text.length) <= 16384 && text.toByteArray(Charsets.UTF_8).size <= 32768) {
+            "Terminal input exceeds the host limit. Paste smaller sections."
+        }
+        val body = json.encodeToString(RawTerminalInput(text))
+        InputValidation.validateBody(body)
+        requireInputAcknowledgement(request("POST", listOf("v1", "panes", paneId, "terminal-input"), body))
+    }
+
+    suspend fun terminalHistory(paneId: String): TerminalHistory = TerminalHistoryProtocol.decode(
+        request("GET", listOf("v1", "panes", paneId, "scrollback"), maxBytes = 512L * 1024L), paneId,
+    )
+
+    private fun requireInputAcknowledgement(response: String) {
         val acknowledgement = json.parseToJsonElement(response).jsonObject["ok"] as? JsonPrimitive
         if (acknowledgement == null || acknowledgement.isString || acknowledgement.booleanOrNull != true) {
             throw IOException("The bridge did not acknowledge the input.")

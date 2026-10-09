@@ -3,6 +3,10 @@ package dev.herdr.android.data
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
@@ -100,6 +104,44 @@ class HerdrClientTest {
         assertThrows(IllegalArgumentException::class.java) { runBlocking { client.input("w1:p1", "😀".repeat(8193), listOf("enter")) } }
         assertThrows(IllegalArgumentException::class.java) { runBlocking { client.input("w1:p1", "bad\u0000paste", listOf("enter")) } }
         assertNull(server.takeRequest(200, TimeUnit.MILLISECONDS))
+    }
+
+    @Test fun `literal terminal input authenticates and preserves controls NUL Unicode and escape sequences`() = runBlocking {
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        val text = "雪😀\u0000\u0003\r\u001b[A\u001b[200~paste\u001b[201~"
+        client.terminalInput("w1:p1", text)
+        val request = server.takeRequest(1, TimeUnit.SECONDS)!!
+        assertEquals("POST", request.method)
+        assertEquals("/v1/panes/w1:p1/terminal-input", request.path)
+        assertEquals("Bearer $token", request.getHeader("Authorization"))
+        val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        assertEquals(setOf("text"), body.keys)
+        assertEquals(text, body["text"]!!.jsonPrimitive.contentOrNull)
+    }
+
+    @Test fun `invalid literal terminal sizes are refused before any request`() {
+        listOf("", "a".repeat(16385), "😀".repeat(8193), "\u0000".repeat(16384)).forEach { text ->
+            assertThrows(IllegalArgumentException::class.java) { runBlocking { client.terminalInput("w1:p1", text) } }
+        }
+        assertNull(server.takeRequest(200, TimeUnit.MILLISECONDS))
+    }
+
+    @Test fun `literal keystrokes whose acknowledgement is lost are never replayed`() {
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST))
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        assertThrows(IOException::class.java) { runBlocking { client.terminalInput("w1:p1", "\u0003") } }
+        assertEquals("/v1/panes/w1:p1/terminal-input", server.takeRequest(1, TimeUnit.SECONDS)!!.path)
+        assertNull(server.takeRequest(300, TimeUnit.MILLISECONDS))
+    }
+
+    @Test fun `literal terminal input rejects false acknowledgement and retry advice`() {
+        listOf(MockResponse().setBody("""{"ok":false}"""),
+            MockResponse().setResponseCode(503).addHeader("Retry-After", "0").setBody("""{"detail":"Unavailable"}""")).forEach { response ->
+            server.enqueue(response)
+            assertThrows(IOException::class.java) { runBlocking { client.terminalInput("w1:p1", "x") } }
+            assertEquals("POST", server.takeRequest(1, TimeUnit.SECONDS)!!.method)
+            assertNull(server.takeRequest(200, TimeUnit.MILLISECONDS))
+        }
     }
 
     @Test fun `only a true acknowledgement reports command success and never retries`() {

@@ -14,7 +14,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 
-internal enum class Symbol { BACK, PLUS, REFRESH, SERVER, NEXT, CLOSE, TERMINAL, CHAT, SEND, DELETE, QR }
+internal enum class Symbol { BACK, PLUS, REFRESH, SERVER, NEXT, CLOSE, TERMINAL, CHAT, SEND, DELETE, QR, SEARCH }
 
 /** Small local vector set; no image assets or icon-font dependency. */
 @Composable
@@ -25,6 +25,10 @@ internal fun SymbolIcon(symbol: Symbol, description: String? = null, modifier: M
         fun line(x1: Float, y1: Float, x2: Float, y2: Float) =
             drawLine(color, Offset(x1 * unit, y1 * unit), Offset(x2 * unit, y2 * unit), 1.8f * unit)
         when (symbol) {
+            Symbol.SEARCH -> {
+                drawCircle(color, 6.5f * unit, Offset(10f * unit, 10f * unit), style = Stroke(1.8f * unit))
+                line(15f, 15f, 21f, 21f)
+            }
             Symbol.CHAT -> {
                 val path = Path().apply {
                     moveTo(5f * unit, 4f * unit); lineTo(19f * unit, 4f * unit)

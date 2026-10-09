@@ -80,12 +80,14 @@ class LiveBridgeDeviceTest {
             compose.waitUntil(timeoutMillis = 15_000) {
                 compose.onAllNodesWithText("Live", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
             }
+            openCommandComposer()
             compose.onNodeWithTag("command-draft").performTextInput("printf 'PHONE_QR_PAIRING_E2E_OK\\n'")
             compose.onNodeWithTag("send-command").performClick()
             compose.waitUntil(timeoutMillis = 10_000) {
                 val node = compose.onNodeWithTag("command-draft").fetchSemanticsNode()
                 node.config.getOrElse(SemanticsProperties.EditableText) { AnnotatedString("pending") }.text.isEmpty()
             }
+            closeCommandComposer()
         } finally {
             store.profiles().filterNot { it.id in originalIds }.forEach { store.remove(it.id) }
         }
@@ -123,6 +125,7 @@ class LiveBridgeDeviceTest {
             compose.waitUntil(timeoutMillis = 15_000) {
                 compose.onAllNodesWithText("Live", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
             }
+            openCommandComposer()
             compose.onNodeWithTag("command-draft").performTextInput("printf 'PHONE_NATIVE_E2E_OK\\n'")
             compose.onNodeWithTag("send-command").performClick()
             compose.waitUntil(timeoutMillis = 10_000) {
@@ -132,6 +135,7 @@ class LiveBridgeDeviceTest {
             compose.onNodeWithTag("command-draft").assert(
                 SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")),
             )
+            closeCommandComposer()
             compose.waitForIdle()
             File(screenshots, "terminal.png").outputStream().use {
                 InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
@@ -140,5 +144,16 @@ class LiveBridgeDeviceTest {
         } finally {
             store.profiles().filterNot { it.id in originalIds }.forEach { store.remove(it.id) }
         }
+    }
+
+    private fun openCommandComposer() {
+        compose.onNodeWithTag("terminal-tools").performClick()
+        compose.onNodeWithTag("terminal-compose").performScrollTo().performClick()
+        compose.onNodeWithTag("command-draft").performScrollTo().assertIsDisplayed()
+    }
+
+    private fun closeCommandComposer() {
+        compose.onNodeWithText("Done").performClick()
+        compose.onNodeWithTag("terminal-surface").assertIsDisplayed()
     }
 }
