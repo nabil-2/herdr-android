@@ -158,23 +158,47 @@ bridge/.venv/bin/python scripts/live_device_fixture.py > artifacts/live-device/f
 
 It starts a UUID-named Herdr session, creates its own workspace labelled `Android live test` in a temporary directory, writes `HERDR_ANDROID_LIVE_DEVICE_READY` in green, and runs the actual companion on `127.0.0.1:18765`. Its one-line readiness JSON contains `url`, `workspaceId`, `paneId`, the complete `pairingPayload` string, and the path `qrImage` to a host-generated QR PNG. Wait for that JSON before starting the device test. Startup is bounded; a busy port fails before any session is created. Keep the fixture running for the device test, then press Ctrl+C or send SIGTERM. It shuts down the companion and stops and reaps only its own Herdr session; stopped metadata can remain in Herdr's configuration directory.
 
-With an emulator or test device attached, run in another terminal:
+With `adb` on `PATH`, run this in another terminal. Set `HERDR_TEST_DEVICE` to the emulator or disposable test device's serial from `adb devices`. It installs the two existing APKs, copies the QR into app-private storage, runs only the three live tests, and cleans up the QR and port reversal. `shlex.join` preserves the invitation JSON when Android's shell parses the instrumentation command.
 
 ```sh
-task_payload=$(bridge/.venv/bin/python -c 'import json; print(json.load(open("artifacts/live-device/fixture.json"))["pairingPayload"])')
-task_qr=$(bridge/.venv/bin/python -c 'import json; print(json.load(open("artifacts/live-device/fixture.json"))["qrImage"])')
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb reverse tcp:18765 tcp:18765
-adb shell mkdir -p /sdcard/Android/data/dev.herdr.android/files/validation
-adb push "$task_qr" /sdcard/Android/data/dev.herdr.android/files/validation/host-pairing.png
-./gradlew :app:connectedDebugAndroidTest \
-  -Pandroid.testInstrumentationRunnerArguments.class=dev.herdr.android.LiveBridgeDeviceTest \
-  -Pandroid.testInstrumentationRunnerArguments.live_bridge_url=http://127.0.0.1:18765 \
-  -Pandroid.testInstrumentationRunnerArguments.live_bridge_token=android-emulator-isolated-test-token-20261008 \
-  "-Pandroid.testInstrumentationRunnerArguments.live_pairing_payload=$task_payload" \
-  -Pandroid.testInstrumentationRunnerArguments.live_pairing_qr=/sdcard/Android/data/dev.herdr.android/files/validation/host-pairing.png
-adb reverse --remove tcp:18765
+HERDR_TEST_DEVICE=emulator-5554 bridge/.venv/bin/python - <<'PY'
+import json, os, shlex, subprocess
+from pathlib import Path
+
+device = os.environ["HERDR_TEST_DEVICE"]
+fixture = json.loads(Path("artifacts/live-device/fixture.json").read_text())
+package = "dev.herdr.android"
+qr_path = f"/data/user/0/{package}/files/live-fixture-pairing.png"
+
+def adb(*args, **kwargs):
+    return subprocess.run(["adb", "-s", device, *args], check=True, **kwargs)
+
+adb("install", "-r", "app/build/outputs/apk/debug/app-debug.apk")
+adb("install", "-r", "app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk")
+adb("reverse", "tcp:18765", "tcp:18765")
+try:
+    adb("shell", shlex.join(["run-as", package, "mkdir", "-p", "files"]))
+    adb("shell", shlex.join(["run-as", package, "sh", "-c", "cat > " + shlex.quote(qr_path)]),
+        input=Path(fixture["qrImage"]).read_bytes())
+    command = ["am", "instrument", "-w",
+        "-e", "class", "dev.herdr.android.LiveBridgeDeviceTest",
+        "-e", "live_bridge_url", fixture["url"],
+        "-e", "live_bridge_token", "android-emulator-isolated-test-token-20261008",
+        "-e", "live_pairing_payload", fixture["pairingPayload"],
+        "-e", "live_pairing_qr", qr_path,
+        "dev.herdr.android.test/androidx.test.runner.AndroidJUnitRunner"]
+    result = adb("shell", shlex.join(command), capture_output=True, text=True)
+    print(result.stdout, end="")
+    if "OK (3 tests)" not in result.stdout:
+        raise SystemExit("Live Android tests failed.")
+finally:
+    subprocess.run(["adb", "-s", device, "shell",
+        shlex.join(["run-as", package, "rm", "-f", qr_path])], check=False)
+    adb("reverse", "--remove", "tcp:18765")
+PY
 ```
+
+Let the app create its own external screenshot directory. Creating that directory or pushing the QR there as the ADB shell can cause Android 13 storage permission failures.
 
 The device test decodes the host QR image with the same native decoder, pastes the invitation, confirms pairing, opens a real pane, and verifies submitted shell input. Emulator image decoding does not test a physical camera. Restart the fixture for a fresh invitation before rerunning the one-use pairing test.
 
