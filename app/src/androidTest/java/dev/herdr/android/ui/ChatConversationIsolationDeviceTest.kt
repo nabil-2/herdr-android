@@ -4,7 +4,9 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.hasSetTextAction
+import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
@@ -101,7 +103,7 @@ class ChatConversationIsolationDeviceTest {
             fixture.connect()
             compose.onNodeWithTag("new-codex-chat").performClick()
             compose.onNodeWithTag("create-tab").assertIsNotEnabled()
-            compose.onNodeWithText(TabCreationProtocol.CODEX_CREATION_REQUIREMENT).assertIsDisplayed()
+            compose.onNode(hasText(TabCreationProtocol.CODEX_CREATION_REQUIREMENT) and hasAnyAncestor(isDialog())).assertIsDisplayed()
             compose.runOnIdle { fixture.vm.createTab("w1", "Synthetic chat", "/tmp/synthetic", codex = true) }
             assertEquals(0, fixture.creations.get())
             assertTrue(fixture.unexpectedWrites.isEmpty())

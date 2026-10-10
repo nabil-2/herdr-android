@@ -37,6 +37,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -203,6 +204,39 @@ class NativeTerminalWorkflowTest {
             }
             fixture.awaitTerminal("w1:p1")
             compose.onNodeWithTag("terminal-scroll-program-hint").assertDoesNotExist()
+        }
+    }
+
+    @Test
+    fun focusedNativeEditorsCanBeRemovedRepeatedlyWithoutRelayoutCrashesOrStaleInput() {
+        Fixture().use { fixture ->
+            fixture.open()
+            compose.onNodeWithText("Shell project").performClick()
+            fixture.awaitTerminal("w1:p1")
+            repeat(6) { index ->
+                val nextPane = if (index % 2 == 0) "w2:p2" else "w1:p1"
+                lateinit var retiredConnection: android.view.inputmethod.InputConnection
+                compose.runOnIdle {
+                    val editor = terminalInputView(compose.activity.window.decorView)
+                    editor.requestKeyboard()
+                    assertTrue("The removed AndroidView must actually own native focus", editor.isFocused)
+                    retiredConnection = editor.onCreateInputConnection(EditorInfo())!!
+                    assertTrue(retiredConnection.setComposingText("Synthetic unsent word $index", 1))
+                    fixture.vm.selectPane(nextPane)
+                }
+                fixture.awaitTerminal(nextPane)
+                compose.runOnIdle {
+                    assertFalse("The retired editor cannot send into a different pane", retiredConnection.commitText("stale", 1))
+                    val editor = terminalInputView(compose.activity.window.decorView)
+                    editor.requestKeyboard()
+                    assertTrue(editor.isFocused)
+                    fixture.vm.leavePane()
+                }
+                compose.waitUntil(10_000) { compose.onAllNodesWithTag("terminal-input-view").fetchSemanticsNodes().isEmpty() }
+                compose.runOnIdle { fixture.vm.selectPane(nextPane) }
+                fixture.awaitTerminal(nextPane)
+            }
+            compose.runOnIdle { assertTrue("Focus changes and abandoned composition must never become terminal input", fixture.inputs.isEmpty()) }
         }
     }
 
