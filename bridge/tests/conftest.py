@@ -46,7 +46,11 @@ async def socket_server(tmp_path):
             requests.append(request)
             if options["drop"]:
                 return
-            result = results[request["method"]]
+            if request["method"] == "pane.process_info" and request["method"] not in results:
+                result = {"type": "pane_process_info", "process_info": {
+                    "pane_id": request["params"]["pane_id"], "foreground_processes": []}}
+            else:
+                result = results[request["method"]]
             response = {"id": "wrong" if options["wrong_id"] else request["id"]}
             if "error" in result:
                 response.update(result)

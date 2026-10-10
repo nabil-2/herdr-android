@@ -8,6 +8,7 @@ No installed Herdr, Tailscale, service manager, or third-party HTTP client is us
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import contextmanager, suppress
 import http.client
 import json
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+from urllib.parse import urlencode
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +51,13 @@ SNAPSHOT = {
     "agents": [], "layouts": [],
 }
 CHAT_THREAD = "00000000-0000-4000-8000-000000000003"
+# Our generated 2x2 blue pixels exercise the frozen codecs, without requiring
+# Pillow in the external smoke runner or introducing user-provided image data.
+IMAGE_FIXTURES = {
+    "png": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR42mNkYPjPwMDAxMDAwMDAAAALHwEDmlnfSQAAAABJRU5ErkJggg==",
+    "jpeg": "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAACAAIDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABQf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCOALiMf//Z",
+    "webp": "UklGRjoAAABXRUJQVlA4IC4AAACQAQCdASoCAAIAAUAmJaACdLoAA5gA/vtV4/+lwf/S4P/pcH/pcH8bss4bpAAA",
+}
 
 
 @contextmanager
@@ -74,6 +83,9 @@ def mock_daemon(path: Path, *, chat: bool = False):
                     response["result"] = {"type": "session_snapshot", "snapshot": snapshot}
                 elif chat and method == "agent.get" and request.get("params") == {"target": "w1:p1"}:
                     response["result"] = {"type": "agent", "agent": snapshot["panes"][0] | {"interactive_ready": True}}
+                elif chat and method == "pane.process_info" and request.get("params") == {"pane_id": "w1:p1"}:
+                    response["result"] = {"type": "process_info", "process_info": {
+                        "pane_id": "w1:p1", "foreground_processes": []}}
                 elif method == "pane.send_text" and request.get("params") == {"pane_id": "w1:p1", "text": "mock keyboard\u0003\r"}:
                     response["result"] = {"type": "ok"}
                 elif method == "pane.read" and request.get("params") == {"pane_id": "w1:p1", "source": "recent_unwrapped", "format": "text", "lines": 1000, "strip_ansi": True, "intent": "interactive"}:
@@ -121,6 +133,22 @@ def http_json(port: int, path: str, *, token: str | None = None, body: dict | No
         check(len(raw) <= 1024 * 1024, "The companion returned an oversized response")
         value = json.loads(raw)
         check(isinstance(value, dict), "The companion returned a non-object response")
+        return response.status, value
+    finally:
+        connection.close()
+
+
+def attachment_request(port: int, path: str, token: str, binding: str, *, data: bytes | None = None) -> tuple[int, dict]:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    headers = {"Authorization": "Bearer " + token, "X-Herdr-Chat-Binding": binding,
+               "Accept": "application/json", "Content-Type": "application/octet-stream"}
+    try:
+        connection.request("POST" if data is not None else "DELETE", path, body=data, headers=headers)
+        response = connection.getresponse()
+        raw = response.read(65537)
+        check(len(raw) <= 65536, "Attachment request returned an oversized response")
+        value = json.loads(raw)
+        check(isinstance(value, dict), "Attachment request returned an invalid response")
         return response.status, value
     finally:
         connection.close()
@@ -204,10 +232,10 @@ for line in sys.stdin:
 def exercise(binary: Path) -> None:
     check("Herdr Pocket " in command(binary, "--version"), "The packaged binary has an unexpected version output")
     licenses = command(binary, "--licenses").lower()
-    check(all(name in licenses for name in ("python", "segno", "pyinstaller")), "The packaged license bundle is incomplete")
+    check(all(name in licenses for name in ("python", "segno", "pyinstaller", "pillow")), "The packaged license bundle is incomplete")
     # Darwin's default TMPDIR can be too long for a Unix socket pathname.
     with tempfile.TemporaryDirectory(prefix="pocket-smoke-", dir="/tmp") as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         daemon_socket = root / "mock.sock"
         token_file, registry_file = root / "token", root / "devices.json"
         owner_token = secrets.token_urlsafe(32)
@@ -228,14 +256,17 @@ def exercise(binary: Path) -> None:
         write_private(config_file, json.dumps(config).encode())
         log_file = root / "companion.log"
         with mock_daemon(daemon_socket, chat=True) as methods, log_file.open("wb") as log:
+            environment = dict(os.environ)
+            environment["XDG_CACHE_HOME"] = str(root / "cache")
             process = subprocess.Popen([
                 str(binary), "serve", "--service-config", str(config_file),
-            ], stdout=log, stderr=log, start_new_session=True)
+            ], stdout=log, stderr=log, start_new_session=True, env=environment)
             try:
                 health = wait_ready(process, port, owner_token)
                 check(health.get("herdrVersion") == "0.9.3", "The packaged bridge did not normalize the mock daemon version")
                 check("codex-chat" in health.get("capabilities", []), "The packaged Codex reader was not discovered")
                 check("codex-chat-working-input" in health.get("capabilities", []), "The packaged companion does not advertise working chat updates")
+                check("codex-chat-attachments" in health.get("capabilities", []), "The packaged companion does not advertise chat attachments")
                 check("terminal-input" in health.get("capabilities", []), "The packaged keyboard route was not advertised")
                 check("terminal-history" in health.get("capabilities", []), "The packaged terminal history route was not advertised")
                 status, _ = http_json(port, "/v1/health")
@@ -269,6 +300,27 @@ def exercise(binary: Path) -> None:
                 reader_methods = [json.loads(line) for line in (codex_home / "methods.jsonl").read_text().splitlines()]
                 check(reader_methods == ["initialize", "initialized", "thread/read"],
                       "The packaged reader attempted additional Codex operations")
+                binding = conversation["binding"]
+                for extension, encoded in IMAGE_FIXTURES.items():
+                    data = base64.b64decode(encoded, validate=True)
+                    name = "owned screenshot." + extension
+                    path = "/v1/panes/w1:p1/attachments?" + urlencode({"kind": "image", "name": name})
+                    status, receipt = attachment_request(port, path, device_token, binding, data=data)
+                    check(status == 201 and receipt.get("name") == name and receipt.get("kind") == "image"
+                          and receipt.get("mimeType") == "image/" + extension and receipt.get("sizeBytes") == len(data)
+                          and isinstance(receipt.get("id"), str) and len(receipt["id"]) == 32,
+                          "A frozen image codec or scoped attachment upload failed")
+                    check(set(receipt) == {"id", "name", "kind", "mimeType", "sizeBytes"},
+                          "Attachment receipt exposed an unexpected field")
+                    status, deleted = attachment_request(port, "/v1/panes/w1:p1/attachments/" + receipt["id"], device_token, binding)
+                    check(status == 200 and deleted == {"ok": True}, "A frozen image stage could not be removed")
+                data = b"Owned generic file fixture\n"
+                path = "/v1/panes/w1:p1/attachments?" + urlencode({"kind": "file", "name": "notes.txt"})
+                status, receipt = attachment_request(port, path, device_token, binding, data=data)
+                check(status == 201 and receipt.get("kind") == "file" and receipt.get("sizeBytes") == len(data),
+                      "A frozen generic file could not be staged")
+                status, deleted = attachment_request(port, "/v1/panes/w1:p1/attachments/" + receipt["id"], device_token, binding)
+                check(status == 200 and deleted == {"ok": True}, "A frozen generic file stage could not be removed")
                 status, _ = http_json(port, "/v1/pair", body={"code": invitation["code"], "deviceName": "Replay test phone"})
                 check(status == 401, "A used invitation could pair a second phone")
 
@@ -296,7 +348,7 @@ def exercise(binary: Path) -> None:
                 check("Scan pairing code" in terminal_qr and any(char in terminal_qr for char in "▀▄█"),
                       "The frozen helper did not render a terminal QR code")
                 check(all(secret not in terminal_qr for secret in seen_secrets), "Terminal QR output exposed existing plaintext credentials")
-                check(methods and set(methods) == {"session.snapshot", "agent.get", "pane.send_text", "pane.read"} and methods.count("pane.send_text") == 1 and methods.count("pane.read") == 1,
+                check(methods and set(methods) == {"session.snapshot", "agent.get", "pane.process_info", "pane.send_text", "pane.read"} and methods.count("pane.send_text") == 1 and methods.count("pane.read") == 1,
                       "The smoke test dispatched unexpected operations to its synthetic daemon")
                 check(stat.S_IMODE(token_file.stat().st_mode) == 0o600 and stat.S_IMODE(registry_file.stat().st_mode) == 0o600,
                       "The smoke test's credential files are not owner-only")
@@ -325,7 +377,7 @@ def main() -> int:
         message = str(error) if isinstance(error, SmokeFailure) else f"Unexpected {type(error).__name__}"
         print("Packaged host smoke test failed: " + message, file=sys.stderr)
         return 1
-    print("Packaged host smoke passed: authenticated API, clean Codex chat, single-use pairing, revocation, frozen QR helpers, and bundled licenses.")
+    print("Packaged host smoke passed: authenticated API, clean Codex chat, PNG/JPEG/WebP and file uploads, single-use pairing, revocation, frozen QR helpers, and bundled licenses.")
     return 0
 
 

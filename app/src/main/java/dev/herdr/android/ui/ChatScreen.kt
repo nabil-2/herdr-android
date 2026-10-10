@@ -1,12 +1,14 @@
 package dev.herdr.android.ui
 
 import androidx.activity.compose.BackHandler
+import android.net.Uri
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -26,6 +28,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.HorizontalDivider
@@ -65,6 +68,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.UriHandler
 import androidx.compose.ui.layout.onSizeChanged
@@ -92,6 +96,9 @@ import com.mikepenz.markdown.model.markdownPadding
 import com.mikepenz.markdown.model.rememberMarkdownState
 import dev.herdr.android.data.ChatContent
 import dev.herdr.android.data.ChatMessage
+import dev.herdr.android.data.ChatAttachmentKind
+import dev.herdr.android.data.ChatAttachmentTarget
+import dev.herdr.android.data.CodexConversationSelectionState
 import dev.herdr.android.data.ConnectionState
 import dev.herdr.android.data.HerdrUiState
 import kotlinx.coroutines.launch
@@ -115,12 +122,25 @@ internal fun ChatScreen(
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
     onAcknowledgeDelivery: () -> Unit,
+    onAddAttachments: (ChatAttachmentTarget, List<Uri>, ChatAttachmentKind) -> Unit = { _, _, _ -> },
+    onRemoveAttachment: (ChatAttachmentTarget, String) -> Unit = { _, _ -> },
+    onDismissAttachmentError: () -> Unit = {},
+    onChooseConversation: () -> Unit = {},
+    onSelectConversation: (String) -> Unit = {},
+    onDismissConversationSelection: () -> Unit = {},
 ) {
     val pane = state.snapshot?.panes?.firstOrNull { it.id == state.paneId }
     val workspace = state.snapshot?.workspaces?.firstOrNull { it.id == pane?.workspaceId }
     val tab = state.snapshot?.tabs?.firstOrNull { it.id == pane?.tabId }
     val chat = state.chat
     val connected = state.connection == ConnectionState.CONNECTED
+    val selectable = pane?.conversation?.selectable == true && "codex-chat-selection" in state.capabilities
+    val selection = state.codexSelection.takeIf { it.profileId == state.activeProfileId && it.paneId == state.paneId }
+        ?: CodexConversationSelectionState()
+    val chooseConversation = selectable && (selection.showing || (pane?.conversation?.available != true && chat.bindingId == null))
+    LaunchedEffect(state.activeProfileId, state.paneId, connected, selectable, chooseConversation) {
+        if (connected && chooseConversation && !selection.showing && !chat.deliveryUncertain) onChooseConversation()
+    }
     val cannotSendReason = if (chat.status == "working" && !chat.canSend && "codex-chat-working-input" !in state.capabilities) {
         "Update the host companion to send while Codex works."
     } else chat.canSendReason
@@ -137,6 +157,7 @@ internal fun ChatScreen(
                 },
                 navigationIcon = { IconButton(onClick = onBack) { SymbolIcon(Symbol.BACK, "Back to workspaces") } },
                 actions = {
+                    if (selectable && !chooseConversation) TextButton(onClick = onChooseConversation, enabled = connected && !chat.sending && !chat.deliveryUncertain, modifier = Modifier.testTag("choose-codex-conversation")) { Text("Conversation") }
                     TextButton(onClick = onTerminal, modifier = Modifier.heightIn(min = 48.dp).testTag("open-chat-terminal")) { Text("Terminal") }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = CanvasColor),
@@ -149,9 +170,17 @@ internal fun ChatScreen(
                 !connected -> ChatNotice("Server disconnected", "Reconnect to update this conversation and send messages.", "Reconnect", onRetry)
                 chat.status == "blocked" -> ChatNotice("Codex needs your attention", "Open the terminal to answer a question or approve an action.", "Open terminal", onTerminal, Modifier.testTag("chat-attention"))
             }
-            if (chat.deliveryUncertain) ChatNotice("Message delivery is uncertain", "Check the conversation or terminal before sending this message again.", "I checked the conversation", onAcknowledgeDelivery, Modifier.testTag("chat-delivery-uncertain"))
+            if (chat.deliveryUncertain) ChatNotice("Message delivery is uncertain",
+                if (chat.attachmentDeliveryUncertain) "Check Terminal and clear any partial draft before continuing. Remove these attachments and attach them again if needed."
+                else "Check the conversation or terminal before sending this message again.",
+                if (chat.attachmentDeliveryUncertain) "I checked and cleared Terminal" else "I checked the conversation",
+                onAcknowledgeDelivery, Modifier.testTag("chat-delivery-uncertain"))
             else if (chat.error != null) ChatNotice("Conversation needs a refresh", chat.error, "Refresh conversation", onRetry)
             if (chat.warning != null) Text(chat.warning, Modifier.padding(horizontal = 20.dp, vertical = 8.dp), color = Amber, style = MaterialTheme.typography.bodySmall)
+            if (chooseConversation) {
+                CodexConversationSelector(selection, onChooseConversation, onSelectConversation,
+                    onDismissConversationSelection.takeIf { chat.bindingId != null }, Modifier.weight(1f).fillMaxWidth())
+            } else {
             key(chat.bindingId, chat.historyEpoch) {
                 ConversationMessages(chat, onOlder, Modifier.weight(1f).fillMaxWidth())
             }
@@ -159,6 +188,16 @@ internal fun ChatScreen(
                 Text(if (chat.canSend) "Working · Send updates this task" else "Working…", Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp).testTag("chat-working"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
             }
+            ChatAttachments(state, onAddAttachments, onRemoveAttachment, onDismissAttachmentError)
+            val attachmentTarget = remember(state.activeProfileId, state.paneId, chat.bindingId) {
+                val profileId = state.activeProfileId
+                val paneId = state.paneId
+                val binding = chat.bindingId
+                if (profileId != null && paneId != null && binding != null) ChatAttachmentTarget(profileId, paneId, binding) else null
+            }
+            val imageReceiver = chatImageContentReceiver(attachmentTarget, onAddAttachments,
+                enabled = connected && "codex-chat-attachments" in state.capabilities && !chat.sending && !chat.deliveryUncertain)
+            key(state.activeProfileId, state.paneId, chat.bindingId) {
             ChatComposer(
                 draft = chat.draft,
                 canSend = connected && chat.canSubmitMessage(),
@@ -167,7 +206,11 @@ internal fun ChatScreen(
                 disabledReason = cannotSendReason?.takeIf { connected && !chat.canSend && chat.status != "blocked" && chat.error == null && !chat.loading && !chat.sending },
                 onDraftChange = onDraftChange,
                 onSend = onSend,
+                hasAttachments = chat.attachments.isNotEmpty(),
+                attachmentModifier = imageReceiver,
             )
+            }
+            }
         }
     }
 }
@@ -380,10 +423,16 @@ internal fun AssistantMarkdown(text: String) {
             }
         }
     }
-    val parsed = rememberMarkdownState(content = text, retainState = true)
+    val prepared = remember(text) { prepareMathMarkdown(text) }
+    val parsed = rememberMarkdownState(content = prepared.source, retainState = true)
     CompositionLocalProvider(LocalUriHandler provides safeHandler) {
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val density = LocalDensity.current
+        val rendering = rememberMathMarkdownRendering(prepared, with(density) { (maxWidth - 24.dp).toPx().coerceAtLeast(1f) })
         Markdown(
             markdownState = parsed,
+            annotator = rendering.annotator,
+            inlineContent = rendering.inline,
             typography = markdownTypography(
                 h1 = chatBodyStyle().copy(fontSize = 20.sp, lineHeight = 28.sp, fontWeight = FontWeight.SemiBold),
                 h2 = chatBodyStyle().copy(fontSize = 18.sp, lineHeight = 26.sp, fontWeight = FontWeight.SemiBold),
@@ -400,6 +449,7 @@ internal fun AssistantMarkdown(text: String) {
             padding = markdownPadding(block = 6.dp, list = 4.dp, listItemTop = 2.dp, listItemBottom = 2.dp, listIndent = 12.dp, codeBlock = PaddingValues(0.dp)),
             modifier = Modifier.fillMaxWidth(),
             components = markdownComponents(
+                custom = { _, model -> Text(model.content.substring(model.node.startOffset, model.node.endOffset), style = chatBodyStyle()) },
                 codeFence = { model -> MarkdownCodeFence(model.content, model.node, model.typography.code) { code, language, _ -> ChatCodeBlock(code, language) } },
                 codeBlock = { model -> MarkdownCodeBlock(model.content, model.node, model.typography.code) { code, language, _ -> ChatCodeBlock(code, language) } },
                 image = { Text("Image attachment", color = MaterialTheme.colorScheme.onSurfaceVariant) },
@@ -414,6 +464,7 @@ internal fun AssistantMarkdown(text: String) {
             loading = { Text(text, style = chatBodyStyle()) },
             error = { Text(text, style = chatBodyStyle()) },
         )
+        }
     }
 }
 
@@ -432,23 +483,34 @@ private fun ChatCodeBlock(code: String, language: String?) {
 }
 
 @Composable
-internal fun ChatComposer(draft: String, canSend: Boolean, sending: Boolean, editable: Boolean = true, disabledReason: String? = null, onDraftChange: (String) -> Unit, onSend: () -> Unit) {
+internal fun ChatComposer(draft: String, canSend: Boolean, sending: Boolean, editable: Boolean = true, disabledReason: String? = null, onDraftChange: (String) -> Unit, onSend: () -> Unit, hasAttachments: Boolean = false, attachmentModifier: Modifier = Modifier) {
+    val field = rememberTextFieldState(draft)
+    val latestDraftChange by androidx.compose.runtime.rememberUpdatedState(onDraftChange)
+    val latestDraft by androidx.compose.runtime.rememberUpdatedState(draft)
+    LaunchedEffect(draft) {
+        if (field.text.toString() != draft) field.edit { replace(0, length, draft) }
+    }
+    LaunchedEffect(field) {
+        snapshotFlow { field.text.toString() }.collect { value ->
+            if (value != latestDraft) latestDraftChange(value)
+        }
+    }
     Surface(color = CanvasColor) {
         Column {
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
-                    value = draft, onValueChange = onDraftChange,
+                    state = field,
                     enabled = editable,
                     placeholder = { Text("Message Codex", style = chatBodyStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                    minLines = 1, maxLines = 5,
+                    lineLimits = androidx.compose.foundation.text.input.TextFieldLineLimits.MultiLine(minHeightInLines = 1, maxHeightInLines = 5),
                     shape = RoundedCornerShape(22.dp),
                     colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant, focusedBorderColor = MaterialTheme.colorScheme.primary, unfocusedContainerColor = MaterialTheme.colorScheme.surface, focusedContainerColor = MaterialTheme.colorScheme.surface),
                     keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Default),
-                    modifier = Modifier.weight(1f).testTag("chat-draft"),
+                    modifier = Modifier.weight(1f).then(attachmentModifier).testTag("chat-draft"),
                     textStyle = chatBodyStyle(),
                 )
-                FilledIconButton(onClick = onSend, enabled = canSend && draft.isNotBlank() && !sending, shape = RoundedCornerShape(16.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = Mint, contentColor = MaterialTheme.colorScheme.onPrimary), modifier = Modifier.size(48.dp).testTag("send-chat").semantics { contentDescription = if (sending) "Sending message" else "Send message" }) {
+                FilledIconButton(onClick = onSend, enabled = canSend && (draft.isNotBlank() || hasAttachments) && !sending, shape = RoundedCornerShape(16.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = Mint, contentColor = MaterialTheme.colorScheme.onPrimary), modifier = Modifier.size(48.dp).testTag("send-chat").semantics { contentDescription = if (sending) "Sending message" else "Send message" }) {
                     if (sending) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else SymbolIcon(Symbol.SEND)
                 }
             }

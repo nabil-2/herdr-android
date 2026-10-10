@@ -3,14 +3,23 @@ package dev.herdr.android
 import android.app.Application
 import android.content.pm.PackageManager
 import android.os.Build
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.herdr.android.data.BridgeException
 import dev.herdr.android.data.ConnectionState
 import dev.herdr.android.data.ChatContent
+import dev.herdr.android.data.ChatAttachment
+import dev.herdr.android.data.ChatAttachmentKind
+import dev.herdr.android.data.ChatAttachmentStatus
+import dev.herdr.android.data.ChatAttachmentTarget
+import dev.herdr.android.data.ChatAttachmentProtocol
+import dev.herdr.android.data.ChatAttachmentPreparation
+import dev.herdr.android.data.PreparedChatAttachment
 import dev.herdr.android.data.ChatDraftStore
 import dev.herdr.android.data.ChatState
 import dev.herdr.android.data.ConversationProtocol
+import dev.herdr.android.data.CodexConversationSelectionState
 import dev.herdr.android.data.HerdrClient
 import dev.herdr.android.data.HerdrUiState
 import dev.herdr.android.data.ProfileStore
@@ -32,6 +41,7 @@ import dev.herdr.android.data.TerminalInputQueueFullException
 import dev.herdr.android.data.TerminalInputTarget
 import dev.herdr.android.data.TerminalHistory
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -45,6 +55,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.util.UUID
 
 class HerdrViewModel(application: Application) : AndroidViewModel(application) {
@@ -74,6 +86,12 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     private var chatJob: Job? = null
     private var olderMessagesJob: Job? = null
     private var chatInputJob: Job? = null
+    private var codexSelectionJob: Job? = null
+    private var codexSelectionSequence = 0L
+    private val attachmentJobs = mutableMapOf<String, Job>()
+    private val attachmentFiles = mutableMapOf<String, PreparedChatAttachment>()
+    private val attachmentUploads = Semaphore(1)
+    private var stagedAttachmentTarget: ChatAttachmentTarget? = null
     private val terminalDecoder = TerminalInputDecoder()
     // Kept in memory across selection/reconnects so an uncertain old write is not
     // silently cleared by a new observer. No input text is retained here.
@@ -283,6 +301,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         val snapshot = state.value.snapshot ?: return
         if (snapshot.workspaces.none { it.id == id }) return
         stopChatWork()
+        clearChatAttachments()
         mutableState.update {
             it.copy(workspaceId = id, tabId = snapshot.tabs.firstOrNull { tab -> tab.workspaceId == id }?.id, paneId = null, chat = ChatContent(),
                 creationUncertain = it.activeProfileId?.let { profile -> profile to id in uncertainCreations } == true)
@@ -293,6 +312,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     fun selectTab(id: String) {
         val tab = state.value.snapshot?.tabs?.firstOrNull { it.id == id } ?: return
         stopChatWork()
+        clearChatAttachments()
         mutableState.update { it.copy(workspaceId = tab.workspaceId, tabId = tab.id, paneId = null, chat = ChatContent(),
             creationUncertain = it.activeProfileId?.let { profile -> profile to tab.workspaceId in uncertainCreations } == true) }
         restartObservation()
@@ -301,6 +321,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     fun selectPane(id: String?) {
         if (id == null) {
             stopChatWork()
+            clearChatAttachments()
             mutableState.update { it.copy(paneId = null, chat = ChatContent()) }
         } else {
             if (state.value.pairing) {
@@ -310,6 +331,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
             val pane = state.value.snapshot?.panes?.firstOrNull { it.id == id } ?: return
             if (state.value.paneId != id) {
                 stopChatWork()
+                clearChatAttachments()
                 mutableState.update {
                     it.copy(workspaceId = pane.workspaceId, tabId = pane.tabId, paneId = pane.id,
                         paneMode = if (supportsChat(pane)) PaneMode.CHAT else PaneMode.TERMINAL, chat = ChatContent())
@@ -357,9 +379,219 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshChat() = restartChatPolling()
 
+    fun loadCodexConversations() {
+        val current = state.value
+        val profileId = current.activeProfileId ?: return
+        val paneId = current.paneId ?: return
+        val currentClient = client ?: return
+        val pane = current.snapshot?.panes?.firstOrNull { it.id == paneId } ?: return
+        if (pane.conversation?.selectable != true || "codex-chat-selection" !in current.capabilities ||
+            current.connection != ConnectionState.CONNECTED || current.chat.sending || current.chat.deliveryUncertain ||
+            !foreground || !paneVisible || !ensureNetworkPermission()) return
+        codexSelectionJob?.cancel()
+        val sequence = ++codexSelectionSequence
+        val currentGeneration = generation
+        mutableState.update { it.copy(codexSelection = CodexConversationSelectionState(profileId, paneId, showing = true, loading = true)) }
+        codexSelectionJob = viewModelScope.launch {
+            try {
+                val choices = currentClient.codexConversations(paneId)
+                if (selectionTargetMatches(currentGeneration, profileId, paneId, sequence)) mutableState.update {
+                    it.copy(codexSelection = it.codexSelection.copy(loading = false, choices = choices.conversations, selectionToken = choices.selectionToken))
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (selectionTargetMatches(currentGeneration, profileId, paneId, sequence)) mutableState.update {
+                    it.copy(codexSelection = it.codexSelection.copy(loading = false, error = readableError(error)))
+                }
+            }
+        }
+    }
+
+    fun selectCodexConversation(id: String) {
+        val current = state.value
+        val profileId = current.activeProfileId ?: return
+        val paneId = current.paneId ?: return
+        val currentClient = client ?: return
+        val selection = current.codexSelection
+        val token = selection.selectionToken ?: return
+        if (selection.profileId != profileId || selection.paneId != paneId || selection.loading || selection.selecting ||
+            selection.choices.none { it.id == id } || current.chat.sending || current.chat.deliveryUncertain ||
+            current.connection != ConnectionState.CONNECTED || !foreground || !paneVisible || !ensureNetworkPermission()) return
+        codexSelectionJob?.cancel()
+        val sequence = ++codexSelectionSequence
+        val currentGeneration = generation
+        mutableState.update { it.copy(codexSelection = selection.copy(selecting = true, error = null)) }
+        codexSelectionJob = viewModelScope.launch {
+            try {
+                currentClient.selectCodexConversation(paneId, id, token)
+                if (selectionTargetMatches(currentGeneration, profileId, paneId, sequence)) {
+                    stopChatWork()
+                    clearChatAttachments()
+                    mutableState.update { old ->
+                        old.copy(codexSelection = CodexConversationSelectionState(), chat = ChatContent(),
+                            snapshot = old.snapshot?.let { snapshot -> snapshot.copy(panes = snapshot.panes.map { pane ->
+                                if (pane.id == paneId) pane.copy(conversation = pane.conversation?.copy(available = true, reason = null)) else pane
+                            }) })
+                    }
+                    restartChatPolling()
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (selectionTargetMatches(currentGeneration, profileId, paneId, sequence)) mutableState.update {
+                    it.copy(codexSelection = it.codexSelection.copy(selecting = false, error = readableError(error)))
+                }
+            }
+        }
+    }
+
+    fun dismissCodexConversationSelection() {
+        codexSelectionJob?.cancel()
+        ++codexSelectionSequence
+        mutableState.update { it.copy(codexSelection = CodexConversationSelectionState()) }
+    }
+
+    private fun selectionTargetMatches(currentGeneration: Long, profileId: String, paneId: String, sequence: Long): Boolean =
+        generation == currentGeneration && state.value.activeProfileId == profileId && state.value.paneId == paneId && codexSelectionSequence == sequence
+
     fun acknowledgeChatDelivery() {
-        mutableState.update { it.copy(chat = it.chat.copy(deliveryUncertain = false, error = null)) }
-        rememberCurrentChat()
+        val current = state.value
+        if (!current.chat.deliveryUncertain || current.chat.sending) return
+        if (!current.chat.attachmentDeliveryUncertain) {
+            mutableState.update { it.copy(chat = it.chat.copy(deliveryUncertain = false, error = null)) }
+            rememberCurrentChat()
+            return
+        }
+        val target = attachmentTarget() ?: return
+        val currentClient = client ?: return
+        if (!foreground || !paneVisible || !ensureNetworkPermission()) return
+        val currentGeneration = generation
+        val writeSequence = ++chatWriteSequence
+        mutableState.update { it.copy(chat = it.chat.copy(sending = true)) }
+        chatInputJob = viewModelScope.launch {
+            try {
+                // This action is offered only after the user checked and cleared the Terminal composer.
+                currentClient.acknowledgeChatAttachments(target.paneId, target.binding)
+                if (generation == currentGeneration && attachmentTarget() == target && chatWriteSequence == writeSequence) {
+                    clearChatAttachments(deleteRemote = false)
+                    mutableState.update { it.copy(chat = it.chat.copy(deliveryUncertain = false, attachmentDeliveryUncertain = false, error = null)) }
+                    rememberCurrentChat()
+                    restartChatPolling()
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (generation == currentGeneration && attachmentTarget() == target && chatWriteSequence == writeSequence) {
+                    mutableState.update { it.copy(chat = it.chat.copy(error = readableError(error))) }
+                }
+            } finally {
+                if (generation == currentGeneration && attachmentTarget() == target && chatWriteSequence == writeSequence) {
+                    mutableState.update { it.copy(chat = it.chat.copy(sending = false)) }
+                    rememberCurrentChat()
+                }
+            }
+        }
+    }
+
+    private fun attachmentTarget(): ChatAttachmentTarget? {
+        val current = state.value
+        return ChatAttachmentTarget(current.activeProfileId ?: return null, current.paneId ?: return null, current.chat.bindingId ?: return null)
+    }
+
+    fun clearChatAttachmentError() = mutableState.update { it.copy(chat = it.chat.copy(attachmentError = null)) }
+
+    fun stageChatAttachments(target: ChatAttachmentTarget, uris: List<Uri>, kind: ChatAttachmentKind) {
+        val current = state.value
+        val currentClient = client ?: return
+        if (attachmentTarget() != target || current.connection != ConnectionState.CONNECTED || current.paneMode != PaneMode.CHAT ||
+            !foreground || !paneVisible || current.chat.sending || current.chat.deliveryUncertain || current.chat.attachmentDeliveryUncertain || !ensureNetworkPermission()) return
+        if ("codex-chat-attachments" !in current.capabilities) {
+            mutableState.update { it.copy(chat = it.chat.copy(attachmentError = "Update the host companion to attach images and files.")) }
+            return
+        }
+        if (uris.isEmpty()) return
+        if (current.chat.attachments.size + uris.size > ChatAttachmentProtocol.MAX_FILES) {
+            mutableState.update { it.copy(chat = it.chat.copy(attachmentError = "Attach up to eight files per message.")) }
+            return
+        }
+        val currentGeneration = generation
+        stagedAttachmentTarget = target
+        uris.forEach { uri ->
+            val localId = UUID.randomUUID().toString()
+            mutableState.update { it.copy(chat = it.chat.copy(attachments = it.chat.attachments + ChatAttachment(localId, "Selected attachment", kind), attachmentError = null)) }
+            attachmentJobs[localId] = viewModelScope.launch {
+                var prepared: PreparedChatAttachment? = null
+                var receiptId: String? = null
+                try {
+                    attachmentUploads.withPermit {
+                        prepared = ChatAttachmentPreparation.prepare(getApplication(), uri, kind)
+                        val copy = prepared!!
+                        if (!attachmentStillSelected(target, currentGeneration, localId)) return@withPermit
+                        require(state.value.chat.attachments.filterNot { it.localId == localId }.sumOf { it.sizeBytes } + copy.size <= ChatAttachmentProtocol.MAX_TOTAL_BYTES) {
+                            "Attachments in one message must total no more than 32 MiB."
+                        }
+                        attachmentFiles[localId] = copy
+                        updateAttachment(localId) { it.copy(name = copy.name, sizeBytes = copy.size, mimeType = copy.mime, previewPath = copy.preview?.path, status = ChatAttachmentStatus.UPLOADING) }
+                        val receipt = currentClient.uploadChatAttachment(target.paneId, target.binding, copy.name, kind, copy.file)
+                        receiptId = receipt.id
+                        if (attachmentStillSelected(target, currentGeneration, localId)) {
+                            updateAttachment(localId) { it.copy(remoteId = receipt.id, mimeType = receipt.mimeType, status = ChatAttachmentStatus.READY) }
+                        }
+                    }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    if (attachmentStillSelected(target, currentGeneration, localId)) {
+                        updateAttachment(localId) { it.copy(status = ChatAttachmentStatus.FAILED, error = readableError(error)) }
+                    }
+                } finally {
+                    val keep = attachmentStillSelected(target, currentGeneration, localId)
+                    if (!keep || (prepared != null && attachmentFiles[localId] !== prepared)) {
+                        val obsoleteReceipt = receiptId
+                        withContext(NonCancellable + Dispatchers.IO) {
+                            if (obsoleteReceipt != null) runCatching { currentClient.deleteChatAttachment(target.paneId, target.binding, obsoleteReceipt) }
+                            prepared?.delete()
+                        }
+                    }
+                    attachmentJobs.remove(localId)
+                }
+            }
+        }
+    }
+
+    fun removeChatAttachment(target: ChatAttachmentTarget, localId: String) {
+        if (attachmentTarget() != target || state.value.chat.sending) return
+        val attachment = state.value.chat.attachments.firstOrNull { it.localId == localId } ?: return
+        attachmentJobs.remove(localId)?.cancel()
+        val prepared = attachmentFiles.remove(localId)
+        mutableState.update { it.copy(chat = it.chat.copy(attachments = it.chat.attachments.filterNot { item -> item.localId == localId }, attachmentError = null)) }
+        disposeAttachment(target, attachment, prepared, client)
+    }
+
+    private fun attachmentStillSelected(target: ChatAttachmentTarget, currentGeneration: Long, localId: String): Boolean =
+        generation == currentGeneration && attachmentTarget() == target && state.value.chat.attachments.any { it.localId == localId }
+
+    private fun updateAttachment(localId: String, update: (ChatAttachment) -> ChatAttachment) = mutableState.update {
+        it.copy(chat = it.chat.copy(attachments = it.chat.attachments.map { item -> if (item.localId == localId) update(item) else item }))
+    }
+
+    private fun clearChatAttachments(deleteRemote: Boolean = true) {
+        val target = stagedAttachmentTarget
+        stagedAttachmentTarget = null
+        val oldClient = client
+        attachmentJobs.values.toList().forEach { it.cancel() }
+        attachmentJobs.clear()
+        val attachments = state.value.chat.attachments
+        mutableState.update { it.copy(chat = it.chat.copy(attachments = emptyList(), attachmentError = null)) }
+        attachments.forEach { item -> disposeAttachment(target, item, attachmentFiles.remove(item.localId), if (deleteRemote) oldClient else null) }
+    }
+
+    private fun disposeAttachment(target: ChatAttachmentTarget?, attachment: ChatAttachment, prepared: PreparedChatAttachment?, oldClient: HerdrClient?) {
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            withContext(NonCancellable + Dispatchers.IO) {
+                if (target != null && attachment.remoteId != null && attachment.status != ChatAttachmentStatus.DELIVERY_UNCERTAIN && oldClient != null) {
+                    runCatching { oldClient.deleteChatAttachment(target.paneId, target.binding, attachment.remoteId) }
+                }
+                prepared?.delete()
+            }
+        }
     }
 
     fun sendChat() {
@@ -372,8 +604,10 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
             current.connection != ConnectionState.CONNECTED || !current.chat.canSubmitMessage()
         ) return
         val text = current.chat.draft
-        if (text.isBlank()) return
-        try { ConversationProtocol.input(binding, text) }
+        val attachments = current.chat.attachments
+        val attachmentIds = attachments.mapNotNull { it.remoteId }
+        if (text.isBlank() && attachmentIds.isEmpty()) return
+        try { ConversationProtocol.input(binding, text, attachmentIds) }
         catch (error: IllegalArgumentException) {
             mutableState.update { it.copy(chat = it.chat.copy(error = error.message ?: "Check the message before sending.")) }
             return
@@ -386,21 +620,26 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         rememberCurrentChat()
         chatInputJob = viewModelScope.launch {
             try {
-                val warning = currentClient.sendMessage(paneId, binding, text)
+                val warning = currentClient.sendMessage(paneId, binding, text, attachmentIds)
                 if (chatTargetMatches(currentGeneration, paneId, binding) && chatWriteSequence == writeSequence) {
-                    mutableState.update { it.copy(chat = ChatState.acknowledged(it.chat, binding, text, warning)) }
+                    mutableState.update { it.copy(chat = ChatState.acknowledged(it.chat, binding, text, warning, attachmentIds)) }
+                    attachments.forEach { item -> disposeAttachment(null, item, attachmentFiles.remove(item.localId), null) }
                     rememberCurrentChat()
                     restartChatPolling()
                 }
             } catch (cancelled: CancellationException) {
                 if (chatTargetMatches(currentGeneration, paneId, binding) && chatWriteSequence == writeSequence) mutableState.update {
-                    it.copy(chat = it.chat.copy(deliveryUncertain = true, error = "Message delivery was not confirmed. Check the conversation before sending again."))
+                    it.copy(chat = it.chat.copy(deliveryUncertain = true, attachmentDeliveryUncertain = attachmentIds.isNotEmpty() || it.chat.attachmentDeliveryUncertain,
+                        attachments = it.chat.attachments.map { item -> if (item.remoteId in attachmentIds) item.copy(status = ChatAttachmentStatus.DELIVERY_UNCERTAIN) else item },
+                        error = "Message delivery was not confirmed. Check the conversation and Terminal composer before sending again."))
                 }
                 throw cancelled
             } catch (error: Exception) {
                 if (chatTargetMatches(currentGeneration, paneId, binding) && chatWriteSequence == writeSequence) mutableState.update {
                     val uncertain = error !is BridgeException || error.statusCode !in listOf(400, 401, 403, 404, 409, 413, 422)
                     it.copy(chat = it.chat.copy(canSend = false, canSendReason = readableError(error), deliveryUncertain = uncertain,
+                        attachmentDeliveryUncertain = (uncertain && attachmentIds.isNotEmpty()) || it.chat.attachmentDeliveryUncertain,
+                        attachments = it.chat.attachments.map { item -> if (uncertain && item.remoteId in attachmentIds) item.copy(status = ChatAttachmentStatus.DELIVERY_UNCERTAIN) else item },
                         error = "${readableError(error)} Message was not retried${if (uncertain) "; check the conversation before sending again" else ""}."))
                 }
             } finally {
@@ -720,6 +959,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (state.value.paneId != previousPaneId) {
             stopChatWork()
+            clearChatAttachments()
             mutableState.update { it.copy(chat = ChatContent()) }
             restartObservation()
             restartChatPolling()
@@ -810,6 +1050,8 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         mutableState.update {
             it.copy(chat = it.chat.copy(loading = false, refreshing = false, loadingOlder = false, sending = false, canSend = false,
                 deliveryUncertain = pendingWrite || it.chat.deliveryUncertain,
+                attachmentDeliveryUncertain = it.chat.attachmentDeliveryUncertain || (pendingWrite && it.chat.attachments.isNotEmpty()),
+                attachments = if (pendingWrite) it.chat.attachments.map { item -> item.copy(status = ChatAttachmentStatus.DELIVERY_UNCERTAIN) } else it.chat.attachments,
                 error = if (pendingWrite) "Message delivery was not confirmed. Check the conversation before sending again." else it.chat.error))
         }
         rememberCurrentChat()
@@ -848,6 +1090,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         }
         val currentClient = client ?: return
         if (!foreground || !paneVisible || current.connection != ConnectionState.CONNECTED || !ensureNetworkPermission()) return
+        if (pane.conversation?.selectable == true && !pane.conversation.available && current.chat.bindingId == null) return
         val currentGeneration = generation
         chatJob = viewModelScope.launch {
             var failures = 0
@@ -862,7 +1105,10 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     if (chatSession != session || generation != currentGeneration || state.value.paneId != paneId) return@launch
                     val previousBinding = state.value.chat.bindingId
-                    if (previousBinding != page.binding) rememberCurrentChat()
+                    if (previousBinding != page.binding) {
+                        rememberCurrentChat()
+                        clearChatAttachments()
+                    }
                     mutableState.update {
                         val updated = ChatState.latest(it.chat, page)
                         val restored = if (previousBinding != page.binding && it.activeProfileId != null) {
@@ -891,7 +1137,10 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun releaseConnection() {
+        dismissCodexConversationSelection()
         stopTerminalInput()
+        stopChatWork()
+        clearChatAttachments()
         generation++
         terminalSession++
         stopChatWork()

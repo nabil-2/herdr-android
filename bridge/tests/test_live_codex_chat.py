@@ -142,6 +142,9 @@ async def mock_herdr(path: Path, thread: str):
                 result = {"type": "session_snapshot", "snapshot": snapshot}
             elif method == "agent.get":
                 result = {"type": "agent", "agent": agent}
+            elif method == "pane.process_info" and request["params"] == {"pane_id": pane["pane_id"]}:
+                result = {"type": "process_info", "process_info": {
+                    "pane_id": pane["pane_id"], "foreground_processes": []}}
             elif method == "agent.prompt":
                 result = {"type": "agent_prompted", "agent": agent}
             else:
@@ -358,5 +361,5 @@ async def test_real_message_clocks_in_one_turn_survive_polls_pagination_and_roll
                 assert rolled_back["historyEpoch"] != updated["historyEpoch"]
                 stale_after_rollback = await phone.get("/v1/panes/w1:p2/conversation", params={"cursor": updated["olderCursor"]})
                 assert stale_after_rollback.status_code == 409
-        assert all(request["method"] in {"session.snapshot", "agent.get"} for request in requests)
+        assert all(request["method"] in {"session.snapshot", "agent.get", "pane.process_info"} for request in requests)
     assert list((home / "sessions").rglob("rollout-*.jsonl")) == [path]

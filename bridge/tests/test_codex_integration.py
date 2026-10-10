@@ -8,6 +8,7 @@ from pathlib import Path
 import socket
 import subprocess
 import shlex
+import sys
 import threading
 from types import SimpleNamespace
 import uuid
@@ -182,6 +183,30 @@ def test_pinned_official_asset_is_patched_once_without_changing_hook_settings(tm
     assert [call[0] for call in calls] == [["/test/herdr", "integration", "status"]] * 2
 
 
+def test_previous_exact_pocket_helper_gets_daemon_guard_without_reinstall(tmp_path, monkeypatch):
+    previous = OFFICIAL_HELPER.replace(b"set -eu\n", integration.PATCH_MARKER + b"set -eu\n", 1)
+    previous = previous.replace(integration._ORIGINAL_ID_GUARD, integration._COMPATIBLE_ID_GUARD, 1)
+    previous = previous.replace(integration._ORIGINAL_EVENT_GUARD, integration._COMPATIBLE_EVENT_GUARD, 1)
+    home, helper = prepare_home(tmp_path, previous)
+    before = ((home / "hooks.json").read_bytes(), (home / "config.toml").read_bytes())
+    calls = fake_cli(monkeypatch, helper)
+    result = integration.ensure_codex_integration("/test/herdr", home)
+    assert result.ready and result.changed
+    assert integration._PANE_PROCESS_GUARD in helper.read_bytes()
+    assert integration._patched_original(helper.read_bytes()) == OFFICIAL_HELPER
+    assert helper.with_name(helper.name + ".herdr-pocket-v8.original").read_bytes() == OFFICIAL_HELPER
+    assert ((home / "hooks.json").read_bytes(), (home / "config.toml").read_bytes()) == before
+    assert [call[0] for call in calls] == [["/test/herdr", "integration", "status"]]
+
+
+def test_non_linux_helper_preserves_canonical_id_flow_without_proc(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    def forbidden():
+        raise AssertionError("Non-Linux helper must not inspect /proc")
+    fake_os = SimpleNamespace(getppid=forbidden)
+    exec(integration._PANE_PROCESS_GUARD.decode(), {"os": fake_os})
+
+
 @pytest.mark.parametrize("data,status", [
     (None, "not installed"),
     (OFFICIAL_HELPER.replace(b"HERDR_INTEGRATION_VERSION=8", b"HERDR_INTEGRATION_VERSION=7"), "outdated (v7, current v8)"),
@@ -308,8 +333,17 @@ def test_cli_install_failure_is_advisory_and_does_not_launch_an_agent(tmp_path, 
     assert all(call[0][1] == "integration" for call in calls)
 
 
+def hook_parent(tmp_path: Path) -> Path:
+    directory = tmp_path / "hook-parent"
+    directory.mkdir(exist_ok=True)
+    codex = directory / "codex"
+    codex.write_text("import subprocess,sys\n"
+                     "raise SystemExit(subprocess.run(['sh', *sys.argv[-2:]], input=sys.stdin.buffer.read()).returncode)\n")
+    return codex
+
+
 def run_hook(helper: Path, tmp_path: Path, payload: dict, *, inherited_thread: str | None = None,
-             herdr_env="1", action="session") -> list[dict]:
+             herdr_env="1", action="session", parent_role="resume") -> list[dict]:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     socket_path = tmp_path / "hook.sock"
     server.bind(str(socket_path))
@@ -339,7 +373,8 @@ def run_hook(helper: Path, tmp_path: Path, payload: dict, *, inherited_thread: s
     environment.pop("CODEX_THREAD_ID", None)
     if inherited_thread is not None:
         environment["CODEX_THREAD_ID"] = inherited_thread
-    result = subprocess.run(["sh", str(helper), action], input=json.dumps(payload), env=environment,
+    result = subprocess.run([sys.executable, str(hook_parent(tmp_path)), parent_role, str(helper), action],
+                            input=json.dumps(payload), env=environment,
                             capture_output=True, text=True, timeout=5)
     worker.join(timeout=2)
     assert not worker.is_alive()
@@ -363,6 +398,16 @@ def test_exact_session_start_reports_identity_without_requiring_transcript(tmp_p
     assert params["agent_session_id"] == identity and params["session_start_source"] == "resume"
     assert params["pane_id"] == "w1:p1" and type(params["seq"]) is int and params["seq"] > 0
     assert not list(tmp_path.glob("herdr-codex-hook.*"))
+
+
+def test_shared_daemon_never_reports_another_frontend_using_inherited_pane(tmp_path, monkeypatch):
+    home, helper = prepare_home(tmp_path)
+    fake_cli(monkeypatch, helper)
+    assert integration.ensure_codex_integration("/test/herdr", home).ready
+    monkeypatch.undo()
+    identity = str(uuid.uuid4())
+    payload = {"hook_event_name": "SessionStart", "session_id": identity, "source": "resume", "transcript_path": None}
+    assert run_hook(helper, tmp_path, payload, inherited_thread=identity, parent_role="app-server") == []
 
 
 @pytest.mark.parametrize("change", ["invalid_id", "uppercase_id", "child_thread", "subagent", "missing_event", "outside_herdr", "wrong_action"])
@@ -445,7 +490,7 @@ async def test_null_transcript_hook_replaces_only_owned_exact_codex_session(tmp_
         hook_environment.update(HERDR_ENV="1", HERDR_PANE_ID=pane, HERDR_SOCKET_PATH=str(socket_path),
                                 CODEX_THREAD_ID=new_id, CODEX_SESSION_ID=new_id, TMPDIR=str(tmp_path))
         payload = {"hook_event_name": "SessionStart", "session_id": new_id, "source": "resume", "transcript_path": None}
-        child = await asyncio.create_subprocess_exec("sh", str(helper), "session", env=hook_environment,
+        child = await asyncio.create_subprocess_exec(sys.executable, str(hook_parent(tmp_path)), "resume", str(helper), "session", env=hook_environment,
                                                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                                                    stderr=asyncio.subprocess.PIPE)
         _, error = await asyncio.wait_for(child.communicate(json.dumps(payload).encode()), timeout=5)

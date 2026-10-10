@@ -27,6 +27,7 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.BufferedSink
 import java.io.IOException
+import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -72,8 +73,69 @@ internal class HerdrClient(
         return ConversationProtocol.decode(request("GET", listOf("v1", "panes", paneId, "conversation"), query = query, maxBytes = 1024L * 1024L, chatWorkingInput = true))
     }
 
-    suspend fun sendMessage(paneId: String, binding: String, text: String): String? =
-        ConversationProtocol.acknowledgement(request("POST", listOf("v1", "panes", paneId, "messages"), ConversationProtocol.input(binding, text), chatWorkingInput = true))
+    suspend fun sendMessage(paneId: String, binding: String, text: String, attachmentIds: List<String> = emptyList()): String? =
+        ConversationProtocol.acknowledgement(request("POST", listOf("v1", "panes", paneId, "messages"), ConversationProtocol.input(binding, text, attachmentIds), chatWorkingInput = true))
+
+    suspend fun codexConversations(paneId: String): CodexConversationChoices = CodexConversationSelectionProtocol.decode(
+        request("GET", listOf("v1", "panes", paneId, "codex-conversations"), maxBytes = 64 * 1024),
+    )
+
+    suspend fun selectCodexConversation(paneId: String, id: String, selectionToken: String) {
+        requireInputAcknowledgement(request("POST", listOf("v1", "panes", paneId, "codex-conversation"), CodexConversationSelectionProtocol.input(id, selectionToken)))
+    }
+
+    suspend fun uploadChatAttachment(paneId: String, binding: String, name: String, kind: ChatAttachmentKind, file: File): UploadedChatAttachment {
+        ConversationProtocol.validateOpaque(binding, 256)
+        ChatAttachmentProtocol.validateName(name)
+        val size = withContext(Dispatchers.IO) { file.length() }
+        require(size in 1..ChatAttachmentProtocol.MAX_FILE_BYTES) { "Choose a file smaller than 16 MiB." }
+        val url = endpoint(listOf("v1", "panes", paneId, "attachments")).newBuilder()
+            .addQueryParameter("kind", kind.wireName).addQueryParameter("name", name).build()
+        val body = object : RequestBody() {
+            override fun contentType() = "application/octet-stream".toMediaType()
+            override fun contentLength() = size
+            override fun isOneShot() = true
+            override fun writeTo(sink: BufferedSink) {
+                file.inputStream().use { input ->
+                    val buffer = ByteArray(16 * 1024)
+                    var remaining = size
+                    while (remaining > 0) {
+                        val count = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                        if (count < 0) throw IOException("The selected attachment changed during upload.")
+                        sink.write(buffer, 0, count)
+                        remaining -= count
+                    }
+                    if (input.read() != -1) throw IOException("The selected attachment changed during upload.")
+                }
+            }
+        }
+        val request = authenticatedRequest(url).header("X-Herdr-Chat-Binding", binding).post(body).build()
+        val call = http.newCall(request)
+        call.timeout().timeout(65, TimeUnit.SECONDS) // The host permits a 60-second streamed upload.
+        return ChatAttachmentProtocol.decode(call.awaitBody(8 * 1024), name, kind, size)
+    }
+
+    suspend fun deleteChatAttachment(paneId: String, binding: String, id: String) {
+        ConversationProtocol.validateOpaque(binding, 256)
+        ChatAttachmentProtocol.validateIds(listOf(id))
+        val request = authenticatedRequest(endpoint(listOf("v1", "panes", paneId, "attachments", id)))
+            .header("X-Herdr-Chat-Binding", binding).delete().build()
+        requireInputAcknowledgement(http.newCall(request).awaitBody(8 * 1024))
+    }
+
+    suspend fun acknowledgeChatAttachments(paneId: String, binding: String) {
+        ConversationProtocol.validateOpaque(binding, 256)
+        val delegate = ByteArray(0).toRequestBody(null)
+        val body = object : RequestBody() {
+            override fun contentType() = delegate.contentType()
+            override fun contentLength() = 0L
+            override fun isOneShot() = true
+            override fun writeTo(sink: BufferedSink) = Unit
+        }
+        val request = authenticatedRequest(endpoint(listOf("v1", "panes", paneId, "attachments", "acknowledge")))
+            .header("X-Herdr-Chat-Binding", binding).post(body).build()
+        requireInputAcknowledgement(http.newCall(request).awaitBody(8 * 1024))
+    }
 
     suspend fun input(paneId: String, text: String?, keys: List<String>) {
         val body = InputValidation.body(text, keys)

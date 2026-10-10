@@ -21,7 +21,7 @@ data class Pane(
 )
 
 @Serializable
-data class ConversationAvailability(val provider: String, val available: Boolean, val reason: String? = null)
+data class ConversationAvailability(val provider: String, val available: Boolean, val reason: String? = null, val selectable: Boolean = false)
 
 @Serializable
 data class Snapshot(
@@ -65,10 +65,31 @@ internal data class ConversationPage(
     val freshBootstrap: Boolean = false,
     val warning: String? = null,
     val canSendReason: String? = null,
+    val attachmentDeliveryUncertain: Boolean = false,
 )
 
 @Serializable
-internal data class ChatInput(val binding: String, val text: String)
+internal data class ChatInput(val binding: String, val text: String, val attachmentIds: List<String> = emptyList())
+
+enum class ChatAttachmentKind(val wireName: String) { IMAGE("image"), FILE("file") }
+enum class ChatAttachmentStatus { PREPARING, UPLOADING, READY, FAILED, DELIVERY_UNCERTAIN }
+data class ChatAttachmentTarget(val profileId: String, val paneId: String, val binding: String)
+data class ChatAttachment(
+    val localId: String,
+    val name: String,
+    val kind: ChatAttachmentKind,
+    val sizeBytes: Long = 0,
+    val mimeType: String? = null,
+    val remoteId: String? = null,
+    val previewPath: String? = null,
+    val status: ChatAttachmentStatus = ChatAttachmentStatus.PREPARING,
+    val error: String? = null,
+) {
+    override fun toString(): String = "ChatAttachment(kind=$kind, status=$status, redacted)"
+}
+
+@Serializable
+internal data class UploadedChatAttachment(val id: String, val name: String, val kind: String, val mimeType: String, val sizeBytes: Long)
 
 data class ChatContent(
     val bindingId: String? = null,
@@ -89,10 +110,14 @@ data class ChatContent(
     val draft: String = "",
     val ackRevision: Long = 0,
     val deliveryUncertain: Boolean = false,
+    val attachmentDeliveryUncertain: Boolean = false,
+    val attachments: List<ChatAttachment> = emptyList(),
+    val attachmentError: String? = null,
 ) {
     /** Herdr accepts follow-ups while Codex is working; server readiness stays authoritative. */
     fun canSubmitMessage(): Boolean = canSend && (status in setOf("idle", "done", "working") || (status == "unknown" && freshBootstrap)) &&
-        bindingId != null && error == null && !loading && !sending && !deliveryUncertain
+        bindingId != null && error == null && !loading && !sending && !deliveryUncertain && !attachmentDeliveryUncertain &&
+        attachments.all { it.status == ChatAttachmentStatus.READY && it.remoteId != null }
 
     override fun toString(): String = "ChatContent(messages=${messages.size}, loading=$loading, sending=$sending)"
 }
@@ -167,4 +192,5 @@ data class HerdrUiState(
     val inputRevision: Long = 0,
     val pairing: Boolean = false,
     val pairingSuccessRevision: Long = 0,
+    val codexSelection: CodexConversationSelectionState = CodexConversationSelectionState(),
 )

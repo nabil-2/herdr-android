@@ -171,7 +171,7 @@ async def chat(socket_server, codex_stub):
 
 async def test_chat_capability_and_metadata_do_not_disclose_native_session(chat):
     client, _, _, _, _, _, _, _, _ = chat
-    assert (await client.get("/v1/health")).json()["capabilities"] == ["terminal-input", "terminal-history", "workspace-tabs", "codex-chat", "codex-chat-working-input", "codex-chat-fresh-input", "codex-create"]
+    assert (await client.get("/v1/health")).json()["capabilities"] == ["terminal-input", "terminal-history", "workspace-tabs", "codex-chat", "codex-chat-working-input", "codex-chat-fresh-input", "codex-create", "codex-chat-attachments", "codex-chat-selection"]
     response = await client.get("/v1/snapshot")
     assert response.json()["panes"][1]["conversation"] == {"provider": "codex", "available": True, "reason": None}
     assert THREAD_ID not in response.text and "term-test-generation" not in response.text
@@ -395,7 +395,7 @@ async def test_message_is_literal_multiline_exactly_one_agent_prompt(chat):
     text = "Explain these lines:\n'$HOME' and `literal`\nLast line"
     response = await client.post("/v1/panes/w1:p2/messages", json={"binding": page["binding"], "text": text})
     assert response.json() == {"ok": True, "warning": None}
-    writes = [r for r in requests if r["method"] not in {"agent.get", "session.snapshot"}]
+    writes = [r for r in requests if r["method"] not in {"agent.get", "session.snapshot", "pane.process_info"}]
     assert len(writes) == 1 and writes[0]["method"] == "agent.prompt"
     assert writes[0]["params"] == {"target": "w1:p2", "text": text}
 

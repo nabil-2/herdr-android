@@ -6,6 +6,22 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ChatDraftStoreTest {
+    @Test fun `ordinary retained draft cannot hide authoritative attachment uncertainty`() {
+        val store = ChatDraftStore()
+        store.remember("profile", "pane", confirmed().copy(draft = "My reviewed reply"))
+        val restored = store.restore("profile", "pane", confirmed().copy(
+            deliveryUncertain = true,
+            attachmentDeliveryUncertain = true,
+            error = "Check and clear the partial attachment in Terminal",
+            canSend = false,
+        ))
+        assertEquals("My reviewed reply", restored.draft)
+        assertTrue(restored.deliveryUncertain)
+        assertTrue(restored.attachmentDeliveryUncertain)
+        assertEquals("Check and clear the partial attachment in Terminal", restored.error)
+        assertFalse(restored.canSubmitMessage())
+    }
+
     private fun confirmed(binding: String = "binding-1") = ChatContent(bindingId = binding, revision = "revision", historyEpoch = "epoch", canSend = true)
 
     @Test fun `leaving a pane and returning restores only its confirmed conversation draft`() {

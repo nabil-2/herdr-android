@@ -181,6 +181,12 @@ fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalR
                     onDraftChange = viewModel::setChatDraft,
                     onSend = viewModel::sendChat,
                     onAcknowledgeDelivery = viewModel::acknowledgeChatDelivery,
+                    onAddAttachments = viewModel::stageChatAttachments,
+                    onRemoveAttachment = viewModel::removeChatAttachment,
+                    onDismissAttachmentError = viewModel::clearChatAttachmentError,
+                    onChooseConversation = viewModel::loadCodexConversations,
+                    onSelectConversation = viewModel::selectCodexConversation,
+                    onDismissConversationSelection = viewModel::dismissCodexConversationSelection,
                 ) else TerminalScreen(
                     state, viewModel,
                     onBack = {

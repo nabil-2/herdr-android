@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import shlex
 import time
 
 import anyio
@@ -20,6 +21,8 @@ import anyio
 from .herdr import BridgeError, CreatedTab, HerdrClient, canonical_codex_session, stop_observer
 from .message_times import ITEM_TIME_FIELD, MAX_TIMESTAMP, enrich_message_times
 from .runtime import external_environment
+from .attachments import AttachmentStore
+from .codex_identity import DaemonConversations
 
 MAX_RPC_BYTES = 32 * 1024 * 1024
 MAX_PAGE_BYTES = 1024 * 1024
@@ -275,6 +278,8 @@ class Conversations:
         self.caches: OrderedDict[str, ConversationCache] = OrderedDict()
         self.send_lock = asyncio.Lock()
         self.fresh_chats: OrderedDict[str, FreshChatReceipt] = OrderedDict()
+        self.attachments: AttachmentStore | None = None
+        self.daemon: DaemonConversations | None = None
 
     def register_created_codex(self, tab: CreatedTab, agent: dict) -> None:
         """Only an acknowledged, newly created terminal can bootstrap empty chat."""
@@ -319,9 +324,13 @@ class Conversations:
         receipt.thread_id = thread_id
         return receipt
 
-    async def target(self, pane_id: str) -> tuple[dict, str, str]:
+    async def target(self, pane_id: str, *, owner: str = "") -> tuple[dict, str, str]:
         agent = await self.client.agent(pane_id)
         thread_id = canonical_codex_session(agent)
+        if self.daemon is not None:
+            selected = await self.daemon.target(agent, owner)
+            if selected is not None:
+                agent, thread_id = selected
         if thread_id is None:
             raise BridgeError(409, "This pane has no canonical saved Codex session; use Terminal")
         terminal_id = agent.get("terminal_id")
@@ -332,12 +341,26 @@ class Conversations:
         except OSError as exc:
             raise BridgeError(503, "The selected Herdr session is unavailable; use Terminal") from exc
         identity = [str(self.client.socket_path.absolute()), info.st_dev, info.st_ino, pane_id, terminal_id, thread_id, str(self.reader.home)]
+        if agent.get("_pocket_daemon_selected") is True:
+            identity.extend([owner, agent["_pocket_daemon_identity"]])
         binding = opaque(hmac.digest(self.secret, json.dumps(identity).encode(), "sha256"))
         return agent, thread_id, binding
 
     @staticmethod
     def ready(agent: dict, *, allow_working: bool = True) -> bool:
         return Conversations.send_unavailable_reason(agent, allow_working=allow_working) is None
+
+    def attachment_runtime(self, pane_id: str, agent: dict, thread_id: str) -> str:
+        """Stable scope survives companion restarts, never terminal replacement."""
+        try:
+            info = self.client.socket_path.stat()
+        except OSError as exc:
+            raise BridgeError(503, "The selected Herdr session is unavailable; use Terminal") from exc
+        identity = [str(self.client.socket_path.absolute()), info.st_dev, info.st_ino, pane_id,
+                    agent.get("terminal_id"), thread_id, str(self.reader.home)]
+        if agent.get("_pocket_daemon_selected") is True:
+            identity.append(agent["_pocket_daemon_identity"])
+        return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
 
     @staticmethod
     def send_unavailable_reason(agent: dict, *, allow_working: bool = True, fresh_bootstrap: bool = False) -> str | None:
@@ -395,10 +418,13 @@ class Conversations:
             self.caches.pop(victim)
 
     async def page(self, pane_id: str, cursor: str | None = None, revision: str | None = None, *, allow_working: bool = True,
-                   allow_fresh: bool = False) -> dict:
+                   allow_fresh: bool = False, owner: str = "") -> dict:
         if not self.reader.enabled:
             raise BridgeError(503, "Codex conversation reader is not configured; use Terminal")
-        agent, thread_id, binding = await self.target(pane_id)
+        agent, thread_id, binding = await self.target(pane_id, owner=owner)
+        if self.attachments is not None:
+            await self.attachments.register(pane_id, binding, thread_id,
+                                            self.attachment_runtime(pane_id, agent, thread_id))
         cache = self.caches.setdefault(binding, ConversationCache())
         self.caches.move_to_end(binding)
         while len(self.caches) > MAX_CACHES:
@@ -407,13 +433,18 @@ class Conversations:
             if self.clock() - cache.refreshed_at >= 1:
                 try:
                     try:
-                        result = await self.reader.read(thread_id)
+                        if agent.get("_pocket_daemon_selected") is True and self.daemon is not None:
+                            result = await self.daemon.read(pane_id, owner, thread_id)
+                        else:
+                            result = await self.reader.read(thread_id)
                     except CodexHistoryNotPersisted as exc:
                         if exc.thread_id != thread_id or self._fresh_chat(pane_id, agent, thread_id) is None:
                             raise
                         messages, cache.warning, cache.bootstrapping = [], None, True
                     else:
                         messages, cache.warning = normalize_thread(result, thread_id)
+                        if self.attachments is not None:
+                            await self.attachments.present_history(messages, pane_id, thread_id)
                         # Startup can persist an empty thread before its first
                         # turn. Retain only our verified new-chat receipt until
                         # there is a real saved turn or a first prompt attempt.
@@ -450,7 +481,7 @@ class Conversations:
             if cache.error:
                 raise cache.error
             # Recheck binding after a potentially slow saved-history read.
-            agent, thread_id, current_binding = await self.target(pane_id)
+            agent, thread_id, current_binding = await self.target(pane_id, owner=owner)
             if current_binding != binding:
                 raise BridgeError(409, "Pane changed while history was loading; refresh the workspace")
             end = self._end(cursor, binding, cache.revision, len(cache.messages)) if cursor else len(cache.messages)
@@ -461,11 +492,14 @@ class Conversations:
                                                                    fresh_bootstrap=allow_fresh and fresh_bootstrap)
             if cache.bootstrapping and not fresh_bootstrap:
                 send_unavailable_reason = "The first message needs saved-history confirmation. Refresh or inspect Terminal before sending again."
+            if self.attachments is not None and self.attachments.blocked(pane_id, binding):
+                send_unavailable_reason = "Attachment delivery was not confirmed. Inspect and clear Terminal, then acknowledge it before sending again."
             response = {"binding": binding, "revision": cache.revision, "historyEpoch": cache.history_epoch,
                         "messages": cache.messages[start:end],
                         "olderCursor": self._cursor(binding, cache.revision, start) if start else None,
                         "unchanged": unchanged, "canSend": send_unavailable_reason is None,
                         "freshBootstrap": fresh_bootstrap,
+                        "attachmentDeliveryUncertain": self.attachments is not None and self.attachments.blocked(pane_id, binding),
                         "canSendReason": send_unavailable_reason,
                         "status": agent.get("agent_status") if agent.get("agent_status") in ("idle", "working", "blocked", "done", "unknown") else "unknown",
                         "warning": cache.warning}
@@ -481,11 +515,12 @@ class Conversations:
             return response
 
     async def send(self, pane_id: str, binding: str, text: str, *, allow_working: bool = True,
-                   allow_fresh: bool = False) -> dict:
+                   allow_fresh: bool = False, attachment_ids: list[str] | None = None,
+                   attachments: AttachmentStore | None = None, attachment_owner: str = "") -> dict:
         if not self.reader.enabled:
             raise BridgeError(503, "Codex conversation reader is not configured; use Terminal")
         async with self.send_lock:
-            agent, thread_id, current_binding = await self.target(pane_id)
+            agent, thread_id, current_binding = await self.target(pane_id, owner=attachment_owner)
             if not hmac.compare_digest(binding, current_binding):
                 raise BridgeError(409, "Pane or conversation changed; refresh before sending")
             cache = self.caches.get(binding)
@@ -496,6 +531,17 @@ class Conversations:
                                                                    fresh_bootstrap=allow_fresh and fresh_bootstrap)
             if send_unavailable_reason is not None:
                 raise BridgeError(409, send_unavailable_reason)
+            daemon_selected = agent.get("_pocket_daemon_selected") is True
+            store = attachments or self.attachments
+            if store is not None:
+                await store.register(pane_id, binding, thread_id, self.attachment_runtime(pane_id, agent, thread_id))
+            if store is not None and store.blocked(pane_id, binding):
+                raise BridgeError(503, "Attachment delivery was not confirmed; inspect and clear Terminal, then acknowledge it before sending again")
+            receipts = []
+            if attachment_ids:
+                if store is None or not attachment_owner:
+                    raise BridgeError(503, "Attachment support is unavailable; update the host companion")
+                receipts = await store.consume(attachment_ids, pane_id, binding, attachment_owner)
             if cache.bootstrapping:
                 if self._fresh_chat(pane_id, agent, thread_id) is None:
                     raise BridgeError(503, "The first message has not been confirmed in saved history; inspect Terminal before sending again")
@@ -503,10 +549,53 @@ class Conversations:
                 # cannot authorize a duplicate first prompt on the next request.
                 self.fresh_chats.pop(pane_id, None)
                 cache.refreshed_at = float("-inf")
-            await self.client.prompt(pane_id, text)
+            submitted_text = store.prompt_text(text, receipts) if receipts else text
+            if daemon_selected:
+                # A selected daemon thread receives real typed image inputs.
+                # This mode is captured at preflight: losing the selection can
+                # never redirect the same request into a Terminal composer.
+                manager = getattr(self, "daemon", None)
+                if manager is None:
+                    raise BridgeError(503, "Selected Codex conversation is unavailable; refresh before sending again")
+                current_agent, _, checked_binding = await self.target(pane_id, owner=attachment_owner)
+                if (checked_binding != binding or current_agent.get("_pocket_daemon_selected") is not True
+                        or self.send_unavailable_reason(current_agent, allow_working=allow_working) is not None):
+                    raise BridgeError(503, "Selected Codex conversation changed; refresh before sending again")
+                delivered = await manager.deliver(pane_id, attachment_owner, thread_id, submitted_text,
+                                                  [receipt.path for receipt in receipts if receipt.kind == "image"])
+                if not delivered:
+                    raise BridgeError(503, "Selected Codex conversation changed; refresh before sending again")
+            else:
+                for receipt in receipts:
+                    if receipt.kind != "image":
+                        continue
+                    # Codex recognizes exactly one image path per bracketed paste.
+                    # These pastes never include Enter; the reviewed message below
+                    # is the sole turn/steering submission.
+                    current_agent, _, checked_binding = await self.target(pane_id, owner=attachment_owner)
+                    if (checked_binding != binding or self.send_unavailable_reason(current_agent, allow_working=allow_working,
+                            fresh_bootstrap=allow_fresh and fresh_bootstrap) is not None):
+                        raise BridgeError(503, "Pane changed while preparing attachments; inspect Terminal before sending again")
+                    try:
+                        await self.client.send_input(pane_id, shlex.quote(str(receipt.path)), [])
+                    except BridgeError as exc:
+                        raise BridgeError(503, "Image preparation was not confirmed; inspect Terminal before sending again") from exc
+                if receipts:
+                    current_agent, _, checked_binding = await self.target(pane_id, owner=attachment_owner)
+                    if (checked_binding != binding or self.send_unavailable_reason(current_agent, allow_working=allow_working,
+                            fresh_bootstrap=allow_fresh and fresh_bootstrap) is not None):
+                        raise BridgeError(503, "Pane changed while preparing attachments; inspect Terminal before sending again")
+                try:
+                    await self.client.prompt(pane_id, submitted_text)
+                except BridgeError as exc:
+                    if receipts and exc.status != 503:
+                        raise BridgeError(503, "Attachment submission was not confirmed; inspect Terminal before sending again") from exc
+                    raise
+            if receipts:
+                await store.confirmed(pane_id, binding, attachment_owner)
             warning = None
             try:
-                _, _, after_binding = await self.target(pane_id)
+                _, _, after_binding = await self.target(pane_id, owner=attachment_owner)
                 if after_binding != binding:
                     warning = "Pane changed after submission; inspect Terminal before sending again"
             except BridgeError:

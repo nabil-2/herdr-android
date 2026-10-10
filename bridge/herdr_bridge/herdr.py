@@ -162,7 +162,7 @@ class HerdrClient:
         await self._wait_created_shell(tab)
         name = "pocket-" + uuid.uuid4().hex[:24]
         result = await self.call("agent.start", {"name": name, "kind": "codex", "pane_id": tab.pane_id,
-                                                  "args": [], "timeout_ms": 30000})
+                                                  "args": ["--no-daemon"], "timeout_ms": 30000})
         agent = result.get("agent")
         if (result.get("type") != "agent_started" or not isinstance(agent, dict)
                 or agent.get("workspace_id") != tab.workspace_id or agent.get("tab_id") != tab.tab_id

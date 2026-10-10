@@ -39,6 +39,53 @@ try:
 except ValueError:
     agent_session_id = None
 '''
+_PANE_PROCESS_GUARD = b'''# A shared app-server inherits only its first launcher's Herdr pane. Never
+# attribute another frontend's session to that inherited pane. A pane-local
+# Codex TUI (--no-daemon on current Codex) remains the closest Codex ancestor.
+def pane_local_codex_hook():
+    pid = os.getppid()
+    for _ in range(32):
+        if pid <= 1:
+            return False
+        try:
+            directory = f"/proc/{pid}"
+            if os.stat(directory).st_uid != os.getuid():
+                return False
+            with open(directory + "/stat", "rb") as handle:
+                before = handle.read(4096).rsplit(b")", 1)[1].split()
+            with open(directory + "/cmdline", "rb") as handle:
+                argv = handle.read(4096).split(b"\\0")
+            executable = os.path.basename(os.readlink(directory + "/exe"))
+            # Herdr also recognizes interpreter-launched Codex wrappers.
+            native = executable == "codex"
+            wrapper = len(argv) > 1 and os.path.basename(argv[1]) == b"codex"
+            with open(directory + "/stat", "rb") as handle:
+                after = handle.read(4096).rsplit(b")", 1)[1].split()
+            if len(before) < 20 or len(after) < 20 or before[19] != after[19]:
+                return False
+            if native or wrapper:
+                args = argv[1:] if native else argv[2:]
+                index = 0
+                while index < len(args):
+                    argument = args[index]
+                    if not argument:
+                        return True
+                    if argument in (b"-c", b"--config", b"-C", b"--cd", b"-p", b"--profile"):
+                        index += 2
+                    elif argument.startswith(b"-"):
+                        index += 1
+                    else:
+                        return argument != b"app-server"
+                return True
+            pid = int(after[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+import sys
+if sys.platform.startswith("linux") and not pane_local_codex_hook():
+    raise SystemExit(0)
+'''
 _ORIGINAL_EVENT_GUARD = b'if hook_event_name and hook_event_name != "SessionStart":\n'
 _COMPATIBLE_EVENT_GUARD = b'if hook_event_name != "SessionStart":\n'
 _MAX_HELPER_BYTES = 65536
@@ -130,6 +177,10 @@ def _patched_original(data: bytes) -> bytes | None:
     if data.count(PATCH_MARKER) != 1 or data.count(_COMPATIBLE_ID_GUARD) != 1:
         return None
     original = data.replace(PATCH_MARKER, b"", 1).replace(_COMPATIBLE_ID_GUARD, _ORIGINAL_ID_GUARD, 1)
+    # Recognize both our previous exact patch and this guarded upgrade, so an
+    # installed Pocket helper can migrate without touching custom hooks.
+    if original.count(_PANE_PROCESS_GUARD) == 1:
+        original = original.replace(_PANE_PROCESS_GUARD, b"", 1)
     original = original.replace(_COMPATIBLE_EVENT_GUARD, _ORIGINAL_EVENT_GUARD, 1)
     return original if hashlib.sha256(original).hexdigest() == OFFICIAL_V8_SHA256 else None
 
@@ -160,11 +211,11 @@ def _hook_configured(home: Path, helper: Path) -> bool:
     return False
 
 
-def _patch_helper(path: Path, original: bytes, info: os.stat_result) -> None:
+def _patch_helper(path: Path, original: bytes, info: os.stat_result, *, expected: bytes | None = None) -> None:
     if original.count(_ORIGINAL_ID_GUARD) != 1 or original.count(_ORIGINAL_EVENT_GUARD) != 1:
         raise _UnsafeIntegration("The Codex helper has custom contents; it was left unchanged.")
     patched = original.replace(b"set -eu\n", PATCH_MARKER + b"set -eu\n", 1)
-    patched = patched.replace(_ORIGINAL_ID_GUARD, _COMPATIBLE_ID_GUARD, 1)
+    patched = patched.replace(_ORIGINAL_ID_GUARD, _PANE_PROCESS_GUARD + _COMPATIBLE_ID_GUARD, 1)
     patched = patched.replace(_ORIGINAL_EVENT_GUARD, _COMPATIBLE_EVENT_GUARD, 1)
     backup = path.with_name(path.name + ".herdr-pocket-v8.original")
     prior_backup = _read_helper(backup)
@@ -184,7 +235,7 @@ def _patch_helper(path: Path, original: bytes, info: os.stat_result) -> None:
             os.fchmod(output.fileno(), stat.S_IMODE(info.st_mode))
             os.fsync(output.fileno())
         current = _read_helper(path)
-        if current is None or current[0] != original or (current[1].st_dev, current[1].st_ino) != (info.st_dev, info.st_ino):
+        if current is None or current[0] != (expected if expected is not None else original) or (current[1].st_dev, current[1].st_ino) != (info.st_dev, info.st_ino):
             raise _UnsafeIntegration("The Codex helper changed during setup; it was left unchanged.")
         os.replace(temporary, path)
     finally:
@@ -245,8 +296,12 @@ def _ensure_locked(herdr_bin: str, codex_home: Path) -> CodexIntegrationResult:
             raise _UnsafeIntegration("Herdr did not install its Codex helper.")
         if not _hook_configured(home, helper):
             raise _UnsafeIntegration("Herdr's Codex hook is not configured; terminal access is available.")
-        if _patched_original(installed[0]) is not None:
-            return CodexIntegrationResult(ready=True, changed=changed)
+        previous_original = _patched_original(installed[0])
+        if previous_original is not None:
+            if installed[0].count(_PANE_PROCESS_GUARD) == 1:
+                return CodexIntegrationResult(ready=True, changed=changed)
+            _patch_helper(helper, previous_original, installed[1], expected=installed[0])
+            return CodexIntegrationResult(ready=True, changed=True)
         if hashlib.sha256(installed[0]).hexdigest() != OFFICIAL_V8_SHA256:
             raise _UnsafeIntegration("This Codex helper version is unsupported; it was left unchanged.")
         _patch_helper(helper, *installed)

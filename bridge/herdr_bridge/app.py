@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager, suppress
 import hmac
+import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -20,6 +22,8 @@ from .herdr import BridgeError, HerdrClient, stop_observer, validate_pane_id, va
 from .codex_integration import CodexIntegrationResult, ensure_codex_integration
 from .pairing import PairingError, PairingStore, valid_name
 from .codex import CodexReader, Conversations
+from .codex_identity import DaemonConversations
+from .attachments import ATTACHMENT_ID, MAX_ATTACHMENT_BYTES, AttachmentStore, valid_attachment_name
 
 MAX_BODY_BYTES = 64 * 1024
 
@@ -56,6 +60,34 @@ class AuthAndBodyLimit:
         pairing_request = scope["path"] == "/v1/pair" and scope["method"] == "POST"
         if not pairing_request and not await asyncio.to_thread(authorized, header, self.token, self.pairing_store):
             await JSONResponse({"detail": "Invalid or missing bearer token"}, 401, headers={"WWW-Authenticate": "Bearer"})(scope, receive, send)
+            return
+        if not pairing_request:
+            supplied = header.partition(" ")[2]
+            scope.setdefault("state", {})["attachment_owner"] = hashlib.sha256(supplied.encode("ascii")).hexdigest()
+        attachment_upload = (scope["method"] == "POST" and re.fullmatch(
+            r"/v1/panes/w[1-9][0-9]*:p[1-9][0-9]*/attachments", scope["path"]) is not None)
+        if attachment_upload:
+            try:
+                raw_length = headers.get(b"content-length")
+                if raw_length is not None and int(raw_length) > MAX_ATTACHMENT_BYTES:
+                    await JSONResponse({"detail": "Attachments must fit within 16 MiB"}, 413)(scope, receive, send)
+                    return
+            except ValueError:
+                await JSONResponse({"detail": "Invalid attachment length"}, 400)(scope, receive, send)
+                return
+            received = 0
+
+            async def limited_receive():
+                nonlocal received
+                message = await receive()
+                received += len(message.get("body", b""))
+                if received > MAX_ATTACHMENT_BYTES:
+                    raise BridgeError(413, "Attachments must fit within 16 MiB")
+                return message
+
+            # Only the exact upload endpoint streams its larger body. All JSON
+            # commands retain the original 64 KiB limit and bounded replay.
+            await self.app(scope, limited_receive, send)
             return
         body = bytearray()
         try:
@@ -109,6 +141,12 @@ class InputRequest(BaseModel):
         if not self.text and not self.keys:
             raise ValueError("Provide text or keys")
         return self
+
+
+class CodexSelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    id: str = Field(min_length=36, max_length=36, pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+    selectionToken: str = Field(min_length=43, max_length=43, pattern=r"^[A-Za-z0-9_-]{43}$")
 
 
 class TerminalInputRequest(BaseModel):
@@ -183,23 +221,34 @@ class PairRequest(BaseModel):
 class MessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     binding: str = Field(pattern=r"^[A-Za-z0-9_-]{43}$")
-    text: str = Field(min_length=1, max_length=16384)
+    text: str = Field(default="", max_length=16384)
+    attachmentIds: list[Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]] = Field(default_factory=list, max_length=8)
 
     @field_validator("text")
     @classmethod
     def literal_message(cls, value: str) -> str:
-        if not value.strip() or len(value.encode("utf-8")) > 32768 or any((ord(c) < 32 and c not in "\n\r\t") or ord(c) == 127 for c in value):
-            raise ValueError("Message must be nonblank literal text within 32 KiB")
+        if len(value.encode("utf-8")) > 32768 or any((ord(c) < 32 and c not in "\n\r\t") or ord(c) == 127 for c in value):
+            raise ValueError("Message must be literal text within 32 KiB")
         return value
+
+    @model_validator(mode="after")
+    def nonempty(self):
+        if (not self.text.strip() and not self.attachmentIds) or len(set(self.attachmentIds)) != len(self.attachmentIds):
+            raise ValueError("Provide message text or distinct attachments")
+        return self
 
 
 def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | None = None, *,
                codex_executable: str | None = None, codex_home: Path | None = None,
-               codex_path: str | None = None, prepare_codex_integration: bool = False) -> FastAPI:
+               codex_path: str | None = None, prepare_codex_integration: bool = False,
+               attachment_dir: Path | None = None) -> FastAPI:
     if not 32 <= len(token) <= 4096 or not token.isascii() or any(c.isspace() for c in token):
         raise ValueError("Use a generated bearer token of at least 32 ASCII characters")
     reader = CodexReader(codex_executable, codex_home, codex_path)
     conversations = Conversations(client, reader)
+    conversations.daemon = DaemonConversations(client, reader.home) if reader.enabled else None
+    attachments = AttachmentStore(attachment_dir)
+    conversations.attachments = attachments
 
     async def prepare_integration() -> CodexIntegrationResult:
         try:
@@ -232,11 +281,20 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
     async def lifespan(_app):
         if prepare_codex_integration and reader.enabled:
             integration_task()
+        async def maintain_attachments():
+            while True:
+                with suppress(BridgeError, OSError):
+                    await attachments.cleanup()
+                await asyncio.sleep(60)
+        attachment_maintenance = asyncio.create_task(maintain_attachments())
         try:
             yield
         finally:
             with anyio.CancelScope(shield=True):
+                attachment_maintenance.cancel()
+                await asyncio.gather(attachment_maintenance, return_exceptions=True)
                 await reader.close()
+                await attachments.close()
                 task = app.state.codex_integration_task
                 if task is not None:
                     task.cancel()
@@ -245,6 +303,7 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
     app = FastAPI(title="Herdr Android Bridge", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.codex_reader = reader
     app.state.conversations = conversations
+    app.state.attachments = attachments
     app.state.codex_integration_task = None
     app.state.codex_integration_result = None
     app.add_middleware(AuthAndBodyLimit, token=token, pairing_store=pairing_store)
@@ -273,33 +332,94 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
         result = {"service": "herdr-android-bridge", "protocol": 1, "companionVersion": __version__, "herdrVersion": snapshot["herdrVersion"], "pairing": pairing_store is not None}
         result["capabilities"] = ["terminal-input", "terminal-history", "workspace-tabs"]
         if reader.enabled:
-            result["capabilities"].extend(["codex-chat", "codex-chat-working-input", "codex-chat-fresh-input", "codex-create"])
+            result["capabilities"].extend(["codex-chat", "codex-chat-working-input", "codex-chat-fresh-input", "codex-create", "codex-chat-attachments", "codex-chat-selection"])
         integration = app.state.codex_integration_result
         if integration is not None and integration.advisory:
             result["codexIntegrationAdvisory"] = integration.advisory
         return result
 
     @app.get("/v1/snapshot")
-    async def snapshot():
+    async def snapshot(request: Request):
         snapshot = await client.snapshot()
         if not reader.enabled:
             for pane in snapshot["panes"]:
                 if "conversation" in pane:
                     pane["conversation"] = {"provider": "codex", "available": False, "reason": "Codex conversation reader is not configured; use Terminal"}
+        elif conversations.daemon is not None:
+            await conversations.daemon.decorate_snapshot(snapshot, request.state.attachment_owner)
         return snapshot
+
+    @app.get("/v1/panes/{pane_id}/codex-conversations")
+    async def codex_conversations(pane_id: str, request: Request):
+        validate_pane_id(pane_id)
+        if conversations.daemon is None:
+            raise BridgeError(503, "Codex conversation selection is unavailable; update the host companion")
+        return await conversations.daemon.list(pane_id, request.state.attachment_owner)
+
+    @app.post("/v1/panes/{pane_id}/codex-conversation")
+    async def codex_conversation(pane_id: str, selection: CodexSelectionRequest, request: Request):
+        validate_pane_id(pane_id)
+        if conversations.daemon is None:
+            raise BridgeError(503, "Codex conversation selection is unavailable; update the host companion")
+        return await conversations.daemon.select(pane_id, request.state.attachment_owner, selection.id, selection.selectionToken)
 
     @app.get("/v1/panes/{pane_id}/conversation")
     async def conversation(pane_id: str, request: Request, cursor: Annotated[str | None, Query(max_length=2048)] = None,
                            revision: Annotated[str | None, Query(max_length=256)] = None):
         return await conversations.page(pane_id, cursor, revision,
                                         allow_working=request.headers.get("X-Herdr-Chat-Working-Input") == "1",
-                                        allow_fresh=request.headers.get("X-Herdr-Chat-Fresh-Input") == "1")
+                                        allow_fresh=request.headers.get("X-Herdr-Chat-Fresh-Input") == "1",
+                                        owner=request.state.attachment_owner)
 
     @app.post("/v1/panes/{pane_id}/messages")
     async def message(pane_id: str, request: MessageRequest, http_request: Request):
         return await conversations.send(pane_id, request.binding, request.text,
                                         allow_working=http_request.headers.get("X-Herdr-Chat-Working-Input") == "1",
-                                        allow_fresh=http_request.headers.get("X-Herdr-Chat-Fresh-Input") == "1")
+                                        allow_fresh=http_request.headers.get("X-Herdr-Chat-Fresh-Input") == "1",
+                                        attachment_ids=request.attachmentIds, attachments=attachments,
+                                        attachment_owner=http_request.state.attachment_owner)
+
+    async def attachment_scope(pane_id: str, request: Request) -> tuple[str, str, str]:
+        binding = request.headers.get("X-Herdr-Chat-Binding", "")
+        if len(binding) != 43 or not all(c.isascii() and (c.isalnum() or c in "_-") for c in binding):
+            raise BridgeError(400, "Refresh the conversation before selecting an attachment")
+        if not reader.enabled:
+            raise BridgeError(503, "Codex conversation reader is not configured; use Terminal")
+        agent, thread_id, current = await conversations.target(pane_id, owner=request.state.attachment_owner)
+        if not hmac.compare_digest(binding, current):
+            raise BridgeError(409, "Pane or conversation changed; refresh before selecting an attachment")
+        cache = conversations.caches.get(binding)
+        if cache is None or cache.error is not None:
+            raise BridgeError(409, "Read the conversation successfully before selecting an attachment")
+        await attachments.register(pane_id, binding, thread_id,
+                                   conversations.attachment_runtime(pane_id, agent, thread_id))
+        return binding, request.state.attachment_owner, thread_id
+
+    @app.post("/v1/panes/{pane_id}/attachments", status_code=201)
+    async def upload_attachment(pane_id: str, request: Request, kind: Literal["image", "file"],
+                                name: Annotated[str, Query(min_length=1, max_length=160)]):
+        if request.headers.get("content-type", "").partition(";")[0].strip().lower() != "application/octet-stream":
+            raise BridgeError(415, "Upload attachment bytes as application/octet-stream")
+        if not valid_attachment_name(name):
+            raise BridgeError(400, "Choose an attachment with a valid basename")
+        binding, owner, thread_id = await attachment_scope(pane_id, request)
+        return await attachments.upload(pane_id, binding, owner, name, kind, request.stream(), thread_id=thread_id)
+
+    @app.delete("/v1/panes/{pane_id}/attachments/{attachment_id}")
+    async def delete_attachment(pane_id: str, attachment_id: str, request: Request):
+        if not ATTACHMENT_ID.fullmatch(attachment_id):
+            raise BridgeError(400, "Select a valid attachment")
+        binding, owner, _ = await attachment_scope(pane_id, request)
+        await attachments.delete(attachment_id, pane_id, binding, owner)
+        return {"ok": True}
+
+    @app.post("/v1/panes/{pane_id}/attachments/acknowledge")
+    async def acknowledge_attachment_input(pane_id: str, request: Request):
+        # An explicit phone action after inspecting/clearing the Terminal composer.
+        # Polling saved messages never clears an uncertain paste automatically.
+        binding, owner, _ = await attachment_scope(pane_id, request)
+        await attachments.confirmed(pane_id, binding, owner)
+        return {"ok": True}
 
     @app.post("/v1/panes/{pane_id}/input")
     async def send_input(pane_id: str, request: InputRequest):

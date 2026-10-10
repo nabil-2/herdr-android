@@ -21,8 +21,8 @@ internal object ConversationProtocol {
                 val value = objectValue[field] as? JsonPrimitive
                 require(value != null && !value.isString && value.booleanOrNull != null)
             }
-            objectValue["freshBootstrap"]?.let { value ->
-                require(value is JsonPrimitive && !value.isString && value.booleanOrNull != null)
+            for (field in listOf("freshBootstrap", "attachmentDeliveryUncertain")) {
+                objectValue[field]?.let { value -> require(value is JsonPrimitive && !value.isString && value.booleanOrNull != null) }
             }
             objectValue["messages"]?.jsonArray?.forEach { item ->
                 for (field in listOf("timestamp", "messageTimestamp")) {
@@ -59,14 +59,15 @@ internal object ConversationProtocol {
         }
     }
 
-    fun input(binding: String, text: String): String {
+    fun input(binding: String, text: String, attachmentIds: List<String> = emptyList()): String {
         validateOpaque(binding, 256)
-        require(text.isNotBlank()) { "Enter a message before sending." }
+        ChatAttachmentProtocol.validateIds(attachmentIds)
+        require(text.isNotBlank() || attachmentIds.isNotEmpty()) { "Enter a message or attach a file before sending." }
         require(text.none { (it.code < 32 && it !in "\n\r\t") || it.code == 127 }) {
             "Chat messages cannot contain terminal control characters. Use Terminal for interactive input."
         }
-        InputValidation.validate(text, emptyList())
-        return json.encodeToString(ChatInput(binding, text)).also(InputValidation::validateBody)
+        if (text.isNotEmpty()) InputValidation.validate(text, emptyList())
+        return json.encodeToString(ChatInput(binding, text, attachmentIds)).also(InputValidation::validateBody)
     }
 
     fun acknowledgement(body: String): String? {
@@ -93,7 +94,7 @@ internal object ConversationProtocol {
 /** Pure transitions shared by the ViewModel and tests, including draft acknowledgement. */
 internal object ChatState {
     fun supportsPaneChat(pane: Pane, capabilities: List<String>): Boolean = "codex-chat" in capabilities &&
-        pane.conversation?.let { it.provider == "codex" && it.available } == true
+        pane.conversation?.let { it.provider == "codex" && (it.available || (it.selectable && "codex-chat-selection" in capabilities)) } == true
 
     fun requiresFullPage(current: ChatContent, page: ConversationPage): Boolean = page.unchanged &&
         (current.bindingId != page.binding || current.revision != page.revision || current.historyEpoch != page.historyEpoch)
@@ -123,7 +124,9 @@ internal object ChatState {
             canSendReason = page.canSendReason,
             status = page.status,
             warning = page.warning,
-            error = if (initial.deliveryUncertain) initial.error else null,
+            deliveryUncertain = initial.deliveryUncertain || page.attachmentDeliveryUncertain,
+            attachmentDeliveryUncertain = initial.attachmentDeliveryUncertain || page.attachmentDeliveryUncertain,
+            error = if (initial.deliveryUncertain) initial.error else if (page.attachmentDeliveryUncertain) "Attachment delivery was not confirmed. Check Terminal and clear any partial draft before continuing." else null,
         )
     }
 
@@ -140,7 +143,7 @@ internal object ChatState {
         )
     }
 
-    fun acknowledged(current: ChatContent, binding: String, submitted: String, warning: String?): ChatContent {
+    fun acknowledged(current: ChatContent, binding: String, submitted: String, warning: String?, attachmentIds: List<String> = emptyList()): ChatContent {
         if (current.bindingId != binding) return current
         return current.copy(
             draft = if (current.draft == submitted) "" else current.draft,
@@ -151,6 +154,9 @@ internal object ChatState {
             warning = warning ?: current.warning,
             error = null,
             deliveryUncertain = false,
+            attachmentDeliveryUncertain = false,
+            attachments = current.attachments.filterNot { it.remoteId in attachmentIds },
+            attachmentError = null,
         )
     }
 }

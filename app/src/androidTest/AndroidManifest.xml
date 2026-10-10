@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <provider android:name="dev.herdr.android.data.SyntheticChatAttachmentProvider"
+            android:authorities="dev.herdr.android.test.synthetic.attachments"
+            android:exported="true" android:grantUriPermissions="true" />
+    </application>
+</manifest>

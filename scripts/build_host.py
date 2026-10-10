@@ -41,7 +41,7 @@ def installer(binary: bytes, operating_system: str, architecture: str) -> str:
     # Installation is performed by the companion itself, after prerequisite checks.
     # A failed setup leaves no shell-created persistent files behind.
     header = f'''#!/usr/bin/env bash
-# Herdr Pocket 0.6.0. Self-contained runtime; no Python installation required.
+# Herdr Pocket 0.7.0. Self-contained runtime; no Python installation required.
 set -euo pipefail
 case "$(uname -s)" in
   {"Linux" if operating_system == "linux" else "Darwin"}) ;;

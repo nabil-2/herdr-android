@@ -14,8 +14,8 @@ android {
         applicationId = "dev.herdr.android"
         minSdk = 26
         targetSdk = 37
-        versionCode = 8
-        versionName = "0.6.0"
+        versionCode = 9
+        versionName = "0.7.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -46,6 +46,8 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("com.mikepenz:multiplatform-markdown-renderer:0.41.0")
     implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.41.0")
+    implementation("io.github.huarangmeng:latex-renderer:1.5.6")
+    implementation("io.github.huarangmeng:latex-parser:1.5.6")
     implementation(project(":termlib"))
     implementation("androidx.camera:camera-camera2:1.6.2")
     implementation("androidx.camera:camera-lifecycle:1.6.2")

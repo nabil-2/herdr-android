@@ -112,7 +112,9 @@ async def run(executable: str) -> None:
             qr_image = Path(directory) / "pairing.png"
             segno.make(payload, error="M", micro=False).save(qr_image, scale=6, border=4)
             bridge = FixtureServer(uvicorn.Config(
-                create_app(client, TEST_TOKEN, pairing), host="127.0.0.1", port=PORT,
+                create_app(client, TEST_TOKEN, pairing,
+                    codex_home=Path(directory) / "codex", attachment_dir=Path(directory) / "attachments"),
+                host="127.0.0.1", port=PORT,
                 log_level="error", access_log=False, timeout_graceful_shutdown=3,
             ))
             bridge_task = asyncio.create_task(bridge.serve(sockets=[listener]))

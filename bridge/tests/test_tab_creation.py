@@ -116,7 +116,7 @@ async def test_codex_creation_prepares_integration_and_starts_only_the_new_root_
     assert "Terminal" in response.json()["warning"]
     assert order == ["session.snapshot", "integration", "tab.create", "pane.get", "pane.process_info", "agent.start"]
     start = requests[-1]["params"]
-    assert start["kind"] == "codex" and start["pane_id"] == "w1:p3" and start["args"] == []
+    assert start["kind"] == "codex" and start["pane_id"] == "w1:p3" and start["args"] == ["--no-daemon"]
     assert re.fullmatch(r"pocket-[0-9a-f]{24}", start["name"])
     assert start["timeout_ms"] == 30000
     assert all(request["method"] not in ("pane.send_input", "pane.send_text", "agent.prompt", "pane.close") for request in requests)
