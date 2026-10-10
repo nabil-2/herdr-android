@@ -128,6 +128,7 @@ internal fun ChatScreen(
     onChooseConversation: () -> Unit = {},
     onSelectConversation: (String) -> Unit = {},
     onDismissConversationSelection: () -> Unit = {},
+    onConfirmConversationChange: () -> Unit = {},
 ) {
     val pane = state.snapshot?.panes?.firstOrNull { it.id == state.paneId }
     val workspace = state.snapshot?.workspaces?.firstOrNull { it.id == pane?.workspaceId }
@@ -170,7 +171,12 @@ internal fun ChatScreen(
                 !connected -> ChatNotice("Server disconnected", "Reconnect to update this conversation and send messages.", "Reconnect", onRetry)
                 chat.status == "blocked" -> ChatNotice("Codex needs your attention", "Open the terminal to answer a question or approve an action.", "Open terminal", onTerminal, Modifier.testTag("chat-attention"))
             }
-            if (chat.deliveryUncertain) ChatNotice("Message delivery is uncertain",
+            if (chat.conversationChanged) ChatNotice("Conversation changed",
+                if (chat.deliveryUncertain) "Your original messages are kept below. Delivery of the previous message was not confirmed. Check Terminal and clear any partial draft before switching chats."
+                else "Your original messages are kept below. This pane now points to another chat. You can keep reading these messages, choose a conversation, or explicitly switch.",
+                if (chat.deliveryUncertain) "I checked Terminal; switch chats" else "Show current conversation",
+                onConfirmConversationChange, Modifier.testTag("chat-conversation-changed"))
+            else if (chat.deliveryUncertain) ChatNotice("Message delivery is uncertain",
                 if (chat.attachmentDeliveryUncertain) "Check Terminal and clear any partial draft before continuing. Remove these attachments and attach them again if needed."
                 else "Check the conversation or terminal before sending this message again.",
                 if (chat.attachmentDeliveryUncertain) "I checked and cleared Terminal" else "I checked the conversation",
@@ -196,7 +202,7 @@ internal fun ChatScreen(
                 if (profileId != null && paneId != null && binding != null) ChatAttachmentTarget(profileId, paneId, binding) else null
             }
             val imageReceiver = chatImageContentReceiver(attachmentTarget, onAddAttachments,
-                enabled = connected && "codex-chat-attachments" in state.capabilities && !chat.sending && !chat.deliveryUncertain)
+                enabled = connected && "codex-chat-attachments" in state.capabilities && !chat.sending && !chat.deliveryUncertain && !chat.conversationChanged)
             key(state.activeProfileId, state.paneId, chat.bindingId) {
             ChatComposer(
                 draft = chat.draft,

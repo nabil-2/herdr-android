@@ -171,7 +171,7 @@ async def chat(socket_server, codex_stub):
 
 async def test_chat_capability_and_metadata_do_not_disclose_native_session(chat):
     client, _, _, _, _, _, _, _, _ = chat
-    assert (await client.get("/v1/health")).json()["capabilities"] == ["terminal-input", "terminal-history", "workspace-tabs", "codex-chat", "codex-chat-working-input", "codex-chat-fresh-input", "codex-create", "codex-chat-attachments", "codex-chat-selection"]
+    assert (await client.get("/v1/health")).json()["capabilities"] == ["terminal-input", "terminal-history", "workspace-tabs", "codex-chat", "codex-chat-working-input", "codex-chat-fresh-input", "codex-create", "codex-create-isolated", "codex-chat-attachments", "codex-chat-selection"]
     response = await client.get("/v1/snapshot")
     assert response.json()["panes"][1]["conversation"] == {"provider": "codex", "available": True, "reason": None}
     assert THREAD_ID not in response.text and "term-test-generation" not in response.text
@@ -189,6 +189,7 @@ async def test_latest_older_pages_revision_and_shared_poll_cache(chat):
     client, _, _, _, _, _, payload, log, now = chat
     payload.write_text(json.dumps(history(112)))
     page = (await client.get("/v1/panes/w1:p2/conversation")).json()
+    assert page["conversationId"] == THREAD_ID
     assert len(page["messages"]) == 50
     assert page["messages"][0]["text"] == "Message 62"
     assert page["canSend"] and not page["unchanged"]

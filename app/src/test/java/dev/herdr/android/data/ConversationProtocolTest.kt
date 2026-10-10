@@ -10,6 +10,16 @@ import java.io.IOException
 class ConversationProtocolTest {
     private val page = """{"binding":"binding-1","revision":"revision-1","historyEpoch":"epoch-1","messages":[{"id":"m1","role":"assistant","text":"Hello","phase":"final_answer"}],"olderCursor":"older-1","unchanged":false,"canSend":true,"status":"idle","warning":null}"""
 
+    @Test fun `canonical conversation identity is optional but must be a canonical UUID string`() {
+        val id = "00000000-0000-4000-8000-000000000001"
+        fun withIdentity(value: String) = page.dropLast(1) + ",\"conversationId\":$value}"
+        assertEquals(id, ConversationProtocol.decode(withIdentity("\"$id\"")).conversationId)
+        assertNull(ConversationProtocol.decode(page).conversationId)
+        assertNull(ConversationProtocol.decode(withIdentity("null")).conversationId)
+        listOf("1", "true", "{}", "[]", "\"\"", "\"1-1-1-1-1\"", "\"not-a-thread\"")
+            .forEach { value -> assertThrows(IOException::class.java) { ConversationProtocol.decode(withIdentity(value)) } }
+    }
+
     @Test fun `turn timestamps and readiness explanation remain optional and validated`() {
         val timed = page.replace("\"phase\":\"final_answer\"", "\"phase\":\"final_answer\",\"timestamp\":1791540060,\"timestampSource\":\"turn_end\"")
         val message = ConversationProtocol.decode(timed).messages.single()

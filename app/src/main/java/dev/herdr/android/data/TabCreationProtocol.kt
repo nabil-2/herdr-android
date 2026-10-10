@@ -6,6 +6,10 @@ import java.io.IOException
 
 /** A creation acknowledgement must identify a new pane inside the requested workspace. */
 internal object TabCreationProtocol {
+    const val CODEX_CREATION_REQUIREMENT = "New Codex chats require companion 0.7.1 on a Linux host. Update the companion or use Terminal."
+    fun supportsIsolatedCodex(capabilities: List<String>): Boolean =
+        "codex-create" in capabilities && "codex-create-isolated" in capabilities
+
     private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
     private val workspaceId = Regex("w[1-9][0-9]*")
 

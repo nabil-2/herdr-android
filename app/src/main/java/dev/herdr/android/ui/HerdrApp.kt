@@ -78,6 +78,7 @@ import dev.herdr.android.data.PaneMode
 import dev.herdr.android.data.ChatState
 import dev.herdr.android.data.ServerProfile
 import dev.herdr.android.data.Workspace
+import dev.herdr.android.data.TabCreationProtocol
 
 @Composable
 fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalRetry: (String) -> Unit, onPair: (String) -> Unit) {
@@ -187,6 +188,7 @@ fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalR
                     onChooseConversation = viewModel::loadCodexConversations,
                     onSelectConversation = viewModel::selectCodexConversation,
                     onDismissConversationSelection = viewModel::dismissCodexConversationSelection,
+                    onConfirmConversationChange = viewModel::confirmConversationChange,
                 ) else TerminalScreen(
                     state, viewModel,
                     onBack = {
@@ -489,8 +491,9 @@ internal fun DashboardScreen(
                                 Text("New Codex chat")
                             }
                         }
-                        if ("workspace-tabs" !in state.capabilities || "codex-create" !in state.capabilities) {
-                            Text("Update the host companion to create tabs and Codex chats here.",
+                        if ("workspace-tabs" !in state.capabilities || !TabCreationProtocol.supportsIsolatedCodex(state.capabilities)) {
+                            Text(if (!TabCreationProtocol.supportsIsolatedCodex(state.capabilities)) TabCreationProtocol.CODEX_CREATION_REQUIREMENT
+                                else "Update the host companion to create tabs here.",
                                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
@@ -540,7 +543,7 @@ internal fun NewTabDialog(
     var cwd by rememberSaveable(workspace.id, codex) { mutableStateOf(workspace.cwd) }
     val initialRevision = remember { state.creationRevision }
     val capability = if (codex) "codex-create" else "workspace-tabs"
-    val supported = capability in state.capabilities
+    val supported = capability in state.capabilities && (!codex || TabCreationProtocol.supportsIsolatedCodex(state.capabilities))
     val busy = state.creatingTab || state.creatingWorkspace
     LaunchedEffect(state.creationRevision) {
         if (state.creationRevision > initialRevision) onCreated()
@@ -557,7 +560,7 @@ internal fun NewTabDialog(
                 OutlinedTextField(cwd, { cwd = it.take(4096) }, label = { Text("Server directory") }, singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), enabled = !busy,
                     modifier = Modifier.fillMaxWidth().testTag("new-tab-directory"))
-                if (!supported) Text("Run herdr-pocket update on this server, then reconnect.",
+                if (!supported) Text(if (codex) TabCreationProtocol.CODEX_CREATION_REQUIREMENT else "Run herdr-pocket update on this server, then reconnect.",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                 if (state.error != null) Text(state.error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                 if (state.creationUncertain) TextButton(onClick = onInspect, modifier = Modifier.testTag("inspect-created-tabs")) {

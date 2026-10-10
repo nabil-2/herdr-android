@@ -176,9 +176,12 @@ class HerdrClient:
         # exact terminal and foreground job before the one agent.start mutation.
         shells = {"sh", "bash", "dash", "zsh", "fish", "ksh", "mksh", "csh", "tcsh",
                   "elvish", "xonsh", "nu", "pwsh", "powershell", "cmd"}
+        stable_shell = None
+        stable_since = 0.0
         try:
             async with asyncio.timeout(3):
                 while True:
+                    current_shell = None
                     pane = (await self.call("pane.get", {"pane_id": tab.pane_id})).get("pane")
                     if (not isinstance(pane, dict) or pane.get("pane_id") != tab.pane_id
                             or pane.get("workspace_id") != tab.workspace_id or pane.get("tab_id") != tab.tab_id
@@ -197,7 +200,18 @@ class HerdrClient:
                             if isinstance(name, str):
                                 normalized = name.replace("\\", "/").rsplit("/", 1)[-1].lstrip("-").lower().removesuffix(".exe")
                                 if normalized in shells:
-                                    return
+                                    current_shell = (pid, normalized)
+                    # A shell can briefly be the only foreground process while
+                    # its startup files prepare another child. Require the same
+                    # quiet foreground job across observations before the one
+                    # launch; reset immediately on a child, job or PID change.
+                    now = asyncio.get_running_loop().time()
+                    if current_shell is None:
+                        stable_shell = None
+                    elif current_shell != stable_shell:
+                        stable_shell, stable_since = current_shell, now
+                    elif now - stable_since >= 0.2:
+                        return
                     await asyncio.sleep(0.05)
         except TimeoutError as exc:
             raise BridgeError(503, "The new terminal's shell is still starting; inspect it before creating another chat") from exc

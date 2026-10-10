@@ -100,7 +100,7 @@ class NewTabWorkflowTest {
                 override fun dispatch(request: RecordedRequest): MockResponse {
                     if (request.getHeader("Authorization") != "Bearer $TOKEN") return MockResponse().setResponseCode(401)
                     return when (request.requestUrl!!.encodedPath) {
-                        "/v1/health" -> json("""{"service":"herdr-android-bridge","protocol":1,"capabilities":["workspace-tabs","codex-create","codex-chat","codex-chat-working-input"]}""")
+                        "/v1/health" -> json("""{"service":"herdr-android-bridge","protocol":1,"capabilities":["workspace-tabs","codex-create","codex-create-isolated","codex-chat","codex-chat-working-input"]}""")
                         "/v1/snapshot" -> json(snapshot())
                         "/v1/workspaces/w1/tabs" -> {
                             assertEquals("POST", request.method)

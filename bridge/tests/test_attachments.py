@@ -13,7 +13,7 @@ from PIL import Image
 import pytest
 
 from herdr_bridge.app import create_app
-from herdr_bridge.attachments import AttachmentStore
+from herdr_bridge.attachments import AttachmentStore, DeliveryScope
 from herdr_bridge.herdr import BridgeError
 from herdr_bridge.pairing import PairingStore
 from .conftest import AUTH, TOKEN
@@ -393,6 +393,116 @@ async def test_store_device_and_pane_scope_expiry_and_delete(tmp_path):
     assert receipt["id"] not in store.receipts
     await store.delete(next_receipt["id"], "w1:p2", "binding", "device1")
     assert not list(store.root.glob("hp-*"))
+
+
+async def test_verified_new_binding_retires_obsolete_stages_before_owner_quota(attachment_chat):
+    client, app, binding, agent, requests, _, _, _ = attachment_chat
+    ids = [(await upload(client, binding, name=f"old-{index}.txt")).json()["id"] for index in range(8)]
+    old_paths = [app.state.attachments.receipts[item].path for item in ids]
+    assert (await upload(client, binding)).status_code == 413
+    agent["terminal_id"] = "new-owned-terminal"
+    page = (await client.get("/v1/panes/w1:p2/conversation")).json()
+    assert page["binding"] != binding
+    requests.clear()
+    response = await upload(client, page["binding"], name="new.txt")
+    assert response.status_code == 201
+    assert set(app.state.attachments.receipts) == {response.json()["id"]}
+    assert all(not path.exists() and not path.with_name(path.name + ".json").exists() for path in old_paths)
+    assert all(request["method"] in ("agent.get", "pane.process_info") for request in requests)
+
+
+async def test_superseded_cleanup_preserves_other_scopes_and_uncertain_payloads(tmp_path):
+    store = AttachmentStore(tmp_path / "private")
+    owner = hashlib.sha256(b"owned first credential").hexdigest()
+    other_owner = hashlib.sha256(b"owned second credential").hexdigest()
+    for index, binding in enumerate(("obsolete", "memory-pending", "durable-pending", "current")):
+        await store.register("w1:p2", binding, THREAD_ID, str(index + 1) * 64)
+
+    async def stage(binding, *, pane="w1:p2", device=owner):
+        result = await store.upload(pane, binding, device, "n.txt", "file", chunks(b"keep"), thread_id=THREAD_ID)
+        return store.receipts[result["id"]]
+
+    obsolete = await stage("obsolete")
+    other_device = await stage("obsolete", device=other_owner)
+    other_pane = await stage("obsolete", pane="w1:p1")
+    unknown_scope = await stage("unregistered")
+    memory_pending = await stage("memory-pending")
+    store.uncertain.add(("w1:p2", "memory-pending", owner))
+    durable_pending = await stage("durable-pending")
+    submitted = await stage("durable-pending")
+    await store.consume([submitted.id], "w1:p2", "durable-pending", owner)
+    # A durable guard protects unconsumed sibling stages even if its old
+    # in-memory uncertainty entry was evicted or lost during cancellation.
+    store.uncertain.discard(("w1:p2", "durable-pending", owner))
+    current = await stage("current")
+    markers = set(store.root.glob("pending-*.json"))
+
+    async def verify():
+        return DeliveryScope("w1:p2", THREAD_ID, "4" * 64)
+
+    uploaded = await store.upload("w1:p2", "current", owner, "new.txt", "file", chunks(b"new"),
+                                  thread_id=THREAD_ID, verify_scope=verify)
+    assert obsolete.id not in store.receipts and not obsolete.path.exists()
+    retained = [other_device, other_pane, unknown_scope, memory_pending, durable_pending, submitted, current]
+    assert set(store.receipts) == {item.id for item in retained} | {uploaded["id"]}
+    assert all(item.path.read_bytes() == b"keep" for item in retained)
+    assert set(store.root.glob("pending-*.json")) == markers
+    assert ("w1:p2", "memory-pending", owner) in store.uncertain
+
+
+async def test_registered_binding_without_live_recheck_cannot_retire_stages(tmp_path):
+    store = AttachmentStore(tmp_path / "private")
+    await store.register("w1:p2", "old", THREAD_ID, "1" * 64)
+    old = await store.upload("w1:p2", "old", "owner", "old.txt", "file", chunks(b"old"), thread_id=THREAD_ID)
+    await store.register("w1:p2", "new", THREAD_ID, "2" * 64)
+    await store.upload("w1:p2", "new", "owner", "new.txt", "file", chunks(b"new"), thread_id=THREAD_ID)
+    assert old["id"] in store.receipts and store.receipts[old["id"]].path.read_bytes() == b"old"
+
+
+async def test_queued_stale_upload_cannot_prune_new_target_stages(tmp_path):
+    store = AttachmentStore(tmp_path / "private")
+    await store.register("w1:p2", "old", THREAD_ID, "1" * 64)
+    await store.register("w1:p2", "new", THREAD_ID, "2" * 64)
+    old = await store.upload("w1:p2", "old", "owner", "old.txt", "file", chunks(b"old"), thread_id=THREAD_ID)
+    new = await store.upload("w1:p2", "new", "owner", "new.txt", "file", chunks(b"new"), thread_id=THREAD_ID)
+    current = "old"
+    entered = asyncio.Event()
+
+    async def verify():
+        entered.set()
+        if current != "old":
+            raise BridgeError(409, "Conversation changed")
+        return DeliveryScope("w1:p2", THREAD_ID, "1" * 64)
+
+    await store.lock.acquire()
+    pending = asyncio.create_task(store.upload("w1:p2", "old", "owner", "queued.txt", "file", chunks(b"late"),
+                                              thread_id=THREAD_ID, verify_scope=verify))
+    await asyncio.sleep(0)
+    assert not entered.is_set()
+    current = "new"
+    store.lock.release()
+    with pytest.raises(BridgeError) as error:
+        await pending
+    assert error.value.status == 409 and entered.is_set()
+    assert set(store.receipts) == {old["id"], new["id"]}
+    assert store.receipts[new["id"]].path.read_bytes() == b"new"
+
+
+async def test_verified_cleanup_reclaims_host_item_and_byte_quota(tmp_path, monkeypatch):
+    import herdr_bridge.attachments as module
+    monkeypatch.setattr(module, "MAX_STORED_ITEMS", 1)
+    monkeypatch.setattr(module, "MAX_STORED_BYTES", 4)
+    store = AttachmentStore(tmp_path / "private")
+    await store.register("w1:p2", "old", THREAD_ID, "1" * 64)
+    old = await store.upload("w1:p2", "old", "owner", "old.txt", "file", chunks(b"1234"), thread_id=THREAD_ID)
+    await store.register("w1:p2", "new", THREAD_ID, "2" * 64)
+
+    async def verify():
+        return DeliveryScope("w1:p2", THREAD_ID, "2" * 64)
+
+    new = await store.upload("w1:p2", "new", "owner", "new.txt", "file", chunks(b"1234"),
+                             thread_id=THREAD_ID, verify_scope=verify)
+    assert set(store.receipts) == {new["id"]} and old["id"] not in store.receipts
 
 
 async def test_store_preserves_sent_files_across_close_and_restart_until_expiry(tmp_path):

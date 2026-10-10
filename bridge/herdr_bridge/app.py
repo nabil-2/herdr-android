@@ -8,6 +8,7 @@ import hmac
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -23,7 +24,7 @@ from .codex_integration import CodexIntegrationResult, ensure_codex_integration
 from .pairing import PairingError, PairingStore, valid_name
 from .codex import CodexReader, Conversations
 from .codex_identity import DaemonConversations
-from .attachments import ATTACHMENT_ID, MAX_ATTACHMENT_BYTES, AttachmentStore, valid_attachment_name
+from .attachments import ATTACHMENT_ID, MAX_ATTACHMENT_BYTES, AttachmentStore, DeliveryScope, valid_attachment_name
 
 MAX_BODY_BYTES = 64 * 1024
 
@@ -332,7 +333,10 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
         result = {"service": "herdr-android-bridge", "protocol": 1, "companionVersion": __version__, "herdrVersion": snapshot["herdrVersion"], "pairing": pairing_store is not None}
         result["capabilities"] = ["terminal-input", "terminal-history", "workspace-tabs"]
         if reader.enabled:
-            result["capabilities"].extend(["codex-chat", "codex-chat-working-input", "codex-chat-fresh-input", "codex-create", "codex-chat-attachments", "codex-chat-selection"])
+            result["capabilities"].extend(["codex-chat", "codex-chat-working-input", "codex-chat-fresh-input", "codex-create"])
+            if sys.platform.startswith("linux"):
+                result["capabilities"].append("codex-create-isolated")
+            result["capabilities"].extend(["codex-chat-attachments", "codex-chat-selection"])
         integration = app.state.codex_integration_result
         if integration is not None and integration.advisory:
             result["codexIntegrationAdvisory"] = integration.advisory
@@ -403,7 +407,19 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
         if not valid_attachment_name(name):
             raise BridgeError(400, "Choose an attachment with a valid basename")
         binding, owner, thread_id = await attachment_scope(pane_id, request)
-        return await attachments.upload(pane_id, binding, owner, name, kind, request.stream(), thread_id=thread_id)
+
+        async def verify_scope():
+            agent, current_thread, current = await conversations.target(pane_id, owner=owner)
+            if not hmac.compare_digest(binding, current) or current_thread != thread_id:
+                raise BridgeError(409, "Pane or conversation changed; refresh before selecting an attachment")
+            cache = conversations.caches.get(binding)
+            if cache is None or cache.error is not None:
+                raise BridgeError(409, "Read the conversation successfully before selecting an attachment")
+            return DeliveryScope(pane_id, current_thread,
+                                 conversations.attachment_runtime(pane_id, agent, current_thread))
+
+        return await attachments.upload(pane_id, binding, owner, name, kind, request.stream(),
+                                        thread_id=thread_id, verify_scope=verify_scope)
 
     @app.delete("/v1/panes/{pane_id}/attachments/{attachment_id}")
     async def delete_attachment(pane_id: str, attachment_id: str, request: Request):

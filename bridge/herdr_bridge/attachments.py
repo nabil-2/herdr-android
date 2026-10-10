@@ -20,7 +20,7 @@ import stat
 import shlex
 import time
 import uuid
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable, Callable
 
 from PIL import Image, UnidentifiedImageError
 
@@ -344,16 +344,59 @@ class AttachmentStore:
             display_bytes -= size
         return total, count
 
+    def _retire_superseded(self, fd: int, pane_id: str, binding: str, owner: str) -> bool:
+        """Retire only our unsubmitted stages after a live scope recheck.
+
+        A pending delivery can outlive its in-memory binding. Keep its payloads
+        even when the native client has moved to a different conversation.
+        """
+        removed = False
+        pending: dict[DeliveryScope, set[str]] = {}
+        for receipt in list(self.receipts.values()):
+            if (receipt.owner != owner or receipt.pane_id != pane_id or receipt.binding == binding
+                    or receipt.consumed or (pane_id, receipt.binding, owner) in self.uncertain):
+                continue
+            scope = self.scopes.get((pane_id, receipt.binding))
+            if scope is None or receipt.thread_id != scope.thread_id:
+                continue
+            if scope not in pending:
+                pending[scope] = self._pending_owners(fd, scope)
+            if owner in pending[scope]:
+                continue
+            record = self._read_record(fd, receipt.path.name + ".json")
+            if (record is None or record.get("submitted") is not False
+                    or record.get("paneId") != pane_id or record.get("threadId") != scope.thread_id):
+                continue
+            info = self._info(fd, receipt.path.name)
+            if (info.st_dev, info.st_ino) != receipt.inode or info.st_size != receipt.size:
+                raise BridgeError(409, "Attachment changed on the host; inspect staged files")
+            os.unlink(receipt.path.name, dir_fd=fd)
+            os.unlink(receipt.path.name + ".json", dir_fd=fd)
+            self.receipts.pop(receipt.id, None)
+            removed = True
+        return removed
+
     async def upload(self, pane_id: str, binding: str, owner: str, name: str, kind: str,
-                     chunks: AsyncIterator[bytes], *, thread_id: str | None = None) -> dict:
+                     chunks: AsyncIterator[bytes], *, thread_id: str | None = None,
+                     verify_scope: Callable[[], Awaitable[DeliveryScope]] | None = None) -> dict:
         if kind not in ("image", "file") or not valid_attachment_name(name):
             raise BridgeError(400, "Choose an attachment with a valid basename and kind")
         async with self.lock:
             fd = None
             path_name = None
             try:
+                # Requests can wait behind a streamed upload. Recheck the live
+                # target under this lock before granting stage cleanup authority;
+                # a registered but now stale binding alone is insufficient.
+                if verify_scope is not None:
+                    current = await verify_scope()
+                    if (current != self.scopes.get((pane_id, binding))
+                            or current.pane_id != pane_id or current.thread_id != thread_id):
+                        raise BridgeError(409, "Pane or conversation changed; refresh before selecting an attachment")
                 fd = await _disk(self._root_fd, close_cancelled_fd=True)
                 total, count = await _disk(self._sweep, fd)
+                if verify_scope is not None and await _disk(self._retire_superseded, fd, pane_id, binding, owner):
+                    total, count = await _disk(self._sweep, fd)
                 if count >= MAX_STORED_ITEMS or total >= MAX_STORED_BYTES:
                     raise BridgeError(413, "Attachment storage is full; remove staged files or wait for expiry")
                 if sum(r.owner == owner and not r.consumed for r in self.receipts.values()) >= MAX_ATTACHMENTS:

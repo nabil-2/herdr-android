@@ -49,13 +49,47 @@ class ChatStateTest {
         assertEquals("my draft", rollback.draft)
     }
 
-    @Test fun `binding rotation clears old draft and rejects its late acknowledgement`() {
+    @Test fun `legacy binding changes preserve original history and reject late acknowledgement`() {
         val initial = ChatState.latest(ChatContent(), page(1..5)).copy(draft = "old draft", sending = true)
         val rebound = ChatState.latest(initial, page(6..10, binding = "b2", epoch = "e2"))
-        assertEquals("", rebound.draft)
+        assertEquals("old draft", rebound.draft)
+        assertEquals(initial.messages, rebound.messages)
+        assertTrue(rebound.conversationChanged)
+        assertTrue(rebound.deliveryUncertain)
+        assertFalse(rebound.canSend)
         assertFalse(rebound.sending)
         val edited = rebound.copy(draft = "new thread draft")
         assertEquals(edited, ChatState.acknowledged(edited, "b1", "old draft", null))
+    }
+
+    @Test fun `same canonical conversation survives binding rotation without dropping draft or delivery guards`() {
+        val id = "00000000-0000-4000-8000-000000000001"
+        val initial = ChatState.latest(ChatContent(), page(1..5).copy(conversationId = id)).copy(
+            draft = "reviewed original draft", sending = true,
+            attachments = listOf(ChatAttachment("local", "image.png", ChatAttachmentKind.IMAGE, remoteId = "receipt", status = ChatAttachmentStatus.READY)),
+        )
+        val rotated = ChatState.latest(initial, page(1..6, binding = "rotated-binding", epoch = "new-cache").copy(conversationId = id))
+        assertFalse(rotated.conversationChanged)
+        assertEquals(id, rotated.conversationId)
+        assertEquals("rotated-binding", rotated.bindingId)
+        assertEquals("reviewed original draft", rotated.draft)
+        assertTrue(rotated.deliveryUncertain)
+        assertTrue(rotated.attachmentDeliveryUncertain)
+        assertFalse(rotated.sending)
+        assertTrue(rotated.attachments.isEmpty())
+        assertFalse(rotated.canSubmitMessage())
+        assertEquals(rotated, ChatState.acknowledged(rotated, "b1", initial.draft, null))
+    }
+
+    @Test fun `changed canonical ID cannot substitute another history even if binding revision and epoch match`() {
+        val original = ChatState.latest(ChatContent(), page(1..5).copy(conversationId = "00000000-0000-4000-8000-000000000001"))
+        val incorrect = page(6..10).copy(conversationId = "00000000-0000-4000-8000-000000000002")
+        val guarded = ChatState.latest(original, incorrect)
+        assertEquals(original.messages, guarded.messages)
+        assertEquals(original.conversationId, guarded.conversationId)
+        assertTrue(guarded.conversationChanged)
+        assertFalse(guarded.canSubmitMessage())
+        assertThrows(IllegalArgumentException::class.java) { ChatState.older(original, incorrect) }
     }
 
     @Test fun `successful send clears only the exact submitted text`() {

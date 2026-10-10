@@ -39,7 +39,7 @@ try:
 except ValueError:
     agent_session_id = None
 '''
-_PANE_PROCESS_GUARD = b'''# A shared app-server inherits only its first launcher's Herdr pane. Never
+_LEGACY_PANE_PROCESS_GUARD = b'''# A shared app-server inherits only its first launcher's Herdr pane. Never
 # attribute another frontend's session to that inherited pane. A pane-local
 # Codex TUI (--no-daemon on current Codex) remains the closest Codex ancestor.
 def pane_local_codex_hook():
@@ -84,6 +84,132 @@ def pane_local_codex_hook():
 
 import sys
 if sys.platform.startswith("linux") and not pane_local_codex_hook():
+    raise SystemExit(0)
+'''
+_PANE_PROCESS_GUARD = b'''# A shared app-server inherits only its first launcher's Herdr pane. Never
+# attribute another frontend's session to that inherited pane. Verify the
+# nearest pane-local Codex process against the actual foreground terminal too:
+# a shell or wrapper can otherwise inherit another pane's environment.
+def pane_local_codex_hook():
+    pid = os.getppid()
+    for _ in range(32):
+        if pid <= 1:
+            return None
+        try:
+            directory = f"/proc/{pid}"
+            if os.stat(directory).st_uid != os.getuid():
+                return None
+            with open(directory + "/stat", "rb") as handle:
+                before = handle.read(4096).rsplit(b")", 1)[1].split()
+            with open(directory + "/cmdline", "rb") as handle:
+                argv = handle.read(4096).split(b"\\0")
+            executable = os.path.basename(os.readlink(directory + "/exe"))
+            native = executable == "codex"
+            wrapper = len(argv) > 1 and os.path.basename(argv[1]) == b"codex"
+            with open(directory + "/stat", "rb") as handle:
+                after = handle.read(4096).rsplit(b")", 1)[1].split()
+            if len(before) < 20 or len(after) < 20 or before[19] != after[19]:
+                return None
+            if native or wrapper:
+                args = argv[1:] if native else argv[2:]
+                index = 0
+                while index < len(args):
+                    argument = args[index]
+                    if not argument or argument == b"--":
+                        break
+                    if argument in (b"-c", b"--config", b"-C", b"--cd", b"-p", b"--profile",
+                                    b"-m", b"--model", b"-i", b"--image", b"-s", b"--sandbox",
+                                    b"-a", b"--ask-for-approval", b"--enable", b"--disable",
+                                    b"--remote", b"--remote-auth", b"--local-provider", b"--add-dir"):
+                        index += 2
+                    elif argument.startswith(b"-"):
+                        index += 1
+                    else:
+                        if argument in (b"exec", b"e", b"review", b"app-server", b"mcp-server", b"exec-server",
+                                        b"sandbox", b"login", b"logout", b"mcp", b"plugin", b"remote-control",
+                                        b"app", b"completion", b"update", b"doctor", b"debug", b"execpolicy",
+                                        b"apply", b"a", b"queue", b"archive", b"delete", b"migrate-rollouts",
+                                        b"unarchive", b"cloud", b"cloud-tasks", b"responses-api-proxy",
+                                        b"stdio-to-uds", b"features", b"tcp-tunnel"):
+                            return None
+                        break
+                return pid, after
+            pid = int(after[1])
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+def pane_foreground_matches(process):
+    if process is None:
+        return False
+    import stat
+    import struct
+    pid, initial = process
+    group, tty = int(initial[2]), int(initial[4])
+    if group <= 0 or tty == 0 or int(initial[5]) != group:
+        return False
+    request_id = f"herdr:codex:foreground:{pid}"
+    request = {"id": request_id, "method": "pane.process_info", "params": {"pane_id": pane_id}}
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            expected = os.lstat(socket_path)
+            if not stat.S_ISSOCK(expected.st_mode) or expected.st_uid != os.getuid():
+                return False
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(min(0.2, max(0.001, deadline - time.monotonic())))
+                client.connect(socket_path)
+                peer_pid, peer_uid, _ = struct.unpack("=iii", client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                if peer_pid <= 1 or peer_uid != os.getuid():
+                    return False
+                client.sendall((json.dumps(request) + "\\n").encode())
+                raw = b""
+                while not raw.endswith(b"\\n") and len(raw) <= 65536:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    client.settimeout(min(0.2, remaining))
+                    chunk = client.recv(min(4096, 65537 - len(raw)))
+                    if not chunk:
+                        break
+                    raw += chunk
+            if len(raw) > 65536:
+                return False
+            response = json.loads(raw)
+            if not isinstance(response, dict) or response.get("id") != request_id or "error" in response:
+                return False
+            result = response.get("result")
+            metadata = result.get("process_info") if isinstance(result, dict) else None
+            if not isinstance(metadata, dict) or metadata.get("pane_id") != pane_id:
+                return False
+            current_socket = os.lstat(socket_path)
+            if (current_socket.st_dev, current_socket.st_ino) != (expected.st_dev, expected.st_ino):
+                return False
+            with open(f"/proc/{pid}/stat", "rb") as handle:
+                current = handle.read(4096).rsplit(b")", 1)[1].split()
+            if (len(current) < 20 or current[19] != initial[19] or int(current[2]) != group
+                    or int(current[4]) != tty or int(current[5]) != group):
+                return False
+            processes = metadata.get("foreground_processes")
+            shell_pid = metadata.get("shell_pid")
+            if (metadata.get("foreground_process_group_id") == group and isinstance(processes, list)
+                    and len(processes) <= 256 and any(isinstance(item, dict) and item.get("pid") == pid for item in processes)
+                    and type(shell_pid) is int and shell_pid > 1):
+                if os.stat(f"/proc/{shell_pid}").st_uid != os.getuid():
+                    return False
+                with open(f"/proc/{shell_pid}/stat", "rb") as handle:
+                    shell = handle.read(4096).rsplit(b")", 1)[1].split()
+                if len(shell) >= 20 and int(shell[4]) == tty and int(shell[5]) == group:
+                    return True
+            # SessionStart can precede Herdr's first foreground observation.
+            # Retry metadata reads only, never a report or any pane input.
+        except (OSError, ValueError, IndexError, TypeError):
+            pass
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    return False
+
+import sys
+if sys.platform.startswith("linux") and not pane_foreground_matches(pane_local_codex_hook()):
     raise SystemExit(0)
 '''
 _ORIGINAL_EVENT_GUARD = b'if hook_event_name and hook_event_name != "SessionStart":\n'
@@ -179,8 +305,9 @@ def _patched_original(data: bytes) -> bytes | None:
     original = data.replace(PATCH_MARKER, b"", 1).replace(_COMPATIBLE_ID_GUARD, _ORIGINAL_ID_GUARD, 1)
     # Recognize both our previous exact patch and this guarded upgrade, so an
     # installed Pocket helper can migrate without touching custom hooks.
-    if original.count(_PANE_PROCESS_GUARD) == 1:
-        original = original.replace(_PANE_PROCESS_GUARD, b"", 1)
+    for guard in (_PANE_PROCESS_GUARD, _LEGACY_PANE_PROCESS_GUARD):
+        if original.count(guard) == 1:
+            original = original.replace(guard, b"", 1)
     original = original.replace(_COMPATIBLE_EVENT_GUARD, _ORIGINAL_EVENT_GUARD, 1)
     return original if hashlib.sha256(original).hexdigest() == OFFICIAL_V8_SHA256 else None
 

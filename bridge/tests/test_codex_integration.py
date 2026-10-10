@@ -10,6 +10,8 @@ import subprocess
 import shlex
 import sys
 import threading
+import pty
+import termios
 from types import SimpleNamespace
 import uuid
 
@@ -199,6 +201,24 @@ def test_previous_exact_pocket_helper_gets_daemon_guard_without_reinstall(tmp_pa
     assert [call[0] for call in calls] == [["/test/herdr", "integration", "status"]]
 
 
+def test_previous_exact_pane_ancestor_guard_gets_foreground_proof_without_reinstall(tmp_path, monkeypatch):
+    assert hashlib.sha256(integration._LEGACY_PANE_PROCESS_GUARD).hexdigest() == "14bc5e11615a60adee0933585e851e054d6a2ba046b218fc8bd7f5a620e6a1fc"
+    previous = OFFICIAL_HELPER.replace(b"set -eu\n", integration.PATCH_MARKER + b"set -eu\n", 1)
+    previous = previous.replace(integration._ORIGINAL_ID_GUARD,
+                                integration._LEGACY_PANE_PROCESS_GUARD + integration._COMPATIBLE_ID_GUARD, 1)
+    previous = previous.replace(integration._ORIGINAL_EVENT_GUARD, integration._COMPATIBLE_EVENT_GUARD, 1)
+    home, helper = prepare_home(tmp_path, previous)
+    settings = ((home / "hooks.json").read_bytes(), (home / "config.toml").read_bytes())
+    calls = fake_cli(monkeypatch, helper)
+    result = integration.ensure_codex_integration("/test/herdr", home)
+    assert result.ready and result.changed
+    assert integration._PANE_PROCESS_GUARD in helper.read_bytes()
+    assert integration._patched_original(helper.read_bytes()) == OFFICIAL_HELPER
+    assert helper.with_name(helper.name + ".herdr-pocket-v8.original").read_bytes() == OFFICIAL_HELPER
+    assert ((home / "hooks.json").read_bytes(), (home / "config.toml").read_bytes()) == settings
+    assert [call[0] for call in calls] == [["/test/herdr", "integration", "status"]]
+
+
 def test_non_linux_helper_preserves_canonical_id_flow_without_proc(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
     def forbidden():
@@ -338,31 +358,70 @@ def hook_parent(tmp_path: Path) -> Path:
     directory.mkdir(exist_ok=True)
     codex = directory / "codex"
     codex.write_text("import subprocess,sys\n"
-                     "raise SystemExit(subprocess.run(['sh', *sys.argv[-2:]], input=sys.stdin.buffer.read()).returncode)\n")
+                     "raise SystemExit(subprocess.run(['sh', *sys.argv[-2:]], input=sys.stdin.buffer.readline()).returncode)\n")
     return codex
 
 
 def run_hook(helper: Path, tmp_path: Path, payload: dict, *, inherited_thread: str | None = None,
-             herdr_env="1", action="session", parent_role="resume") -> list[dict]:
+             herdr_env="1", action="session", parent_role="resume", metadata_change=None,
+             pending_reads=0, metadata_requests=None) -> list[dict]:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     socket_path = tmp_path / "hook.sock"
     server.bind(str(socket_path))
     server.listen(1)
-    server.settimeout(0.2)
+    server.settimeout(0.1)
     requests = []
+    finished = threading.Event()
+    parent = None
+    reads = 0
 
     def receive():
+        nonlocal reads
         try:
-            connection, _ = server.accept()
-            with connection:
-                connection.settimeout(1)
-                raw = b""
-                while not raw.endswith(b"\n"):
-                    raw += connection.recv(4096)
-                requests.append(json.loads(raw))
-                connection.sendall(b'{"result":{"type":"ok"}}\n')
-        except TimeoutError:
-            pass
+            while not finished.is_set():
+                try:
+                    connection, _ = server.accept()
+                except TimeoutError:
+                    continue
+                with connection:
+                    connection.settimeout(1)
+                    raw = b""
+                    while not raw.endswith(b"\n"):
+                        raw += connection.recv(4096)
+                    request = json.loads(raw)
+                    if request["method"] == "pane.process_info":
+                        assert parent is not None
+                        reads += 1
+                        if metadata_requests is not None:
+                            metadata_requests.append(request)
+                        metadata = {"pane_id": "w1:p1", "shell_pid": parent.pid,
+                                    "foreground_process_group_id": parent.pid,
+                                    "foreground_processes": [{"pid": parent.pid, "name": "codex"}]}
+                        if reads <= pending_reads:
+                            metadata["foreground_processes"] = []
+                        if metadata_change == "wrong_pane":
+                            metadata["pane_id"] = "w1:p2"
+                        elif metadata_change == "wrong_group":
+                            metadata["foreground_process_group_id"] = parent.pid + 1
+                        elif metadata_change == "wrong_pid":
+                            metadata["foreground_processes"] = [{"pid": parent.pid + 1, "name": "codex"}]
+                        elif metadata_change == "wrong_terminal":
+                            metadata["shell_pid"] = os.getpid()
+                        response = {"id": request["id"], "result": {"type": "pane_process_info", "process_info": metadata}}
+                    else:
+                        requests.append(request)
+                        response = {"id": request["id"], "result": {"type": "ok"}}
+                    encoded = json.dumps(response).encode() + b"\n"
+                    if metadata_change == "trickle" and request["method"] == "pane.process_info":
+                        for byte in encoded:
+                            try:
+                                connection.sendall(bytes([byte]))
+                            except BrokenPipeError:
+                                break
+                            if finished.wait(0.05):
+                                break
+                    else:
+                        connection.sendall(encoded)
         finally:
             server.close()
 
@@ -373,12 +432,24 @@ def run_hook(helper: Path, tmp_path: Path, payload: dict, *, inherited_thread: s
     environment.pop("CODEX_THREAD_ID", None)
     if inherited_thread is not None:
         environment["CODEX_THREAD_ID"] = inherited_thread
-    result = subprocess.run([sys.executable, str(hook_parent(tmp_path)), parent_role, str(helper), action],
-                            input=json.dumps(payload), env=environment,
-                            capture_output=True, text=True, timeout=5)
-    worker.join(timeout=2)
+    master, slave = pty.openpty()
+    def owned_terminal():
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    try:
+        parent_args = [parent_role] if isinstance(parent_role, str) else parent_role
+        parent = subprocess.Popen([sys.executable, str(hook_parent(tmp_path)), *parent_args, str(helper), action],
+                                  stdin=slave, stdout=slave, stderr=subprocess.PIPE, env=environment,
+                                  preexec_fn=owned_terminal)
+        os.write(master, json.dumps(payload).encode() + b"\n")
+        _, stderr = parent.communicate(timeout=5)
+        assert parent.returncode == 0, stderr.decode()
+    finally:
+        finished.set()
+        worker.join(timeout=2)
+        os.close(master)
+        os.close(slave)
     assert not worker.is_alive()
-    assert result.returncode == 0, result.stderr
     return requests
 
 
@@ -408,6 +479,59 @@ def test_shared_daemon_never_reports_another_frontend_using_inherited_pane(tmp_p
     identity = str(uuid.uuid4())
     payload = {"hook_event_name": "SessionStart", "session_id": identity, "source": "resume", "transcript_path": None}
     assert run_hook(helper, tmp_path, payload, inherited_thread=identity, parent_role="app-server") == []
+
+
+@pytest.mark.parametrize("role", ["exec", "e", "review", "app-server", "mcp-server", "exec-server", "sandbox"])
+def test_noninteractive_codex_tool_child_cannot_rebind_its_parent_pane(tmp_path, monkeypatch, role):
+    home, helper = prepare_home(tmp_path)
+    fake_cli(monkeypatch, helper)
+    assert integration.ensure_codex_integration("/test/herdr", home).ready
+    monkeypatch.undo()
+    identity = str(uuid.uuid4())
+    metadata_requests = []
+    payload = {"hook_event_name": "SessionStart", "session_id": identity, "source": "startup", "transcript_path": None}
+    assert run_hook(helper, tmp_path, payload, parent_role=role, metadata_requests=metadata_requests) == []
+    assert metadata_requests == []  # Rejected even if its inherited foreground job would match.
+
+
+@pytest.mark.parametrize("args", [["--no-daemon"], ["resume"], ["fork"], ["--model", "exec", "resume"], ["--", "exec"]])
+def test_interactive_codex_forms_keep_exact_foreground_session_reporting(tmp_path, monkeypatch, args):
+    home, helper = prepare_home(tmp_path)
+    fake_cli(monkeypatch, helper)
+    assert integration.ensure_codex_integration("/test/herdr", home).ready
+    monkeypatch.undo()
+    identity = str(uuid.uuid4())
+    payload = {"hook_event_name": "SessionStart", "session_id": identity, "source": "startup", "transcript_path": None}
+    reports = run_hook(helper, tmp_path, payload, parent_role=args)
+    assert len(reports) == 1 and reports[0]["params"]["agent_session_id"] == identity
+
+
+@pytest.mark.parametrize("change", ["wrong_pane", "wrong_group", "wrong_pid", "wrong_terminal", "trickle"])
+def test_hook_cannot_attribute_session_to_another_foreground_pane(tmp_path, monkeypatch, change):
+    home, helper = prepare_home(tmp_path)
+    fake_cli(monkeypatch, helper)
+    assert integration.ensure_codex_integration("/test/herdr", home).ready
+    monkeypatch.undo()
+    identity = str(uuid.uuid4())
+    metadata_requests = []
+    payload = {"hook_event_name": "SessionStart", "session_id": identity, "source": "startup", "transcript_path": None}
+    assert run_hook(helper, tmp_path, payload, metadata_change=change, metadata_requests=metadata_requests) == []
+    assert metadata_requests and len(metadata_requests) <= 41
+    assert all(request["method"] == "pane.process_info" and request["params"] == {"pane_id": "w1:p1"}
+               for request in metadata_requests)
+
+
+def test_session_start_waits_for_exact_foreground_metadata_then_reports_once(tmp_path, monkeypatch):
+    home, helper = prepare_home(tmp_path)
+    fake_cli(monkeypatch, helper)
+    assert integration.ensure_codex_integration("/test/herdr", home).ready
+    monkeypatch.undo()
+    identity = str(uuid.uuid4())
+    metadata_requests = []
+    payload = {"hook_event_name": "SessionStart", "session_id": identity, "source": "startup", "transcript_path": None}
+    reports = run_hook(helper, tmp_path, payload, pending_reads=2, metadata_requests=metadata_requests)
+    assert len(metadata_requests) == 3
+    assert len(reports) == 1 and reports[0]["params"]["agent_session_id"] == identity
 
 
 @pytest.mark.parametrize("change", ["invalid_id", "uppercase_id", "child_thread", "subagent", "missing_event", "outside_herdr", "wrong_action"])
@@ -471,7 +595,15 @@ async def test_null_transcript_hook_replaces_only_owned_exact_codex_session(tmp_
         fake_bin = tmp_path / "fake-bin"
         fake_bin.mkdir()
         fake_codex = fake_bin / "codex"
-        fake_codex.write_text("import signal,sys\nsys.stdout.write('\\x1b]0;Codex ⠋\\x07• Working (1s)\\n');sys.stdout.flush()\nsignal.pause()\n")
+        hook_input = tmp_path / "owned-hook-input.json"
+        hook_completed = tmp_path / "owned-hook-completed"
+        fake_codex.write_text("import pathlib,signal,subprocess,sys,time\n"
+                              "sys.stdout.write('\\x1b]0;Codex ⠋\\x07• Working (1s)\\n');sys.stdout.flush()\n"
+                              f"payload=pathlib.Path({str(hook_input)!r})\n"
+                              "while not payload.exists(): time.sleep(0.02)\n"
+                              f"result=subprocess.run(['sh',{str(helper)!r},'session'],input=payload.read_bytes())\n"
+                              f"pathlib.Path({str(hook_completed)!r}).write_text(str(result.returncode))\n"
+                              "signal.pause()\n")
         # Start only our own synthetic process in the uniquely named fixture.
         await backend.send_input(pane, f"{shlex.quote(sys.executable)} {shlex.quote(str(fake_codex))}", ["enter"])
         async with asyncio.timeout(10):
@@ -486,18 +618,14 @@ async def test_null_transcript_hook_replaces_only_owned_exact_codex_session(tmp_
             "agent_session_id": old_id, "session_start_source": "startup",
         })
         assert canonical_codex_session(await backend.agent(pane)) == old_id
-        hook_environment = dict(environment)
-        hook_environment.update(HERDR_ENV="1", HERDR_PANE_ID=pane, HERDR_SOCKET_PATH=str(socket_path),
-                                CODEX_THREAD_ID=new_id, CODEX_SESSION_ID=new_id, TMPDIR=str(tmp_path))
         payload = {"hook_event_name": "SessionStart", "session_id": new_id, "source": "resume", "transcript_path": None}
-        child = await asyncio.create_subprocess_exec(sys.executable, str(hook_parent(tmp_path)), "resume", str(helper), "session", env=hook_environment,
-                                                   stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                                                   stderr=asyncio.subprocess.PIPE)
-        _, error = await asyncio.wait_for(child.communicate(json.dumps(payload).encode()), timeout=5)
-        assert child.returncode == 0, error.decode()
+        # SessionStart runs in the exact owned foreground Codex ancestry,
+        # rather than an unrelated process carrying a copied pane environment.
+        hook_input.write_text(json.dumps(payload))
         async with asyncio.timeout(5):
-            while canonical_codex_session(await backend.agent(pane)) != new_id:
+            while not hook_completed.exists() or canonical_codex_session(await backend.agent(pane)) != new_id:
                 await asyncio.sleep(0.05)
+        assert hook_completed.read_text() == "0"
     finally:
         stop = await asyncio.create_subprocess_exec(executable, "--session", name, "session", "stop", name,
                                                    env=environment, stdout=asyncio.subprocess.DEVNULL,

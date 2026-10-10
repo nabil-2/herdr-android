@@ -71,7 +71,7 @@ internal fun ChatAttachments(
         pendingFiles = null
     }
     val enabled = target != null && state.connection == ConnectionState.CONNECTED &&
-        !state.chat.sending && !state.chat.deliveryUncertain && "codex-chat-attachments" in state.capabilities
+        !state.chat.sending && !state.chat.deliveryUncertain && !state.chat.conversationChanged && "codex-chat-attachments" in state.capabilities
     Column(modifier.testTag("chat-attachments")) {
         if (state.chat.attachments.isNotEmpty()) {
             Row(Modifier.horizontalScroll(rememberScrollState()).heightIn(max = 220.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {

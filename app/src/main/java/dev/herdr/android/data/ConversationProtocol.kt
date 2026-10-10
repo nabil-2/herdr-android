@@ -8,6 +8,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.longOrNull
 import java.io.IOException
+import java.util.UUID
 
 /** Conversation pages are structured Codex records, never parsed terminal output. */
 internal object ConversationProtocol {
@@ -24,6 +25,9 @@ internal object ConversationProtocol {
             for (field in listOf("freshBootstrap", "attachmentDeliveryUncertain")) {
                 objectValue[field]?.let { value -> require(value is JsonPrimitive && !value.isString && value.booleanOrNull != null) }
             }
+            objectValue["conversationId"]?.let { value ->
+                require(value.toString() == "null" || (value is JsonPrimitive && value.isString))
+            }
             objectValue["messages"]?.jsonArray?.forEach { item ->
                 for (field in listOf("timestamp", "messageTimestamp")) {
                     val timestamp = item.jsonObject[field]
@@ -36,6 +40,7 @@ internal object ConversationProtocol {
             validateOpaque(page.binding, 256)
             validateOpaque(page.revision, 256)
             validateOpaque(page.historyEpoch, 256)
+            page.conversationId?.let { id -> require(UUID.fromString(id).toString() == id) }
             page.olderCursor?.let { validateOpaque(it, 2048) }
             require(page.messages.size <= 50 && page.messages.map { it.id }.distinct().size == page.messages.size)
             require(!page.unchanged || page.messages.isEmpty())
@@ -93,18 +98,42 @@ internal object ConversationProtocol {
 
 /** Pure transitions shared by the ViewModel and tests, including draft acknowledgement. */
 internal object ChatState {
+    const val CONVERSATION_CHANGED_REASON = "This pane now points to a different Codex conversation. Your original messages are kept here. Choose a conversation or inspect Terminal before switching."
+
     fun supportsPaneChat(pane: Pane, capabilities: List<String>): Boolean = "codex-chat" in capabilities &&
         pane.conversation?.let { it.provider == "codex" && (it.available || (it.selectable && "codex-chat-selection" in capabilities)) } == true
 
     fun requiresFullPage(current: ChatContent, page: ConversationPage): Boolean = page.unchanged &&
         (current.bindingId != page.binding || current.revision != page.revision || current.historyEpoch != page.historyEpoch)
 
+    fun changesConversation(current: ChatContent, page: ConversationPage): Boolean {
+        if (current.bindingId == null) return false
+        val knownId = current.conversationId
+        val receivedId = page.conversationId
+        return if (knownId != null && receivedId != null) knownId != receivedId
+        else current.bindingId != page.binding
+    }
+
     fun latest(current: ChatContent, page: ConversationPage): ChatContent {
+        if (changesConversation(current, page)) return current.copy(
+            canSend = false, loading = false, refreshing = false, loadingOlder = false,
+            sending = false, deliveryUncertain = current.deliveryUncertain || current.sending,
+            attachmentDeliveryUncertain = current.attachmentDeliveryUncertain || (current.sending && current.attachments.isNotEmpty()),
+            conversationChanged = true, canSendReason = CONVERSATION_CHANGED_REASON,
+            error = if (current.deliveryUncertain || current.sending) current.error ?: "Message delivery was not confirmed. Check the conversation before sending again." else CONVERSATION_CHANGED_REASON,
+        )
         val sameBinding = current.bindingId == page.binding
         if (requiresFullPage(current, page)) {
             throw IOException("The bridge returned an inconsistent conversation revision.")
         }
         val initial = when {
+            !sameBinding && current.conversationId != null && current.conversationId == page.conversationId -> current.copy(
+                messages = if (current.historyEpoch == page.historyEpoch) current.messages else emptyList(),
+                olderCursor = null, loadingOlder = false, sending = false, attachments = emptyList(), attachmentError = null,
+                deliveryUncertain = current.deliveryUncertain || current.sending,
+                attachmentDeliveryUncertain = current.attachmentDeliveryUncertain || (current.sending && current.attachments.isNotEmpty()),
+                error = if (current.deliveryUncertain || current.sending) current.error ?: "Message delivery was not confirmed. Check the conversation before sending again." else current.error,
+            )
             !sameBinding -> ChatContent(ackRevision = current.ackRevision)
             current.historyEpoch != page.historyEpoch -> current.copy(messages = emptyList(), olderCursor = null, loadingOlder = false)
             else -> current
@@ -113,6 +142,8 @@ internal object ChatState {
         val messages = if (page.unchanged) initial.messages else initial.messages.filterNot { it.id in ids } + page.messages
         return initial.copy(
             bindingId = page.binding,
+            conversationId = page.conversationId ?: current.conversationId,
+            conversationChanged = false,
             revision = page.revision,
             historyEpoch = page.historyEpoch,
             messages = messages,
@@ -131,7 +162,7 @@ internal object ChatState {
     }
 
     fun older(current: ChatContent, page: ConversationPage): ChatContent {
-        require(current.bindingId == page.binding && current.revision == page.revision && current.historyEpoch == page.historyEpoch && !page.unchanged) {
+        require(!changesConversation(current, page) && current.bindingId == page.binding && current.revision == page.revision && current.historyEpoch == page.historyEpoch && !page.unchanged) {
             "The conversation changed. Refresh before loading older messages."
         }
         val ids = page.messages.map { it.id }.toSet()
@@ -144,7 +175,7 @@ internal object ChatState {
     }
 
     fun acknowledged(current: ChatContent, binding: String, submitted: String, warning: String?, attachmentIds: List<String> = emptyList()): ChatContent {
-        if (current.bindingId != binding) return current
+        if (current.bindingId != binding || current.conversationChanged) return current
         return current.copy(
             draft = if (current.draft == submitted) "" else current.draft,
             sending = false,

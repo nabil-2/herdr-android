@@ -494,7 +494,7 @@ class Conversations:
                 send_unavailable_reason = "The first message needs saved-history confirmation. Refresh or inspect Terminal before sending again."
             if self.attachments is not None and self.attachments.blocked(pane_id, binding):
                 send_unavailable_reason = "Attachment delivery was not confirmed. Inspect and clear Terminal, then acknowledge it before sending again."
-            response = {"binding": binding, "revision": cache.revision, "historyEpoch": cache.history_epoch,
+            response = {"binding": binding, "conversationId": thread_id, "revision": cache.revision, "historyEpoch": cache.history_epoch,
                         "messages": cache.messages[start:end],
                         "olderCursor": self._cursor(binding, cache.revision, start) if start else None,
                         "unchanged": unchanged, "canSend": send_unavailable_reason is None,

@@ -13,6 +13,11 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 class TabCreationProtocolTest {
+    @Test fun `Codex creation requires verified isolated launch capability`() {
+        org.junit.Assert.assertFalse(TabCreationProtocol.supportsIsolatedCodex(listOf("codex-create")))
+        org.junit.Assert.assertFalse(TabCreationProtocol.supportsIsolatedCodex(listOf("codex-create-isolated")))
+        org.junit.Assert.assertTrue(TabCreationProtocol.supportsIsolatedCodex(listOf("codex-create", "codex-create-isolated")))
+    }
     @Test fun `names and directories stay literal and kind is explicit`() {
         val body = Json.parseToJsonElement(TabCreationProtocol.input("w2", "  Mobile 雪 $()  ", "/tmp/space project", true)).jsonObject
         assertEquals(setOf("kind", "label", "cwd"), body.keys)

@@ -17,6 +17,7 @@ from herdr_bridge.app import create_app
 from herdr_bridge.codex import CodexHistoryNotPersisted
 from herdr_bridge.codex_integration import CodexIntegrationResult
 from herdr_bridge.herdr import HerdrClient
+from herdr_bridge import herdr as herdr_module
 from .conftest import AUTH, TOKEN
 
 
@@ -83,6 +84,13 @@ async def test_phone_creates_new_managed_codex_and_sends_one_first_message_witho
                     raise
 
         backend = OwnedHerdr(socket_path, str(executable))
+        error_codes = []
+        original_error = herdr_module.upstream_error
+        def record_owned_error(error, *, prompt=False):
+            if isinstance(error, dict):
+                error_codes.append(error.get("code"))
+            return original_error(error, prompt=prompt)
+        monkeypatch.setattr(herdr_module, "upstream_error", record_owned_error)
         workspace = (await backend.call("workspace.create", {"cwd": str(tmp_path), "label": "Owned creation fixture",
                                                                "focus": False}))["workspace"]["workspace_id"]
         monkeypatch.setattr("herdr_bridge.app.ensure_codex_integration", lambda *_: CodexIntegrationResult(True))
@@ -109,7 +117,7 @@ async def test_phone_creates_new_managed_codex_and_sends_one_first_message_witho
                 except TimeoutError:
                     process = await backend.call("pane.process_info", {"pane_id": pane})
                     output = await backend.call("pane.read", {"pane_id": pane, "source": "recent_unwrapped", "format": "text", "lines": 20})
-                    pytest.fail(f"Owned fake Codex did not start: {getattr(backend, 'start_error', None)} {created.json()} {process} {output}")
+                    pytest.fail(f"Owned fake Codex did not start: upstreamCodes={error_codes} {getattr(backend, 'start_error', None)} {created.json()} {process} {output}")
                 async with asyncio.timeout(15):
                     while True:
                         response = await phone.get(f"/v1/panes/{pane}/conversation")

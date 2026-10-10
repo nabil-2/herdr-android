@@ -36,7 +36,8 @@ async def creation_host(tmp_path, monkeypatch):
     }}
     options = {"tab_result": tab_result, "start_change": None, "drop": None,
                "integration": CodexIntegrationResult(ready=True), "pane_result": pane_result,
-               "process_result": process_result, "shell_delay": 0}
+               "process_result": process_result, "shell_delay": 0,
+               "process_sequence": [], "process_observations": []}
 
     def ensure(*_args):
         order.append("integration")
@@ -62,9 +63,12 @@ async def creation_host(tmp_path, monkeypatch):
             elif method == "pane.process_info":
                 assert request["params"] == {"pane_id": "w1:p3"}
                 result = deepcopy(options["process_result"])
+                if options["process_sequence"]:
+                    result["process_info"] = deepcopy(options["process_sequence"].pop(0))
                 if options["shell_delay"] > 0:
                     options["shell_delay"] -= 1
                     result["process_info"]["foreground_processes"] = []
+                options["process_observations"].append(deepcopy(result["process_info"]))
             elif method == "agent.start":
                 agent = {"workspace_id": "w1", "tab_id": "w1:t3", "pane_id": "w1:p3",
                          "terminal_id": "fixture-new-terminal", "name": request["params"]["name"],
@@ -114,7 +118,9 @@ async def test_codex_creation_prepares_integration_and_starts_only_the_new_root_
     assert response.status_code == 201
     assert response.json()["paneId"] == "w1:p3"
     assert "Terminal" in response.json()["warning"]
-    assert order == ["session.snapshot", "integration", "tab.create", "pane.get", "pane.process_info", "agent.start"]
+    assert order[:3] == ["session.snapshot", "integration", "tab.create"]
+    assert order[-1] == "agent.start" and order.count("agent.start") == 1
+    assert set(order[3:-1]) == {"pane.get", "pane.process_info"}
     start = requests[-1]["params"]
     assert start["kind"] == "codex" and start["pane_id"] == "w1:p3" and start["args"] == ["--no-daemon"]
     assert re.fullmatch(r"pocket-[0-9a-f]{24}", start["name"])
@@ -211,8 +217,26 @@ async def test_shell_initialization_polls_only_owned_metadata_before_the_one_lau
     response, _ = await post(creation_host, {"kind": "codex", "label": "Wait for shell"})
     assert response.status_code == 201
     methods = [request["method"] for request in requests]
-    assert methods == ["session.snapshot", "tab.create", "pane.get", "pane.process_info", "pane.get", "pane.process_info", "agent.start"]
+    assert methods[:2] == ["session.snapshot", "tab.create"] and methods[-1] == "agent.start"
+    assert set(methods[2:-1]) == {"pane.get", "pane.process_info"}
+    assert len(options["process_observations"]) > 2
     assert methods.count("tab.create") == methods.count("agent.start") == 1
+
+
+async def test_transient_sole_shell_then_startup_child_does_not_launch_until_foreground_settles(creation_host):
+    _, requests, options, _, _ = creation_host
+    ready = deepcopy(options["process_result"]["process_info"])
+    busy = deepcopy(ready)
+    busy["foreground_processes"].append({"pid": 43, "name": "startup-helper"})
+    options["process_sequence"] = [ready, busy, ready]
+    response, _ = await post(creation_host, {"kind": "codex", "label": "Wait through shell startup"})
+    assert response.status_code == 201 and "Codex is starting" in response.json()["warning"]
+    observed = options["process_observations"]
+    assert observed[:3] == [ready, busy, ready] and len(observed) > 3
+    assert observed[-1] == ready
+    assert [request["method"] for request in requests].count("agent.start") == 1
+    assert all(request["method"] in {"session.snapshot", "tab.create", "pane.get", "pane.process_info", "agent.start"}
+               for request in requests)
 
 
 @pytest.mark.parametrize("malformation", ["terminal", "pane", "workspace", "tab", "process_target", "process_list", "no_shell"])
@@ -249,7 +273,9 @@ async def test_mismatched_launch_receipt_keeps_created_tab_with_a_controlled_war
     assert [request["method"] for request in requests].count("agent.start") == 1
 
 
-async def test_capabilities_advertise_optional_codex_launch_support(creation_host):
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+async def test_capabilities_advertise_optional_codex_launch_support(creation_host, monkeypatch, platform):
+    monkeypatch.setattr("herdr_bridge.app.sys.platform", platform)
     backend, _, _, _, home = creation_host
     for enabled in (False, True):
         app = create_app(backend, TOKEN, codex_executable="/bin/sh" if enabled else None, codex_home=home)
@@ -257,3 +283,4 @@ async def test_capabilities_advertise_optional_codex_launch_support(creation_hos
             capabilities = (await phone.get("/v1/health")).json()["capabilities"]
         assert "workspace-tabs" in capabilities
         assert ("codex-create" in capabilities) is enabled
+        assert ("codex-create-isolated" in capabilities) is (enabled and platform == "linux")
