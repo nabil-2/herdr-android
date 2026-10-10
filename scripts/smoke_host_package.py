@@ -348,7 +348,12 @@ def exercise(binary: Path) -> None:
                 check("Scan pairing code" in terminal_qr and any(char in terminal_qr for char in "▀▄█"),
                       "The frozen helper did not render a terminal QR code")
                 check(all(secret not in terminal_qr for secret in seen_secrets), "Terminal QR output exposed existing plaintext credentials")
-                check(methods and set(methods) == {"session.snapshot", "agent.get", "pane.process_info", "pane.send_text", "pane.read"} and methods.count("pane.send_text") == 1 and methods.count("pane.read") == 1,
+                expected_methods = {"session.snapshot", "agent.get", "pane.send_text", "pane.read"}
+                # Local-daemon attribution uses Linux process/socket metadata.
+                # macOS retains the canonical history flow without that probe.
+                if sys.platform.startswith("linux"):
+                    expected_methods.add("pane.process_info")
+                check(methods and set(methods) == expected_methods and methods.count("pane.send_text") == 1 and methods.count("pane.read") == 1,
                       "The smoke test dispatched unexpected operations to its synthetic daemon")
                 check(stat.S_IMODE(token_file.stat().st_mode) == 0o600 and stat.S_IMODE(registry_file.stat().st_mode) == 0o600,
                       "The smoke test's credential files are not owner-only")

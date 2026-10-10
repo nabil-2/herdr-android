@@ -332,12 +332,28 @@ def test_linux_socket_peer_proof_uses_only_owned_descriptor_metadata():
         right.close()
 
 
-def test_arbitrary_rendezvous_symlink_cannot_select_a_different_daemon(tmp_path):
+@pytest.mark.parametrize("private_directory_exists", [True, False])
+def test_arbitrary_rendezvous_symlink_cannot_select_a_different_daemon(
+    tmp_path, monkeypatch, private_directory_exists,
+):
+    from herdr_bridge import codex_identity as identity
+
+    # Both daemon-directory states must be independent of any Codex daemon
+    # running on the developer's machine or absent from a clean CI runner.
+    private_root = tmp_path / "private-tmp"
+    private_root.mkdir()
+    monkeypatch.setattr(
+        identity, "Path", lambda value: private_root if value == "/tmp" else Path(value),
+    )
+    if private_directory_exists:
+        (private_root / f"codex-daemon-{os.getuid()}").mkdir(mode=0o700)
+
     home = tmp_path / "home"
     control = home / "app-server-control"
     control.mkdir(parents=True, mode=0o700)
     (control / "app-server-control.sock").symlink_to(tmp_path / "arbitrary.sock")
-    with pytest.raises(ValueError, match="alias"):
+    expected_error = ValueError if private_directory_exists else FileNotFoundError
+    with pytest.raises(expected_error, match="alias" if private_directory_exists else None):
         _daemon_socket(home)
 
 

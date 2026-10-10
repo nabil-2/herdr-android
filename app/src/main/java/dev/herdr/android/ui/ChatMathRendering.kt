@@ -145,7 +145,7 @@ internal fun rememberMathMarkdownRendering(prepared: MathMarkdown, widthPx: Floa
             // GFM also recognizes dollar-delimited text (including currency).
             // All accepted formulas were protected before parsing. Preserve
             // the remaining math nodes that the default renderer would omit.
-            if (child.type == GFMElementTypes.INLINE_MATH) {
+            if (child.type == GFMElementTypes.INLINE_MATH || child.type == GFMElementTypes.BLOCK_MATH) {
                 append(content.substring(child.startOffset, child.endOffset))
                 true
             } else if (child.type != MarkdownTokenTypes.TEXT) false else {

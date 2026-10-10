@@ -89,10 +89,46 @@ class NativeMathUiTest {
     }
 
     @Test
+    fun reportedEvidenceIntegralRendersWithinThePhoneAndCopiesItsOriginalSource() {
+        val original = """
+            The transformed evidence is:
+
+            [ Z_j(\psi)=\int L_j(T^{-1}(\eta)),p_\eta(\eta\mid X_j;\psi),d\eta. ]
+        """.trimIndent()
+        val clipboard = compose.activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val previous = clipboard.primaryClip
+        try {
+            render(ChatMessage("reported-integral", "assistant", original), narrow = true)
+            awaitMath(0)
+            assertDrawn(0)
+            val root = compose.onNodeWithTag("math-test-root").fetchSemanticsNode().boundsInRoot
+            val math = compose.onNodeWithTag("chat-math-0", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+            assertTrue("The reported integral must fit the phone width", math.left >= root.left && math.right <= root.right + 1)
+            saveScreenshot("math-reported-integral-device.png")
+            compose.waitUntil(5_000) { compose.activity.hasWindowFocus() }
+            compose.onNodeWithContentDescription("Copy Codex message").performScrollTo().performClick()
+            compose.waitUntil(5_000) { clipboard.primaryClip?.getItemAt(0)?.text?.toString() == original }
+            compose.runOnIdle { assertEquals(original, clipboard.primaryClip?.getItemAt(0)?.text?.toString()) }
+        } finally {
+            compose.runOnIdle {
+                if (previous != null) clipboard.setPrimaryClip(previous)
+                else clipboard.clearPrimaryClip()
+            }
+        }
+    }
+
+    @Test
     fun oversizedFormulaRemainsReadableWithoutInvokingTheRenderer() {
         val original = "$$\n${"x".repeat(16_385)}\n$$"
         render(ChatMessage("oversized", "assistant", original))
-        awaitText(original)
+        try {
+            awaitText(original)
+        } finally {
+            // Text-only diagnostics keep this bounded fixture out of image
+            // artifacts while distinguishing missing content from split text.
+            File(compose.activity.cacheDir, "oversized-math-semantics.txt")
+                .writeText(compose.onRoot(useUnmergedTree = true).printToString())
+        }
         compose.onNodeWithTag("chat-math-0", useUnmergedTree = true).assertDoesNotExist()
     }
 
