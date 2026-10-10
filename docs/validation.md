@@ -1,78 +1,72 @@
-# Preview 0.7.0 validation
+# Preview 0.7.1 validation
 
-Validated on 10 October 2026. This release adds native mathematical formulas, existing shared-daemon Codex conversation selection, and reviewed image/file attachments. The [0.6.0 report](validation-0.6.0.md) records the earlier terminal and creation work.
+Validated on 10 October 2026. This release prevents a new Codex chat from replacing the displayed content of an existing chat. The [0.7.0 report](validation-0.7.0.md) records math, image/file attachments and existing shared-daemon conversation selection.
+
+## Conversation isolation
+
+An owned two-pane Herdr fixture reproduces the previous bug: the 0.7.0 helper accepts a new session report with a stale inherited pane variable, changing the older pane's reported conversation ID while the new pane remains unbound. This reproduces metadata misattribution; it does not demonstrate saved-history deletion or establish the precise trigger on a user's phone.
+
+The Linux helper now proves that its nearest interactive Codex ancestor belongs to the exact reported pane's foreground process group and controlling terminal. It verifies owned process lifetimes, the Herdr socket and Linux peer credentials through a bounded read-only metadata request. Shared app-server and noninteractive ancestors are rejected. Custom hooks remain intact; only the exact recognized official compatibility patch is upgraded. New launches wait for the same sole foreground shell to stay stable for 200 milliseconds before starting one isolated Codex runtime.
+
+Canonical conversation IDs accompany opaque page bindings. The phone preserves an already-open conversation and draft when the ID unexpectedly changes, pauses writes and requires an explicit switch. A binding rotation for the same canonical conversation does not replace its content or erase its draft. A bounded, memory-only history cache retains expected conversation identity across pane navigation. Explicit conversation selection clears that expectation deliberately. Attachment receipts from an obsolete binding are dropped; the companion retires only unconsumed stages belonging to the same credential and pane, preserving consumed and uncertain delivery records.
+
+The terminal-inspection switch keeps unresolved delivery uncertainty with the original draft and never acknowledges another conversation's marker. The new target's authoritative server uncertainty still applies. Actual MainActivity regressions exercise new-chat creation followed by an older pane, explicit switching, same-ID binding rotation, old-companion creation rejection and inspected switching without a remote acknowledgement.
+
+New phone-created Codex chats require the companion's Linux-only `codex-create-isolated` capability. Update older Linux hosts to 0.7.1. Existing macOS chat and terminal access remain supported; creation from this phone version is disabled until macOS has equivalent foreground ownership verification.
+
+## Terminal focus
+
+The first broad device run exposed an intermittent terminal teardown failure. Its earlier cause was native focus removal triggering a nested Compose measurement through lazy focus search; the later detach-lifecycle assertion was a consequence. The same primary exception appears in an archived 0.6 run, so it predates the conversation changes.
+
+MainActivity enables Compose 1.12.1's existing experimental `isViewFocusFixEnabled` before creating the UI. The [official AndroidViewHolder implementation](https://android.googlesource.com/platform/frameworks/support/+/edd8bafb328feda384a1048242a66d77f12b6699/compose/ui/ui/src/androidMain/kotlin/androidx/compose/ui/viewinterop/AndroidViewHolder.android.kt) clears focus before removing a focused native view. The new regression explicitly focuses the real terminal editor before six pane replacements and six returns to the lazy dashboard, rejects stale InputConnection commits and verifies no unintended terminal input. Retain this regression when upgrading Compose.
 
 ## Results
 
 | Check | Result | Coverage |
 | --- | --- | --- |
-| Android JVM | 179 passed | Conservative math recognition, bounded renderer inputs, strict selection/attachment protocols, upload send-once behavior, authoritative uncertainty restoration, retained chat/terminal/connection guards |
-| Android lint | 0 errors, 22 warnings, 2 hints | App, tests and terminal dependency; existing strict source-text scan retained |
-| Bridge offline | 570 passed | Explicit runtime-bound selection, daemon WebSocket reads/steering, upload validation/quotas, durable uncertainty, scoped display names, existing authentication/creation/pairing |
-| Actual Codex/Herdr integrations | 13 passed | Isolated real Codex saved histories and owned Herdr shell/hooks/new-chat/attachment input; no model prompts |
-| Android 13 device | 99 passed | 96 ordinary UI cases and three owned live pairing/terminal cases |
-| Frozen Linux package | Passed | PNG/JPEG/WebP and generic-file uploads, authentication, clean history, single-use pairing, revocation, frozen QR helpers and bundled licenses |
-| Linux/macOS package CI | Passed | Linux x86_64, macOS arm64 and macOS x86_64 builds, codec smoke and artifact uploads |
-| Installed 005 companion | Passed | Checksummed 0.6.0→0.7.0 update, expected capabilities, current conversation offered from both terminal panes |
-| Normal Android update | Passed | Files/PackageInstaller 0.6.0→0.7.0 upgrade, retained private app data, exact installed APK hash and successful launch |
+| Android JVM | 186 passed | Canonical IDs, conversation guard/history cache, same-conversation reconnect, existing math/attachment/input guards |
+| Android lint | 0 errors, 22 warnings, 2 hints | App and tests, including experimental focus opt-in |
+| Bridge offline | 596 passed | Foreground hook ownership, canonical page IDs, launch stability, obsolete upload cleanup, retained protocol/authentication guards |
+| Actual Codex/Herdr integrations | 16 passed | Owned two-pane misattribution reproduction and rejection, distinct launches, real hooks, histories and attachment input |
+| Android 13 device | 104 passed | 101 ordinary cases plus three isolated live pairing/terminal cases |
+| Frozen Linux package | Passed | Version/capabilities, QR/pairing, authentication, clean history, static image codecs, generic uploads and licenses |
+| Host package CI | Passed | Linux x86_64, macOS arm64 and macOS x86_64 builds and frozen smoke |
+| Android/bridge CI | Passed | Unit tests, lint, APK build and offline bridge tests |
+| Installed 005 companion | Passed | Checksummed update, preserved pairing/configuration, guarded helper and original conversation metadata |
+| Normal Android update | Passed | Files/PackageInstaller 0.7.0→0.7.1, retained private app data, exact installed APK and successful launch |
 
-These are **861 distinct automated passing cases**, plus artifact, installed-host, package and delivery checks. The ordinary 95-case device suite passed in 169.792 seconds. One additional regression using the exact reported integral passed in 3.103 seconds; the three live Android cases passed in 13.001 seconds. The final full run had no transient crash. Offline checks skip the 13 opt-in integrations, which passed separately. All test conversations and file/image payloads are synthetic; real-runtime checks use owned UUID Herdr sessions and temporary Codex homes. No test input was sent to an existing user agent, and actual user histories were not used as fixtures.
+These are **902 distinct automated passing cases**, plus artifact, package, installed-host and delivery checks. The final 101-case ordinary device run passed in 194.712 seconds; the three live Android cases passed in 12.981 seconds. The focused terminal class, included in the full-suite total, passed six cases in 39.794 seconds. The final build produced no device crash diagnostic. All 16 opt-in runtime integrations passed separately; the offline run skips those integrations.
 
-## Native mathematical formulas
+[Android/bridge CI](https://github.com/nabil-2/herdr-android/actions/runs/38031574617) and [all host package CI jobs](https://github.com/nabil-2/herdr-android/actions/runs/38031574638) passed at the final production commit.
 
-Assistant math is extracted before Markdown parsing and rendered with huarangmeng/latex 1.5.6 and bundled KaTeX fonts. Device tests require visible nonblank native pixels, rather than only a semantic placeholder. Coverage includes integrals, Greek letters, fractions, radicals, superscripts/subscripts, aligned rows, math fences, plain bracketed TeX, real multiline display source, unsupported/malformed input, currency, code and literal user messages. Copy retains the complete original Markdown/LaTeX.
-
-The exact reported evidence integral was tested at 260 dp with font scale 1.8. Its integral, inverse, Greek symbols and subscripts render natively. Formulas wrap where the renderer supports breaks; a wide atom can scroll horizontally within the phone viewport. Unsupported and oversized math stays readable. Device checks exposed and fixed both newline-spanning placeholders disappearing and unclaimed GFM math nodes dropping currency/oversized source.
-
-<p>
-  <img src="screenshots/chat-math-integral-0.7.png" width="240" alt="Synthetic integral and fraction rendered natively">
-  <img src="screenshots/chat-math-aligned-0.7.png" width="200" alt="Aligned derivatives at narrow width and large font">
-  <img src="screenshots/chat-reported-integral-0.7.png" width="240" alt="Reported evidence integral rendered at narrow width and large font">
-</p>
-
-## Existing shared Codex conversations
-
-Codex 0.162's shared background app-server inherits its first terminal's Herdr environment. That hook identity cannot establish which conversation another terminal displays. The companion verifies the foreground TUI, process/start lifetime, owned daemon/socket/home and Linux Unix-socket peer relationship, then offers explicit loaded primary conversations. It never chooses from a directory, message preview or newest file. Choices are scoped to one credential and exact runtime; tokens expire after five minutes. Loaded IDs are scanned across at most eight 32-ID pages, with at most 32 eligible displayed choices.
-
-The current conversation was verified as offered through the installed 005 API from both relevant panes, using metadata only. Device tests cover deliberate selection, exact thread/token submission, lost/expired selection recovery and no automatic choice. Backend tests cover cross-device isolation, stale hook exclusion, changed runtimes, paged subagents, blocked chats, exact active-turn steering, image inputs, uncertain acknowledgements and no PTY fallback. New managed chats use `--no-daemon`; the recognized official helper receives an ancestry guard on Linux. macOS retains its existing canonical pane-local hook flow without attempting Linux process verification.
-
-Selected reads connect to the existing daemon over its official Unix WebSocket transport. Explicit Send uses the selected thread's `turn/start` or `turn/steer` with its active turn ID. Existing frontend listeners remain attached. Approval/tool questions remain in Terminal. The ordinary saved-history sidecar allowlist stays read-only. See [identity notes and pinned sources](codex-session-selection.md).
-
-## Reviewed attachments
-
-Native system pickers, clipboard image paste and actual Android `InputConnection.commitContent` were exercised against the real MainActivity. Tests verify image-only Send, image/file preview and removal, exact uploaded bytes and IDs, one submission, acknowledgement clearing, invalid image handling, picker backgrounding and rejection of stale targets. The editor uses Compose's state-based text field so a compatible keyboard receives image MIME support. Input sessions reset when profile, pane or conversation changes.
-
-The server validates static PNG/JPEG/WebP with Pillow; generic files remain available to the same agent through generated owner-private paths. Limits are 16 MiB/file, 16 megapixels/image, eight files and 32 MiB/Send. Tests cover actual codecs, MIME mismatch, symlinks, changed bytes, scope changes, cross-device IDs, cancellation, limits and cleanup. Uploaded bytes alone never type. The owned real Herdr test confirms two separate no-Enter bracketed image pastes followed by one reviewed file prompt and one Enter. Selected shared-daemon chats use typed local-image inputs and no PTY writes.
-
-IDs are consumed before input. Durable fsynced markers preserve uncertain partial delivery across companion restart, scoped to credential/pane/thread/runtime independently of a temporary binding. Only confirmed delivery or explicit inspection acknowledgement clears that credential's marker. Restart cannot resurrect consumed IDs. Payloads expire after one hour unsent or seven days submitted; bounded display-only records retain readable own attachment names. The native draft store cannot override an authoritative server uncertainty gate.
-
-<p><img src="screenshots/chat-attachments-0.7.png" width="240" alt="Synthetic image and text file reviewed before image-only Send"></p>
+All test conversations, images, files and draft text are synthetic. Real runtime tests use owned UUID Herdr sessions and temporary Codex homes, without model prompts or input into existing user agents. Existing user message bodies are not fixtures. Focused checks are included in the full-suite totals rather than counted twice.
 
 ## Artifact and installed host
 
 - Pixel 7 emulator, Android 13/API 33, x86_64, hardware virtualization.
 - JDK 17, Kotlin 2.4.20, Gradle 9.6.0, Android Gradle Plugin 9.4.0; compile/target SDK 37.0, build tools 36.0.0; minimum API 26.
-- APK: **32,652,983 bytes**, version code **9**, name **0.7.0**. Signature and 16 KiB alignment checks pass. All 16 native libraries remain byte-identical to 0.6.0; the production APK excludes the synthetic test provider. Math fonts and both MIT notices are included.
-- Linux package: portable Python 3.11.17, PyInstaller 6.22.3; frozen codec smoke passes.
-- 005 configuration, device registry, owner token and Codex configuration remain byte-identical after upgrade. Only the recognized compatibility helper changed; its original backup remains intact. Existing Tailscale routes and paired profiles are preserved.
+- APK version code 10, name 0.7.1. All 16 native libraries and 20 bundled math fonts remain byte-identical to 0.7.0. The production APK excludes the synthetic test provider.
+- Linux package: portable Python 3.11.17, PyInstaller 6.22.3. Frozen package and codec smoke passed. Linux and both macOS package builds passed in [host CI](https://github.com/nabil-2/herdr-android/actions/runs/38031574638).
+- The installed 005 companion is 0.7.1 with the isolated-creation capability. Setup, device registry, owner token, Codex configuration and the original helper backup remain byte-identical. Only the recognized compatibility helper changed. Existing Tailscale routes and paired profiles are preserved.
+- Metadata-only checks confirmed the original loaded primary conversations remain offered from both relevant 005 panes. The checked saved histories remain present and unarchived, with owner-private safety copies. No user conversation was automatically selected or restarted.
+
+APK: **32,274,435 bytes**, signature, unique ZIP entries, CRC and 16 KiB alignment verified. The normal Android Files/PackageInstaller 0.7.0→0.7.1 update confirmed **App installed**, retained an app-private synthetic marker, installed the exact APK below and launched successfully. Private Tailscale HTTPS delivery passed normal CA/hostname validation, HTTP 200, APK MIME, full byte count and exact hash.
 
 APK SHA-256:
 
 ```text
-29e5da3310ac156cc4ac61ff516b2d72ac6187391898a40e83c09ce2e4c99346
+bc395eda156dc3cc8c4e0e7ef65eec8afb48ba5ff3f7924db17b3cf39dee9ac7
 ```
+
+Production source is `dc756587195080bcde157c5e4b5dd7ef455382c7`. The host source is unchanged from `df1d06021c35aa63e1b5a727beaee0da23171b8b`; the final production change enables terminal focus handling. Later documentation records these results.
+
+The signing certificate is unchanged: `ad045612a56a05953afb2162ac0b277a8a579dd8e70269caa18db37c26125c9c`.
 
 Linux companion SHA-256:
 
 ```text
-df9f8ab37162b9e0b2ad88c3c3646876aad8e01cadf2d2ee67a08f48f9b61f38
+a455f459f795c78c7291d68e69d19f7762fd53cfc18e0608bb2bead996b40b29
 ```
-
-The signing certificate is unchanged: `ad045612a56a05953afb2162ac0b277a8a579dd8e70269caa18db37c26125c9c`. Private Tailscale HTTPS delivery was verified with normal CA/hostname checks, HTTP 200, APK MIME, the complete 32,652,983 bytes and the exact APK hash.
-
-Production source is `8bdc2de0168525bfa12c5a6ffa4089e3f3cb5598`. [Host package CI](https://github.com/nabil-2/herdr-android/actions/runs/38027374023) passed all three platforms, including actual frozen codecs. [Android/bridge CI](https://github.com/nabil-2/herdr-android/actions/runs/38027374085) also passed. Earlier CI failures were isolated test assumptions: requiring a Linux probe on macOS and expecting a real private daemon directory on a clean runner. Both were corrected in fixtures; the packaged codecs and Android build were already passing.
-
-The API 33 normal Files/PackageInstaller update confirmed **App installed**, retained an app-private synthetic marker, installed the exact APK hash above and launched successfully. The retained 0.6.0 fixture data also retained its already-audited saved crash diagnostic from 9 October; that old record was cleared through the app UI. No new exception occurred in the final UI run or installation. Later documentation changes only record these results.
 
 ## Repeat
 
@@ -88,4 +82,4 @@ bridge/.venv/bin/python scripts/build_host.py
 bridge/.venv/bin/python scripts/smoke_host_package.py artifacts/host/herdr-pocket-linux-x86_64
 ```
 
-The live Android fixture also accepts a private attachment directory and temporary Codex home, so maintenance cannot inspect existing user uploads. The host smoke permits the Linux process-metadata probe only on Linux. The arbitrary socket-alias test creates its own temporary daemon directory instead of depending on a local real Codex daemon.
+Runtime fixtures wait for exact metadata adoption after a hook report. Hook-report and mutation retries are not introduced. A dialog assertion is scoped to the dialog because the same explanatory text also appears in the dashboard. The initial broad device failure was investigated and fixed in production rather than hidden by a teardown delay.
