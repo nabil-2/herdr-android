@@ -23,6 +23,8 @@ from .message_times import ITEM_TIME_FIELD, MAX_TIMESTAMP, enrich_message_times
 from .runtime import external_environment
 from .attachments import AttachmentStore
 from .codex_identity import DaemonConversations
+from .codex_history import (CodexHistoryNotPersisted, CodexHistoryTooLarge, CodexHistoryUnsupported,
+                            HISTORY_WARNING_FIELD, HISTORY_PAGED_FIELD, history_rpc_error, read_history)
 
 MAX_RPC_BYTES = 32 * 1024 * 1024
 MAX_PAGE_BYTES = 1024 * 1024
@@ -112,7 +114,11 @@ def normalize_thread(result: dict, thread_id: str) -> tuple[list[dict], str | No
                 if type(recorded) is int and 0 <= recorded <= MAX_TIMESTAMP:
                     message["messageTimestamp"] = recorded
                 messages.append(message)
-        return messages, "Some messages were truncated; use Terminal for complete output" if truncated else None
+        warnings = ["Some messages were truncated; use Terminal for complete output"] if truncated else []
+        page_warning = result.get(HISTORY_WARNING_FIELD)
+        if isinstance(page_warning, str) and len(page_warning) <= 1024:
+            warnings.append(page_warning)
+        return messages, " ".join(warnings) or None
     except (KeyError, TypeError, ValueError, UnicodeError) as exc:
         raise BridgeError(503, "Codex returned incompatible saved history; use Terminal") from exc
 
@@ -129,13 +135,14 @@ class CodexReader:
         self.stderr_task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
         self.next_id = 0
+        self.paged_threads: OrderedDict[str, None] = OrderedDict()
 
     @property
     def enabled(self) -> bool:
         return self.executable is not None
 
     async def _rpc(self, method: str, params: dict) -> dict:
-        if method not in {"initialize", "thread/read"}:
+        if method not in {"initialize", "thread/read", "thread/turns/list"}:
             raise ValueError("Codex adapter permits only initialization and saved-history reads")
         assert self.process and self.process.stdin and self.process.stdout
         self.next_id += 1
@@ -143,9 +150,18 @@ class CodexReader:
         self.process.stdin.write(json.dumps({"id": request_id, "method": method, "params": params}, separators=(",", ":")).encode() + b"\n")
         await self.process.stdin.drain()
         while True:
-            line = await self.process.stdout.readline()
-            if not line or len(line) > MAX_RPC_BYTES:
-                raise BridgeError(503, "Codex saved history is unavailable or too large; use Terminal")
+            try:
+                line = await self.process.stdout.readline()
+            except ValueError as exc:
+                # StreamReader.readline wraps its byte-limit exception in a
+                # ValueError. It is distinct from malformed JSON below.
+                if method in {"thread/read", "thread/turns/list"}:
+                    raise CodexHistoryTooLarge() from exc
+                raise
+            if len(line) > MAX_RPC_BYTES:
+                raise CodexHistoryTooLarge()
+            if not line:
+                raise BridgeError(503, "Codex saved history is unavailable; use Terminal")
             response = json.loads(line)
             if not isinstance(response, dict):
                 raise ValueError()
@@ -157,16 +173,9 @@ class CodexReader:
             if response.get("id") != request_id:
                 raise BridgeError(503, "Codex could not read this saved conversation; use Terminal")
             if "error" in response:
-                error = response["error"]
-                thread_id = params.get("threadId")
-                # These exact 0.162 errors mean there is no stored thread in this
-                # read-only sidecar. They prove an empty first conversation only
-                # together with a separately confirmed, fresh creation receipt.
-                if (method == "thread/read" and isinstance(thread_id, str) and isinstance(error, dict)
-                        and type(error.get("code")) is int and error["code"] == -32600
-                        and error.get("message") in (f"thread not loaded: {thread_id}",
-                                                      f"no rollout found for thread id {thread_id}")):
-                    raise CodexHistoryNotPersisted(thread_id)
+                semantic = history_rpc_error(method, params, response["error"])
+                if semantic is not None:
+                    raise semantic
                 raise BridgeError(503, "Codex could not read this saved conversation; use Terminal")
             if not isinstance(response.get("result"), dict):
                 raise BridgeError(503, "Codex could not read this saved conversation; use Terminal")
@@ -180,43 +189,62 @@ class CodexReader:
         except TimeoutError as exc:
             raise BridgeError(503, "Codex saved-history reader timed out; use Terminal") from exc
 
+    async def _ensure_process(self) -> None:
+        if self.process is None or self.process.returncode is not None:
+            if not self.enabled:
+                raise BridgeError(503, "Codex conversation reader is not configured; use Terminal")
+            info = self.home.stat()
+            if not self.home.is_dir() or info.st_uid != os.getuid():
+                raise BridgeError(503, "Codex home must belong to the bridge user; use Terminal")
+            env = external_environment()
+            env["CODEX_HOME"] = str(self.home)
+            if self.search_path is not None:
+                env["PATH"] = self.search_path
+            for name in ("CODEX_THREAD_ID", "CODEX_SESSION_ID", "HERDR_PANE_ID", "HERDR_ENV"):
+                env.pop(name, None)
+            self.process = await asyncio.create_subprocess_exec(
+                self.executable, "app-server", "--listen", "stdio://",
+                env=env, cwd=str(self.home), stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                limit=MAX_RPC_BYTES + 1,
+            )
+
+            async def drain_stderr():
+                assert self.process and self.process.stderr
+                while await self.process.stderr.read(65536):
+                    pass
+
+            self.stderr_task = asyncio.create_task(drain_stderr())
+            await self._rpc("initialize", {"clientInfo": {"name": "herdr_pocket_reader", "title": "Herdr Pocket", "version": "1"}})
+            assert self.process.stdin
+            self.process.stdin.write(b'{"method":"initialized","params":{}}\n')
+            await self.process.stdin.drain()
+
     async def _read(self, thread_id: str) -> dict:
         async with self.lock:
             try:
                 async with asyncio.timeout(self.timeout):
-                    if self.process is None or self.process.returncode is not None:
-                        if not self.enabled:
-                            raise BridgeError(503, "Codex conversation reader is not configured; use Terminal")
-                        info = self.home.stat()
-                        if not self.home.is_dir() or info.st_uid != os.getuid():
-                            raise BridgeError(503, "Codex home must belong to the bridge user; use Terminal")
-                        env = external_environment()
-                        env["CODEX_HOME"] = str(self.home)
-                        if self.search_path is not None:
-                            env["PATH"] = self.search_path
-                        for name in ("CODEX_THREAD_ID", "CODEX_SESSION_ID", "HERDR_PANE_ID", "HERDR_ENV"):
-                            env.pop(name, None)
-                        self.process = await asyncio.create_subprocess_exec(
-                            self.executable, "app-server", "--listen", "stdio://",
-                            env=env, cwd=str(self.home), stdin=asyncio.subprocess.PIPE,
-                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                            limit=MAX_RPC_BYTES + 1,
-                        )
+                    await self._ensure_process()
 
-                        async def drain_stderr():
-                            assert self.process and self.process.stderr
-                            while await self.process.stderr.read(65536):
-                                pass
+                    async def history_rpc(method: str, params: dict) -> dict:
+                        try:
+                            return await self._rpc(method, params)
+                        except CodexHistoryTooLarge:
+                            # An oversized line leaves the stdio stream out of
+                            # sync. Replace only our read-only sidecar before
+                            # the pager requests a smaller view at that cursor.
+                            await self._stop()
+                            await self._ensure_process()
+                            self.paged_threads[thread_id] = None
+                            self.paged_threads.move_to_end(thread_id)
+                            while len(self.paged_threads) > MAX_CACHES:
+                                self.paged_threads.popitem(last=False)
+                            raise
 
-                        self.stderr_task = asyncio.create_task(drain_stderr())
-                        await self._rpc("initialize", {"clientInfo": {"name": "herdr_pocket_reader", "title": "Herdr Pocket", "version": "1"}})
-                        assert self.process.stdin
-                        self.process.stdin.write(b'{"method":"initialized","params":{}}\n')
-                        await self.process.stdin.drain()
-                    result = await self._rpc("thread/read", {"threadId": thread_id, "includeTurns": True})
+                    result = await read_history(history_rpc, thread_id, prefer_pages=thread_id in self.paged_threads)
                     await enrich_message_times(result, thread_id, self.home)
                     return result
-            except CodexHistoryNotPersisted:
+            except (CodexHistoryNotPersisted, CodexHistoryUnsupported):
                 # The request completed normally; the RPC channel remains usable.
                 raise
             except asyncio.CancelledError:
@@ -254,12 +282,6 @@ class ConversationCache:
     history_epoch: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     byte_size: int = 0
     bootstrapping: bool = False
-
-
-class CodexHistoryNotPersisted(BridgeError):
-    def __init__(self, thread_id: str):
-        super().__init__(503, "Codex has not saved this conversation yet; use Terminal")
-        self.thread_id = thread_id
 
 
 @dataclass
@@ -434,7 +456,14 @@ class Conversations:
                 try:
                     try:
                         if agent.get("_pocket_daemon_selected") is True and self.daemon is not None:
-                            result = await self.daemon.read(pane_id, owner, thread_id)
+                            try:
+                                result = await self.daemon.read(pane_id, owner, thread_id)
+                            except CodexHistoryUnsupported:
+                                # Some existing daemons can load a primary
+                                # chat but lack that store's history-list API.
+                                # Read only its exact saved canonical thread;
+                                # delivery remains bound to the live daemon.
+                                result = await self.reader.read(thread_id)
                         else:
                             result = await self.reader.read(thread_id)
                     except CodexHistoryNotPersisted as exc:

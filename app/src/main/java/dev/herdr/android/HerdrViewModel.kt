@@ -390,7 +390,15 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshChat() = restartChatPolling()
 
-    fun loadCodexConversations() {
+    fun loadCodexConversations() = loadCodexConversations(automatic = false)
+
+    fun loadCodexConversationsAutomatically() {
+        val current = state.value
+        if (current.codexSelection.showing || current.chat.bindingId != null) return
+        loadCodexConversations(automatic = true)
+    }
+
+    private fun loadCodexConversations(automatic: Boolean) {
         val current = state.value
         val profileId = current.activeProfileId ?: return
         val paneId = current.paneId ?: return
@@ -402,7 +410,10 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         codexSelectionJob?.cancel()
         val sequence = ++codexSelectionSequence
         val currentGeneration = generation
-        mutableState.update { it.copy(codexSelection = CodexConversationSelectionState(profileId, paneId, showing = true, loading = true)) }
+        val remainsAutomatic = automatic || (current.codexSelection.profileId == profileId &&
+            current.codexSelection.paneId == paneId && current.codexSelection.showing && current.codexSelection.automatic)
+        mutableState.update { it.copy(codexSelection = CodexConversationSelectionState(profileId, paneId,
+            showing = true, loading = true, automatic = remainsAutomatic)) }
         codexSelectionJob = viewModelScope.launch {
             try {
                 val choices = currentClient.codexConversations(paneId)
@@ -1078,7 +1089,7 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         olderMessagesJob = null
         chatInputJob = null
         mutableState.update {
-            it.copy(chat = it.chat.copy(loading = false, refreshing = false, loadingOlder = false, sending = false, canSend = false,
+            it.copy(chat = it.chat.copy(loading = false, refreshing = false, loadingOlder = false, readRetrying = false, sending = false, canSend = false,
                 deliveryUncertain = pendingWrite || it.chat.deliveryUncertain,
                 attachmentDeliveryUncertain = it.chat.attachmentDeliveryUncertain || (pendingWrite && it.chat.attachments.isNotEmpty()),
                 attachments = if (pendingWrite) it.chat.attachments.map { item -> item.copy(status = ChatAttachmentStatus.DELIVERY_UNCERTAIN) } else it.chat.attachments,
@@ -1102,9 +1113,10 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
         olderMessagesJob = null
         val session = ++chatSession
         mutableState.update {
-            it.copy(chat = it.chat.copy(loading = false, refreshing = false, loadingOlder = false,
+            it.copy(chat = it.chat.copy(loading = false, refreshing = false, loadingOlder = false, readRetrying = false,
                 revision = if (resetRevision) null else it.chat.revision, canSend = false,
-                canSendReason = "Checking whether Codex is ready to receive a message."))
+                canSendReason = "Checking whether Codex is ready to receive a message.",
+                error = if (it.chat.deliveryUncertain || it.chat.conversationChanged) it.chat.error else null))
         }
         val current = state.value
         val paneId = current.paneId ?: return
@@ -1159,12 +1171,21 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
                         rememberCurrentChat()
                         clearChatAttachments()
                     }
+                    val selection = state.value.codexSelection
+                    val closeAutomaticSelection = page.conversationId != null && selection.showing && selection.automatic &&
+                        !selection.selecting && selection.profileId == state.value.activeProfileId && selection.paneId == paneId
+                    if (closeAutomaticSelection) {
+                        codexSelectionJob?.cancel()
+                        codexSelectionJob = null
+                        ++codexSelectionSequence
+                    }
                     mutableState.update {
                         val updated = ChatState.latest(it.chat, page)
                         val restored = if (previousBinding != page.binding && it.activeProfileId != null) {
                             chatDrafts.restore(it.activeProfileId, paneId, updated)
                         } else updated
-                        it.copy(chat = restored)
+                        it.copy(chat = restored,
+                            codexSelection = if (closeAutomaticSelection) CodexConversationSelectionState() else it.codexSelection)
                     }
                     if (previousBinding != null && previousBinding != page.binding) {
                         chatWriteSequence++
@@ -1175,10 +1196,12 @@ class HerdrViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (error: Exception) {
                     if (chatSession != session || generation != currentGeneration || state.value.paneId != paneId) return@launch
+                    val retry = !(error is BridgeException && error.statusCode in listOf(401, 403))
                     mutableState.update { it.copy(chat = it.chat.copy(loading = false, refreshing = false, canSend = false,
+                        readRetrying = retry,
                         canSendReason = readableError(error),
                         error = if (it.chat.deliveryUncertain) it.chat.error else readableError(error))) }
-                    if (error is BridgeException && error.statusCode in listOf(401, 403, 404)) return@launch
+                    if (!retry) return@launch
                     failures++
                 }
                 delay(if (failures == 0) 1_000 else CHAT_READ_RETRY_DELAYS[(failures - 1).coerceAtMost(CHAT_READ_RETRY_DELAYS.lastIndex)])

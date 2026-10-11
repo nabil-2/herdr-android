@@ -117,6 +117,35 @@ class ChatStateTest {
         assertFalse(ChatState.requiresFullPage(initial, unchanged.copy(historyEpoch = "e1")))
     }
 
+    @Test fun `retrying reads block submission until an authoritative same conversation page restores readiness`() {
+        val id = "00000000-0000-4000-8000-000000000001"
+        val initial = ChatState.latest(ChatContent(), page(1..5).copy(conversationId = id))
+            .copy(draft = "reviewed draft", readRetrying = true)
+        assertFalse("Clearing a displayed error must not bypass an ongoing failed read", initial.canSubmitMessage())
+        val recovered = ChatState.latest(initial, page(1..6).copy(conversationId = id))
+        assertFalse(recovered.readRetrying)
+        assertEquals("reviewed draft", recovered.draft)
+        assertEquals(id, recovered.conversationId)
+        assertTrue(recovered.canSubmitMessage())
+        val uncertain = ChatState.latest(initial.copy(deliveryUncertain = true, error = "Inspect delivery"), page(1..6).copy(conversationId = id))
+        assertFalse(uncertain.readRetrying)
+        assertTrue(uncertain.deliveryUncertain)
+        assertEquals("Inspect delivery", uncertain.error)
+        assertFalse(uncertain.canSubmitMessage())
+    }
+
+    @Test fun `read recovery from a different UUID ends retrying but keeps the original conversation guarded`() {
+        val initial = ChatState.latest(ChatContent(), page(1..5).copy(conversationId = "00000000-0000-4000-8000-000000000001"))
+            .copy(draft = "original draft", readRetrying = true, error = "Temporary read failure")
+        val guarded = ChatState.latest(initial, page(6..10).copy(conversationId = "00000000-0000-4000-8000-000000000002"))
+        assertFalse(guarded.readRetrying)
+        assertTrue(guarded.conversationChanged)
+        assertEquals(initial.messages, guarded.messages)
+        assertEquals(initial.draft, guarded.draft)
+        assertEquals(initial.conversationId, guarded.conversationId)
+        assertFalse(guarded.canSubmitMessage())
+    }
+
     @Test fun `uncertain delivery and draft survive reads until user review or acknowledged resend`() {
         val initial = ChatState.latest(ChatContent(), page(51..100)).copy(draft = "not confirmed", deliveryUncertain = true, error = "Check before resending")
         val updated = ChatState.latest(initial, page(52..101, revision = "r2"))

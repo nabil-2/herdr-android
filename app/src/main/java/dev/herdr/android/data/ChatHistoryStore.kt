@@ -25,7 +25,7 @@ internal class ChatHistoryStore(private val maxEntries: Int = 16, private val ma
             revision = if (originalCost > maxCharacters) null else chat.revision,
             olderCursor = if (originalCost > maxCharacters) null else chat.olderCursor,
             draft = "", attachments = emptyList(), attachmentError = null,
-            loading = false, refreshing = false, loadingOlder = false,
+            loading = false, refreshing = false, loadingOlder = false, readRetrying = false,
             sending = false, canSend = false,
         ), cost)
         while (histories.size > maxEntries || histories.values.sumOf { it.characters.toLong() } > maxCharacters) {

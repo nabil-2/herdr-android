@@ -27,6 +27,7 @@ data class CodexConversationSelectionState(
     val choices: List<CodexConversationChoice> = emptyList(),
     val selectionToken: String? = null,
     val error: String? = null,
+    val automatic: Boolean = false,
 )
 
 internal object CodexConversationSelectionProtocol {

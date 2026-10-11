@@ -47,7 +47,7 @@ async def selected_host(socket_server, tmp_path, monkeypatch):
     path = tmp_path / "daemon.sock"
     requests = []
     threads = {THREAD: metadata(), OTHER: metadata(OTHER, source="exec")}
-    full_history = {"thread": {"id": THREAD, "turns": [{"id": TURN, "items": [
+    full_history = {"thread": {"id": THREAD, "turns": [{"id": TURN, "status": "completed", "items": [
         {"id": "u1", "type": "userMessage", "content": [{"type": "text", "text": "Synthetic user"}]},
         {"id": "a1", "type": "agentMessage", "text": "Synthetic answer", "phase": "final_answer"}]}]}}
     control = {"mode": "ack", "turn": TURN, "turnStatus": "inProgress", "turnItems": []}
@@ -70,9 +70,25 @@ async def selected_host(socket_server, tmp_path, monkeypatch):
                 elif method == "thread/read":
                     result = full_history if params["includeTurns"] else {"thread": threads[params["threadId"]]}
                 elif method == "thread/turns/list":
-                    assert params["itemsView"] == "notLoaded"
-                    result = {"data": [{"id": control["turn"], "status": control["turnStatus"], "items": control["turnItems"]}],
-                              "nextCursor": None}
+                    assert params["sortDirection"] == "desc"
+                    if params["itemsView"] == "notLoaded":
+                        assert params["limit"] == 1
+                        result = {"data": [{"id": control["turn"], "status": control["turnStatus"], "items": control["turnItems"]}],
+                                  "nextCursor": None}
+                    else:
+                        assert params["itemsView"] in {"full", "summary"} and params["threadId"] == full_history["thread"]["id"]
+                        assert 1 <= params["limit"] <= 5
+                        turns = list(reversed(full_history["thread"]["turns"]))
+                        offset = int(params.get("cursor") or 0)
+                        end = offset + params["limit"]
+                        page = turns[offset:end]
+                        if params["itemsView"] == "summary":
+                            page = [turn | {"items": [item for item in (
+                                next((item for item in turn["items"] if item.get("type") == "userMessage"), None),
+                                next((item for item in reversed(turn["items"]) if item.get("type") == "agentMessage"), None),
+                            ) if item is not None]} for turn in page]
+                        result = {"data": page,
+                                  "nextCursor": str(end) if end < len(turns) else None}
                 elif method in {"turn/start", "turn/steer"}:
                     if control["mode"] == "drop":
                         return

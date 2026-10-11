@@ -129,6 +129,7 @@ internal fun ChatScreen(
     onSelectConversation: (String) -> Unit = {},
     onDismissConversationSelection: () -> Unit = {},
     onConfirmConversationChange: () -> Unit = {},
+    onAutomaticallyChooseConversation: () -> Unit = onChooseConversation,
 ) {
     val pane = state.snapshot?.panes?.firstOrNull { it.id == state.paneId }
     val workspace = state.snapshot?.workspaces?.firstOrNull { it.id == pane?.workspaceId }
@@ -140,7 +141,7 @@ internal fun ChatScreen(
         ?: CodexConversationSelectionState()
     val chooseConversation = selectable && (selection.showing || (pane?.conversation?.available != true && chat.bindingId == null))
     LaunchedEffect(state.activeProfileId, state.paneId, connected, selectable, chooseConversation) {
-        if (connected && chooseConversation && !selection.showing && !chat.deliveryUncertain) onChooseConversation()
+        if (connected && chooseConversation && !selection.showing && !chat.deliveryUncertain) onAutomaticallyChooseConversation()
     }
     val cannotSendReason = if (chat.status == "working" && !chat.canSend && "codex-chat-working-input" !in state.capabilities) {
         "Update the host companion to send while Codex works."
@@ -181,7 +182,9 @@ internal fun ChatScreen(
                 else "Check the conversation or terminal before sending this message again.",
                 if (chat.attachmentDeliveryUncertain) "I checked and cleared Terminal" else "I checked the conversation",
                 onAcknowledgeDelivery, Modifier.testTag("chat-delivery-uncertain"))
-            else if (chat.error != null) ChatNotice("Conversation needs a refresh", chat.error, "Refresh conversation", onRetry)
+            else if (connected && chat.readRetrying) ChatNotice("Reconnecting conversation",
+                "Trying again automatically. ${chat.error.orEmpty()}", "Try now", onRetry, Modifier.testTag("chat-read-retrying"))
+            else if (chat.error != null) ChatNotice("Could not open the conversation", chat.error, "Try again", onRetry)
             if (chat.warning != null) Text(chat.warning, Modifier.padding(horizontal = 20.dp, vertical = 8.dp), color = Amber, style = MaterialTheme.typography.bodySmall)
             if (chooseConversation) {
                 CodexConversationSelector(selection, onChooseConversation, onSelectConversation,
@@ -281,8 +284,9 @@ internal fun ConversationMessages(chat: ChatContent, onOlder: () -> Unit, modifi
             if (messages.isEmpty()) item(key = "empty-conversation") {
                 Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     if (chat.loading) CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.dp)
-                    Text(if (chat.loading) "Opening conversation…" else if (chat.bindingId == null) "Conversation unavailable" else "Start a conversation", style = MaterialTheme.typography.titleMedium)
-                    if (!chat.loading) Text(if (chat.bindingId == null) "Use the terminal to control this session." else "Write to the Codex session running on your computer.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(if (chat.readRetrying) "Waiting for this tab’s conversation" else if (chat.loading) "Opening conversation…" else if (chat.bindingId == null) "Conversation unavailable" else "Start a conversation", style = MaterialTheme.typography.titleMedium)
+                    if (!chat.loading || chat.readRetrying) Text(if (chat.readRetrying) "The app will reopen it automatically when the server is ready."
+                        else if (chat.bindingId == null) "Use the terminal to control this session." else "Write to the Codex session running on your computer.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             itemsIndexed(messages, key = { _, message -> message.id }, contentType = { _, message -> message.role }) { index, message ->

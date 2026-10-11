@@ -116,10 +116,11 @@ data class ChatContent(
     val attachmentError: String? = null,
     val conversationId: String? = null,
     val conversationChanged: Boolean = false,
+    val readRetrying: Boolean = false,
 ) {
     /** Herdr accepts follow-ups while Codex is working; server readiness stays authoritative. */
     fun canSubmitMessage(): Boolean = canSend && (status in setOf("idle", "done", "working") || (status == "unknown" && freshBootstrap)) &&
-        bindingId != null && error == null && !loading && !sending && !deliveryUncertain && !attachmentDeliveryUncertain && !conversationChanged &&
+        bindingId != null && error == null && !loading && !readRetrying && !sending && !deliveryUncertain && !attachmentDeliveryUncertain && !conversationChanged &&
         attachments.all { it.status == ChatAttachmentStatus.READY && it.remoteId != null }
 
     override fun toString(): String = "ChatContent(messages=${messages.size}, loading=$loading, sending=$sending)"

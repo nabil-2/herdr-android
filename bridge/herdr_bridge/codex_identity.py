@@ -26,10 +26,12 @@ import uuid
 
 import anyio
 from websockets.asyncio.client import unix_connect
-from websockets.exceptions import WebSocketException
+from websockets.exceptions import WebSocketException, ConnectionClosed
 
 from .herdr import BridgeError, HerdrClient
 from .message_times import enrich_message_times
+from .codex_history import (CodexHistoryTooLarge, HISTORY_PAGED_FIELD, history_rpc_error, read_history)
+from .codex_selection_store import CodexSelectionStore, selection_fingerprint
 
 MAX_SELECTIONS = 32
 MAX_CANDIDATES = 32
@@ -233,7 +235,9 @@ def _inspect_runtime(client: HerdrClient, home: Path, agent: dict, metadata: dic
     peers = _unix_peers(frontend_sockets)
     matches = [(source, target) for source, target in peers.items() if target in daemon_sockets]
     if len(matches) != 1:
-        return None
+        # A shared TUI can reconnect while socket metadata is sampled. Never
+        # fall back to its daemon-inherited hook UUID during that transition.
+        raise ValueError("Shared Codex peer connection is not ready")
     after, _, _ = _process(pid)
     if after[19] != details[19] or int(after[2]) != group or int(after[5]) != group:
         raise ValueError("Foreground Codex changed while inspected")
@@ -287,11 +291,20 @@ class DaemonSession:
         request_id = self.next_id
         await self.connection.send(json.dumps({"id": request_id, "method": method, "params": params}, separators=(",", ":")))
         skipped = 0
-        limit = MAX_HISTORY_RPC_BYTES if method == "thread/read" and params.get("includeTurns") is True else MAX_RPC_BYTES
+        history_page = (method == "thread/read" and params.get("includeTurns") is True
+                        or method == "thread/turns/list" and params.get("itemsView") in {"full", "summary"})
+        limit = MAX_HISTORY_RPC_BYTES if history_page else MAX_RPC_BYTES
         for _ in range(128):
-            raw = await self.connection.recv()
+            try:
+                raw = await self.connection.recv()
+            except ConnectionClosed as exc:
+                if history_page and exc.sent is not None and exc.sent.code == 1009:
+                    raise CodexHistoryTooLarge() from exc
+                raise
             size = len(raw.encode("utf-8")) if isinstance(raw, str) else len(raw)
             skipped += size
+            if size > limit and history_page:
+                raise CodexHistoryTooLarge()
             if not raw or size > limit or skipped > limit + 4 * MAX_RPC_BYTES:
                 raise BridgeError(503, "Codex daemon response exceeded its limits")
             response = json.loads(raw)
@@ -305,6 +318,9 @@ class DaemonSession:
             if type(response.get("id")) is not int or response["id"] != request_id:
                 raise ValueError("Daemon response did not match its request")
             if "error" in response:
+                semantic = history_rpc_error(method, params, response["error"])
+                if semantic is not None:
+                    raise semantic
                 raise BridgeError(503 if method in {"turn/start", "turn/steer"} else 409,
                                   "Codex could not confirm the selected operation; refresh or inspect its existing Terminal")
             if not isinstance(response.get("result"), dict):
@@ -362,11 +378,61 @@ def thread_metadata(thread: object, expected_id: str) -> dict | None:
 
 
 class DaemonConversations:
-    def __init__(self, client: HerdrClient, home: Path, *, clock=time.monotonic):
+    def __init__(self, client: HerdrClient, home: Path, *, clock=time.monotonic, selection_root: Path | None = None):
         self.client, self.home, self.clock = client, home, clock
         self.offers: OrderedDict[str, SelectionOffer] = OrderedDict()
         self.selections: OrderedDict[tuple[str, str], tuple[DaemonRuntime, str]] = OrderedDict()
+        self.selection_digests: dict[tuple[str, str], str] = {}
+        self.selection_store = CodexSelectionStore(selection_root) if selection_root is not None else None
         self.lock = asyncio.Lock()
+        self.paged_threads: OrderedDict[tuple[str, str], None] = OrderedDict()
+
+    async def same_runtime(self, first: DaemonRuntime, second: DaemonRuntime) -> bool:
+        # Every caller has freshly verified the actual peer connection. Its
+        # reconnecting endpoints are not the lifetime of the TUI or daemon.
+        fingerprints = await asyncio.to_thread(lambda: (selection_fingerprint(first), selection_fingerprint(second)))
+        return fingerprints[0] is not None and fingerprints[0] == fingerprints[1]
+
+    def _retain(self, key: tuple[str, str], runtime: DaemonRuntime, thread_id: str, digest: str) -> None:
+        self.selections[key] = runtime, thread_id
+        self.selections.move_to_end(key)
+        self.selection_digests[key] = digest
+        while len(self.selections) > MAX_SELECTIONS:
+            victim, _ = self.selections.popitem(last=False)
+            self.selection_digests.pop(victim, None)
+
+    async def _remembered(self, runtime: DaemonRuntime, owner: str) -> tuple[DaemonRuntime, str] | None:
+        # Selection acknowledgement and restart recovery share one ordering
+        # lock. A slow disk/RPC restore cannot overwrite a newer user choice.
+        async with self.lock:
+            return await self._remembered_locked(runtime, owner)
+
+    async def _remembered_locked(self, runtime: DaemonRuntime, owner: str) -> tuple[DaemonRuntime, str] | None:
+        key = owner, runtime.pane_id
+        selected = self.selections.get(key)
+        if selected is not None:
+            if await self.same_runtime(selected[0], runtime):
+                return selected
+            # A proven process, terminal, daemon or host replacement cannot
+            # inherit a prior choice, even when the same thread stays loaded.
+            self.selections.pop(key, None)
+            self.selection_digests.pop(key, None)
+            if self.selection_store is not None:
+                await self.selection_store.forget(*key)
+            return None
+        if self.selection_store is not None:
+            fingerprint = await asyncio.to_thread(selection_fingerprint, runtime)
+            if fingerprint is not None:
+                record = await self.selection_store.load(*key, fingerprint)
+                if record is not None:
+                    thread_id, digest = record
+                    async with self.session(runtime) as session:
+                        if thread_id not in await self.loaded(session):
+                            return None
+                        await self.metadata(session, thread_id)
+                    self._retain(key, runtime, thread_id, digest)
+                    return self.selections[key]
+        return None
 
     async def probe(self, agent: dict) -> DaemonRuntime | None:
         # Unix peer/process proof is Linux-specific. Other supported hosts keep
@@ -468,10 +534,11 @@ class DaemonConversations:
                 if thread_id not in await self.loaded(session):
                     raise BridgeError(409, UNAVAILABLE)
                 await self.metadata(session, thread_id)
-            self.selections[(owner, pane_id)] = runtime, thread_id
-            self.selections.move_to_end((owner, pane_id))
-            while len(self.selections) > MAX_SELECTIONS:
-                self.selections.popitem(last=False)
+            self._retain((owner, pane_id), runtime, thread_id, runtime.identity)
+            if self.selection_store is not None:
+                fingerprint = await asyncio.to_thread(selection_fingerprint, runtime)
+                if fingerprint is not None:
+                    await self.selection_store.remember(owner, pane_id, fingerprint, thread_id, runtime.identity)
             return {"ok": True}
 
     async def target(self, agent: dict, owner: str) -> tuple[dict, str] | None:
@@ -480,21 +547,20 @@ class DaemonConversations:
         selected = self.selections.get(key)
         if runtime is None:
             if selected is not None:
-                self.selections.pop(key, None)
                 raise BridgeError(409, UNAVAILABLE)
             return None
-        if selected is None or selected[0] != runtime:
-            self.selections.pop(key, None)
+        selected = await self._remembered(runtime, owner)
+        if selected is None:
             raise BridgeError(409, "Choose the conversation shown in this Codex Terminal before opening chat")
         thread_id = selected[1]
+        digest = self.selection_digests.get(key, selected[0].identity)
         async with self.session(runtime) as session:
             if thread_id not in await self.loaded(session):
-                self.selections.pop(key, None)
                 raise BridgeError(409, UNAVAILABLE)
             metadata = await self.metadata(session, thread_id)
         mapped = dict(agent)
         mapped.update(agent_status=metadata["status"], interactive_ready=True, launch_pending=False,
-                      _pocket_daemon_selected=True, _pocket_daemon_identity=runtime.identity)
+                      _pocket_daemon_selected=True, _pocket_daemon_identity=digest)
         return mapped, thread_id
 
     async def read(self, pane_id: str, owner: str, thread_id: str) -> dict:
@@ -502,13 +568,29 @@ class DaemonConversations:
         if selected is None or selected[1] != thread_id:
             raise BridgeError(409, UNAVAILABLE)
         runtime = await self.probe(await self.client.agent(pane_id))
-        if runtime != selected[0]:
+        if runtime is None or not await self.same_runtime(runtime, selected[0]):
             raise BridgeError(409, UNAVAILABLE)
         async with self.session(runtime) as session:
             if thread_id not in await self.loaded(session):
                 raise BridgeError(409, UNAVAILABLE)
             await self.metadata(session, thread_id)
-            result = await session.rpc("thread/read", {"threadId": thread_id, "includeTurns": True})
+            key = self.selection_digests.get((owner, pane_id), selected[0].identity), thread_id
+
+            async def history_rpc(method: str, params: dict) -> dict:
+                try:
+                    return await session.rpc(method, params)
+                except CodexHistoryTooLarge:
+                    # Retire only our reading connection; other TUI listeners
+                    # and their approvals remain attached to the live daemon.
+                    await session.close()
+                    await session.open()
+                    self.paged_threads[key] = None
+                    self.paged_threads.move_to_end(key)
+                    while len(self.paged_threads) > MAX_SELECTIONS:
+                        self.paged_threads.popitem(last=False)
+                    raise
+
+            result = await read_history(history_rpc, thread_id, prefer_pages=key in self.paged_threads)
         await enrich_message_times(result, thread_id, runtime.home)
         return result
 
@@ -522,8 +604,8 @@ class DaemonConversations:
                     runtime = await self.probe(agent)
                     if runtime is None:
                         return
-                    selected = self.selections.get((owner, pane["id"]))
-                    available = selected is not None and selected[0] == runtime
+                    selected = await self._remembered(runtime, owner)
+                    available = selected is not None
                     pane["conversation"] = {"provider": "codex", "available": available, "selectable": True,
                                             "reason": None if available else "Choose the conversation shown in this Codex Terminal"}
                 except BridgeError:
@@ -543,7 +625,7 @@ class DaemonConversations:
             if selected is None:
                 return False
             runtime = await self.probe(await self.client.agent(pane_id))
-            if runtime != selected[0] or thread_id != selected[1]:
+            if runtime is None or not await self.same_runtime(runtime, selected[0]) or thread_id != selected[1]:
                 raise BridgeError(409, UNAVAILABLE)
             async with self.session(runtime) as session:
                 if thread_id not in await self.loaded(session):

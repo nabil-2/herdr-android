@@ -247,8 +247,9 @@ def create_app(client: HerdrClient, token: str, pairing_store: PairingStore | No
         raise ValueError("Use a generated bearer token of at least 32 ASCII characters")
     reader = CodexReader(codex_executable, codex_home, codex_path)
     conversations = Conversations(client, reader)
-    conversations.daemon = DaemonConversations(client, reader.home) if reader.enabled else None
     attachments = AttachmentStore(attachment_dir)
+    conversations.daemon = (DaemonConversations(client, reader.home, selection_root=attachments.root / "codex-selections")
+                            if reader.enabled else None)
     conversations.attachments = attachments
 
     async def prepare_integration() -> CodexIntegrationResult:

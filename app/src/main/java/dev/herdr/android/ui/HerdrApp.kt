@@ -186,6 +186,7 @@ fun HerdrApp(viewModel: HerdrViewModel, onConnect: (String) -> Unit, onTerminalR
                     onRemoveAttachment = viewModel::removeChatAttachment,
                     onDismissAttachmentError = viewModel::clearChatAttachmentError,
                     onChooseConversation = viewModel::loadCodexConversations,
+                    onAutomaticallyChooseConversation = viewModel::loadCodexConversationsAutomatically,
                     onSelectConversation = viewModel::selectCodexConversation,
                     onDismissConversationSelection = viewModel::dismissCodexConversationSelection,
                     onConfirmConversationChange = viewModel::confirmConversationChange,

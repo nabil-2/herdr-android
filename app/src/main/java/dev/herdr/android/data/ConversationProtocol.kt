@@ -116,7 +116,7 @@ internal object ChatState {
 
     fun latest(current: ChatContent, page: ConversationPage): ChatContent {
         if (changesConversation(current, page)) return current.copy(
-            canSend = false, loading = false, refreshing = false, loadingOlder = false,
+            canSend = false, loading = false, refreshing = false, loadingOlder = false, readRetrying = false,
             sending = false, deliveryUncertain = current.deliveryUncertain || current.sending,
             attachmentDeliveryUncertain = current.attachmentDeliveryUncertain || (current.sending && current.attachments.isNotEmpty()),
             conversationChanged = true, canSendReason = CONVERSATION_CHANGED_REASON,
@@ -144,6 +144,7 @@ internal object ChatState {
             bindingId = page.binding,
             conversationId = page.conversationId ?: current.conversationId,
             conversationChanged = false,
+            readRetrying = false,
             revision = page.revision,
             historyEpoch = page.historyEpoch,
             messages = messages,

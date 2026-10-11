@@ -64,7 +64,30 @@ for line in sys.stdin:
         if mode == 'error':
             response = {'id': request['id'], 'error': {'message': 'raw secret path /private/auth.json'}}
         else:
-            response = {'id': request['id'] + (1 if mode == 'wrongId' else 0), 'result': fixture}
+            if request['method'] == 'thread/read':
+                assert request['params']['threadId'] == fixture['thread']['id']
+                assert type(request['params']['includeTurns']) is bool
+                if not request['params']['includeTurns']:
+                    fixture['thread']['turns'] = []
+                result = fixture
+            elif request['method'] == 'thread/turns/list':
+                params = request['params']
+                assert params['threadId'] == fixture['thread']['id']
+                assert 1 <= params['limit'] <= 5 and params['sortDirection'] == 'desc' and params['itemsView'] in ('full', 'summary')
+                turns = list(reversed(fixture['thread']['turns']))
+                offset = int(params.get('cursor') or 0)
+                end = offset + params['limit']
+                page = turns[offset:end]
+                if params['itemsView'] == 'summary':
+                    page = [turn | {'items': [item for item in (
+                        next((item for item in turn['items'] if item.get('type') == 'userMessage'), None),
+                        next((item for item in reversed(turn['items']) if item.get('type') == 'agentMessage'), None)
+                    ) if item is not None]} for turn in page]
+                result = {'data': page,
+                          'nextCursor': str(end) if end < len(turns) else None}
+            else:
+                raise AssertionError('Unexpected history operation ' + request['method'])
+            response = {'id': request['id'] + (1 if mode == 'wrongId' else 0), 'result': result}
     print(json.dumps({'method': 'deprecationNotice', 'params': {'message': 'never forward notice'}}), flush=True)
     print(json.dumps(response), flush=True)
 ''')
@@ -198,6 +221,7 @@ async def test_latest_older_pages_revision_and_shared_poll_cache(chat):
     unchanged = (await client.get("/v1/panes/w1:p2/conversation", params={"revision": page["revision"]})).json()
     assert unchanged["unchanged"] and unchanged["messages"] == [] and unchanged["historyEpoch"] == page["historyEpoch"]
     assert [json.loads(line)["method"] for line in log.read_text().splitlines()].count("thread/read") == 1
+    assert not any(json.loads(line)["method"] == "thread/turns/list" for line in log.read_text().splitlines())
     now[0] += 1
     payload.write_text(json.dumps(history(113)))
     appended = (await client.get("/v1/panes/w1:p2/conversation")).json()
