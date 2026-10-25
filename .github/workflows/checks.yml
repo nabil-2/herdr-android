@@ -10,6 +10,9 @@ permissions:
 
 jobs:
   android:
+    permissions:
+      contents: read
+      actions: write
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -27,14 +30,44 @@ jobs:
       - run: sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0'
       - run: ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
       - uses: actions/upload-artifact@v4
+        id: upload_debug
         with:
           name: herdr-pocket-debug
           path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Keep only the latest herdr-pocket-debug artifact
+        if: >-
+          ${{ !cancelled() && steps.upload_debug.outputs.artifact-id != '' && github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/github-script@v9
+        env:
+          ARTIFACT_NAME: herdr-pocket-debug
+          UPLOADED_ARTIFACT_ID: ${{ steps.upload_debug.outputs.artifact-id }}
+        with:
+          script: |
+            await require('./.github/scripts/keep-latest-artifacts.cjs')({
+              github, context, core,
+              artifactName: process.env.ARTIFACT_NAME,
+              uploadedArtifactId: process.env.UPLOADED_ARTIFACT_ID
+            });
       - uses: actions/upload-artifact@v4
+        id: upload_reports
         if: always()
         with:
           name: android-test-reports
           path: app/build/reports
+      - name: Keep only the latest android-test-reports artifact
+        if: >-
+          ${{ !cancelled() && steps.upload_reports.outputs.artifact-id != '' && github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/github-script@v9
+        env:
+          ARTIFACT_NAME: android-test-reports
+          UPLOADED_ARTIFACT_ID: ${{ steps.upload_reports.outputs.artifact-id }}
+        with:
+          script: |
+            await require('./.github/scripts/keep-latest-artifacts.cjs')({
+              github, context, core,
+              artifactName: process.env.ARTIFACT_NAME,
+              uploadedArtifactId: process.env.UPLOADED_ARTIFACT_ID
+            });
 
   bridge:
     runs-on: ubuntu-latest

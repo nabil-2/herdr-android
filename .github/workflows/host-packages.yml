@@ -9,6 +9,9 @@ permissions:
 
 jobs:
   package:
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +45,21 @@ jobs:
         shell: bash
         run: bridge/.venv/bin/python scripts/smoke_host_package.py artifacts/host/herdr-pocket-${{ matrix.artifact }}
       - uses: actions/upload-artifact@v4
+        id: upload_host
         with:
           name: herdr-pocket-host-${{ matrix.artifact }}
           path: artifacts/host/*
+      - name: Keep only the latest herdr-pocket-host-${{ matrix.artifact }} artifact
+        if: >-
+          ${{ !cancelled() && steps.upload_host.outputs.artifact-id != '' && github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/github-script@v9
+        env:
+          ARTIFACT_NAME: herdr-pocket-host-${{ matrix.artifact }}
+          UPLOADED_ARTIFACT_ID: ${{ steps.upload_host.outputs.artifact-id }}
+        with:
+          script: |
+            await require('./.github/scripts/keep-latest-artifacts.cjs')({
+              github, context, core,
+              artifactName: process.env.ARTIFACT_NAME,
+              uploadedArtifactId: process.env.UPLOADED_ARTIFACT_ID
+            });
